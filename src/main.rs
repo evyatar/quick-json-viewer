@@ -1,5 +1,7 @@
 mod index;
 mod loader;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod parser;
 mod search;
 mod settings;
@@ -53,6 +55,8 @@ use tree::TreeState;
 enum RowAction {
     Select(u32),
     Toggle(u32),
+    ExpandRecursive(u32),
+    CollapseRecursive(u32),
 }
 
 // ─── app state ───────────────────────────────────────────────────────────────
@@ -75,6 +79,10 @@ struct App {
     settings_open:  bool,
     help_open:      bool,
     about_open:     bool,
+    type_ahead:     String,
+    type_ahead_time: f64,
+    #[cfg(target_os = "macos")]
+    menu_installed: bool,
 }
 
 impl Default for App {
@@ -87,11 +95,15 @@ impl Default for App {
             search_input:   String::new(),
             search_pending: None,
             file_info:      None,
-            focus_search:   false,
-            settings:       Settings::default(),
-            settings_open:  false,
-            help_open:      false,
-            about_open:     false,
+            focus_search:    false,
+            settings:        Settings::default(),
+            settings_open:   false,
+            help_open:       false,
+            about_open:      false,
+            type_ahead:      String::new(),
+            type_ahead_time: 0.0,
+            #[cfg(target_os = "macos")]
+            menu_installed: false,
         }
     }
 }
@@ -101,21 +113,30 @@ impl Default for App {
 fn setup_unicode_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // Try common macOS paths for a font with Hebrew/Unicode coverage.
-    let candidates = [
+    // Apple Symbols covers keyboard glyphs (⌥ ⌘ ⇧ …) missing from most fonts.
+    if let Ok(data) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+        fonts.font_data.insert(
+            "apple_symbols".to_owned(),
+            egui::FontData::from_owned(data).into(),
+        );
+        for list in fonts.families.values_mut() {
+            list.push("apple_symbols".to_owned());
+        }
+    }
+
+    // Hebrew / broad Unicode fallback.
+    let hebrew_candidates = [
         "/System/Library/Fonts/Supplemental/Arial Unicode MS.ttf",
         "/Library/Fonts/Arial Unicode MS.ttf",
         "/System/Library/Fonts/ArialHB.ttc",
         "/System/Library/Fonts/Supplemental/Arial Hebrew.ttf",
     ];
-    for path in &candidates {
+    for path in &hebrew_candidates {
         if let Ok(data) = std::fs::read(path) {
             fonts.font_data.insert(
                 "unicode_fallback".to_owned(),
                 egui::FontData::from_owned(data).into(),
             );
-            // Append as last resort for every family so Latin glyphs still
-            // come from the primary font and Hebrew/RTL falls through here.
             for list in fonts.families.values_mut() {
                 list.push("unicode_fallback".to_owned());
             }
@@ -182,6 +203,27 @@ impl eframe::App for App {
         self.show_help_window(ui.ctx());
         self.show_about_window(ui.ctx());
 
+        // ── macOS native menu bar (installed once, actions polled every frame) ──
+        #[cfg(target_os = "macos")]
+        {
+            if !self.menu_installed {
+                macos_menu::install(ui.ctx());
+                self.menu_installed = true;
+            }
+            let acts = macos_menu::take_actions();
+            if acts & macos_menu::ACT_OPEN_FILE    != 0 { self.open_file_dialog(); }
+            if acts & macos_menu::ACT_SETTINGS     != 0 { self.settings_open = true; }
+            if acts & macos_menu::ACT_FOCUS_SEARCH != 0 { self.focus_search = true; }
+            if acts & macos_menu::ACT_COLLAPSE_ALL != 0 {
+                if let Some(t) = &mut self.tree { t.collapse_all(); }
+            }
+            if acts & macos_menu::ACT_EXPAND_ALL   != 0 {
+                if let Some(t) = &mut self.tree { t.expand_all(); }
+            }
+            if acts & macos_menu::ACT_HELP         != 0 { self.help_open  = true; }
+            if acts & macos_menu::ACT_ABOUT        != 0 { self.about_open = true; }
+        }
+
         // ── 1. Poll background loader ──
         if let Some(rx) = &self.load_rx {
             match rx.try_recv() {
@@ -229,7 +271,8 @@ impl eframe::App for App {
 
         // ── 4. Keyboard shortcuts ──
         let (cmd_o, cmd_f, cmd_comma, arrow_up, arrow_down, arrow_left, arrow_right,
-             cmd_g, cmd_shift_g, opt_c, opt_x, page_up, page_down, home, end) =
+             cmd_g, cmd_shift_g, opt_c, opt_x,
+             page_up, page_down, home, end) =
             ui.input(|i| {
                 let cmd   = i.modifiers.command;
                 let shift = i.modifiers.shift;
@@ -269,6 +312,28 @@ impl eframe::App for App {
         if page_down   { if let Some(t) = &mut self.tree { t.select_page_down(20); } }
         if home        { if let Some(t) = &mut self.tree { t.select_home(); } }
         if end         { if let Some(t) = &mut self.tree { t.select_end(); } }
+
+        // ── 4b. Type-ahead selection ──
+        // Only active when no text widget (e.g. search box) has keyboard focus.
+        if self.tree.is_some() && ui.ctx().memory(|m| m.focused().is_none()) {
+            let now = ui.input(|i| i.time);
+            let typed: String = ui.input(|i| {
+                i.events.iter().filter_map(|e| {
+                    if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None }
+                }).collect()
+            });
+            if !typed.is_empty() {
+                if now - self.type_ahead_time > 1.0 {
+                    self.type_ahead.clear();
+                }
+                self.type_ahead.push_str(&typed);
+                self.type_ahead_time = now;
+                let prefix = self.type_ahead.clone();
+                if let Some(t) = &mut self.tree {
+                    t.type_ahead_select(&prefix);
+                }
+            }
+        }
 
         // ── 5. Layout ──
         if self.settings.show_menu_bar {
@@ -313,17 +378,6 @@ impl App {
                     self.settings_open = true;
                 }
             });
-            ui.menu_button("Help", |ui| {
-                if ui.button("Keyboard Shortcuts").clicked() {
-                    ui.close();
-                    self.help_open = true;
-                }
-                ui.separator();
-                if ui.button("About JSON Viewer").clicked() {
-                    ui.close();
-                    self.about_open = true;
-                }
-            });
             ui.menu_button("View", |ui| {
                 let has_tree = self.tree.is_some();
                 if ui.add_enabled(has_tree, egui::Button::new("Collapse All").shortcut_text("⌥C")).clicked() {
@@ -338,6 +392,17 @@ impl App {
                 if ui.add(egui::Button::new("Search").shortcut_text("⌘F")).clicked() {
                     ui.close();
                     self.focus_search = true;
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("Keyboard Shortcuts").clicked() {
+                    ui.close();
+                    self.help_open = true;
+                }
+                ui.separator();
+                if ui.button("About JSON Viewer").clicked() {
+                    ui.close();
+                    self.about_open = true;
                 }
             });
         });
@@ -364,7 +429,10 @@ impl App {
                 };
 
                 let section = |ui: &mut egui::Ui, title: &str| {
-                    ui.add_space(8.0);
+                    // add_space is invalid inside a grid; emit a blank row instead
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
                     ui.label(egui::RichText::new(title).strong());
                     ui.label("");
                     ui.end_row();
@@ -497,10 +565,11 @@ impl App {
                 self.kick_search();
             }
 
-            if ui.button("▲").clicked() {
+            let has_results = !self.search_input.is_empty();
+            if ui.add_enabled(has_results, egui::Button::new("▲")).clicked() {
                 if let Some(t) = &mut self.tree { t.search_prev(); }
             }
-            if ui.button("▼").clicked() {
+            if ui.add_enabled(has_results, egui::Button::new("▼")).clicked() {
                 if let Some(t) = &mut self.tree { t.search_next(); }
             }
 
@@ -555,31 +624,33 @@ impl App {
             let visible        = &tree.visible;
             let selected       = tree.selected;
 
-            let avail_h    = ui.available_height();
-            // show_rows uses row_h + item_spacing.y as the internal row pitch.
-            let row_pitch  = row_h + ui.spacing().item_spacing.y;
-            let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
+            let avail_h   = ui.available_height();
+            let row_pitch = row_h + ui.spacing().item_spacing.y;
+
+            let mut scroll_area = egui::ScrollArea::both().auto_shrink([false; 2]);
             if let Some(row) = scroll_to_row {
                 let y = (row as f32 * row_pitch - avail_h / 2.0 + row_h / 2.0).max(0.0);
                 scroll_area = scroll_area.vertical_scroll_offset(y);
             }
             scroll_area.show_rows(ui, row_h, num_rows, |ui, row_range| {
-                    for row_idx in row_range {
-                        let node_idx = visible[row_idx];
-                        let row_actions = render_row(
-                            ui, index, expanded, selected, search_res_set, node_idx,
-                            row_h, key_font.clone(), val_font.clone(),
-                        );
-                        actions.extend(row_actions);
-                    }
-                });
+                for row_idx in row_range {
+                    let node_idx = visible[row_idx];
+                    let row_actions = render_row(
+                        ui, index, expanded, selected, search_res_set, node_idx,
+                        row_h, key_font.clone(), val_font.clone(),
+                    );
+                    actions.extend(row_actions);
+                }
+            });
         }
 
         // Apply actions after borrows released
         for action in actions {
             match action {
-                RowAction::Select(n) => { tree.selected = Some(n); }
-                RowAction::Toggle(n) => { tree.toggle(n); }
+                RowAction::Select(n)           => { tree.selected = Some(n); }
+                RowAction::Toggle(n)           => { tree.toggle(n); }
+                RowAction::ExpandRecursive(n)   => { tree.expand_recursive(n); }
+                RowAction::CollapseRecursive(n) => { tree.collapse_recursive(n); }
             }
         }
     }
@@ -627,6 +698,7 @@ fn render_row(
     };
 
     // Value text + color
+    let str_color = if dark { egui::Color32::from_rgb(206, 145, 120) } else { egui::Color32::from_rgb(163, 21, 21) };
     let (value_text, value_color): (String, egui::Color32) = match kind {
         NodeKind::Object => (
             format!("{{ {} }}", child_count),
@@ -638,12 +710,15 @@ fn render_row(
         ),
         NodeKind::String => {
             let raw = index.value_bytes(node);
-            // raw includes surrounding quotes
             let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { raw };
-            // Truncate at a character boundary (not byte) to avoid broken
-            // multi-byte sequences that produce U+FFFD replacement boxes.
-            let s: String = String::from_utf8_lossy(inner).chars().take(80).collect();
-            (format!("\"{}\"", s), if dark { egui::Color32::from_rgb(206, 145, 120) } else { egui::Color32::from_rgb(163, 21, 21) })
+            let chars: Vec<char> = String::from_utf8_lossy(inner).chars().take(501).collect();
+            let s: String = if chars.len() > 500 {
+                let t: String = chars[..500].iter().collect();
+                format!("{}…", t)
+            } else {
+                chars.into_iter().collect()
+            };
+            (format!("\"{}\"", s), str_color)
         }
         NodeKind::Number => {
             let raw = index.value_bytes(node);
@@ -656,9 +731,28 @@ fn render_row(
         NodeKind::Null => ("null".to_owned(), if dark { egui::Color32::from_rgb(160, 160, 160) } else { egui::Color32::from_rgb(100, 100, 100) }),
     };
 
-    // Allocate row rect
-    let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), row_h));
-    let response   = ui.interact(rect, id, egui::Sense::click());
+    let indent  = 4.0 + depth as f32 * 16.0;
+
+    // Pre-compute display strings and key width (needed before allocation in both modes).
+    let key_display   = bidi_reorder(&key_text);
+    let value_display = bidi_reorder(&value_text);
+    let key_w = if !key_text.is_empty() {
+        ui.painter()
+            .layout_no_wrap(key_display.as_ref().to_owned(), key_font.clone(), egui::Color32::BLACK)
+            .rect.width()
+    } else {
+        0.0
+    };
+
+    // Widen the row so ScrollArea::both() can scroll horizontally.
+    let val_w = ui.painter()
+        .layout_no_wrap(value_display.as_ref().to_owned(), val_font.clone(), egui::Color32::BLACK)
+        .rect.width();
+    let content_w = indent + 18.0 + key_w + val_w + 8.0;
+    let row_w = content_w.max(ui.available_width());
+    let (id, rect) = ui.allocate_space(egui::vec2(row_w, row_h));
+
+    let response = ui.interact(rect, id, egui::Sense::click());
 
     // Background
     if is_match {
@@ -673,56 +767,32 @@ fn render_row(
         ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
 
-    let painter = ui.painter();
+    let painter  = ui.painter();
+    let text_col = if is_selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
 
-    let indent   = 4.0 + depth as f32 * 16.0;
-    let mut x    = rect.left() + indent;
-    let y        = rect.center().y;
-    let text_col = if is_selected {
-        ui.visuals().selection.stroke.color
-    } else {
-        ui.visuals().text_color()
-    };
+    // y position for single-line elements: centred in the first row_h band.
+    let y1 = rect.top() + row_h / 2.0;
+    let mut x = rect.left() + indent;
 
-    // Triangle region (always 16px wide)
+    // Triangle region (always 16 px wide, in the first line band).
     let tri_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + indent, rect.top()),
         egui::vec2(16.0, row_h),
     );
     if is_container && has_children {
         let tri = if is_expanded { "▼" } else { "▶" };
-        painter.text(
-            egui::pos2(x + 2.0, y),
-            egui::Align2::LEFT_CENTER,
-            tri,
-            val_font.clone(),
-            text_col,
-        );
+        painter.text(egui::pos2(x + 2.0, y1), egui::Align2::LEFT_CENTER, tri, val_font.clone(), text_col);
     }
     x += 18.0;
 
-    // Key
+    // Key (always single-line, vertically centred in the first band).
     if !key_text.is_empty() {
-        let key_display = bidi_reorder(&key_text);
-        let kr = painter.text(
-            egui::pos2(x, y),
-            egui::Align2::LEFT_CENTER,
-            key_display.as_ref(),
-            key_font.clone(),
-            key_color,
-        );
-        x += kr.width();
+        painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, key_display.as_ref(), key_font.clone(), key_color);
+        x += key_w;
     }
 
-    // Value
-    let value_display = bidi_reorder(&value_text);
-    painter.text(
-        egui::pos2(x, y),
-        egui::Align2::LEFT_CENTER,
-        value_display.as_ref(),
-        val_font,
-        value_color,
-    );
+    // Value — single line, vertically centred.
+    painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, value_display.as_ref(), val_font, value_color);
 
     // Collect actions
     let mut actions: Vec<RowAction> = Vec::new();
@@ -770,6 +840,18 @@ fn render_row(
             let raw = index.value_bytes(n);
             ui.ctx().copy_text(String::from_utf8_lossy(raw).into_owned());
             ui.close();
+        }
+
+        if is_container && has_children {
+            ui.separator();
+            if ui.button("Expand All").clicked() {
+                actions.push(RowAction::ExpandRecursive(node_idx));
+                ui.close();
+            }
+            if ui.button("Collapse All").clicked() {
+                actions.push(RowAction::CollapseRecursive(node_idx));
+                ui.close();
+            }
         }
     });
 

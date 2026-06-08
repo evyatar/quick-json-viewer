@@ -20,7 +20,8 @@ pub struct TreeState {
 impl TreeState {
     pub fn new(index: Arc<JsonIndex>) -> Self {
         let root = index.root;
-        let expanded = HashSet::new();
+        let mut expanded = HashSet::new();
+        expanded.insert(root);
         let visible = rebuild_visible(root, &index.nodes, &expanded);
         Self {
             index,
@@ -45,7 +46,7 @@ impl TreeState {
         self.refresh_visible();
     }
 
-    fn refresh_visible(&mut self) {
+    pub fn refresh_visible(&mut self) {
         self.visible = rebuild_visible(self.index.root, &self.index.nodes, &self.expanded);
     }
 
@@ -185,6 +186,87 @@ impl TreeState {
             }
         }
         self.refresh_visible();
+    }
+
+    pub fn collapse_recursive(&mut self, root: u32) {
+        let mut stack = vec![root];
+        while let Some(idx) = stack.pop() {
+            let node = &self.index.nodes[idx as usize];
+            if matches!(node.kind, NodeKind::Object | NodeKind::Array) && node.child_count > 0 {
+                self.expanded.remove(&idx);
+                let mut child = node.first_child;
+                while child != u32::MAX {
+                    stack.push(child);
+                    child = self.index.nodes[child as usize].next_sibling;
+                }
+            }
+        }
+        self.refresh_visible();
+    }
+
+    pub fn expand_recursive(&mut self, root: u32) {
+        let mut stack = vec![root];
+        while let Some(idx) = stack.pop() {
+            let node = &self.index.nodes[idx as usize];
+            if matches!(node.kind, NodeKind::Object | NodeKind::Array) && node.child_count > 0 {
+                self.expanded.insert(idx);
+                let mut child = node.first_child;
+                while child != u32::MAX {
+                    stack.push(child);
+                    child = self.index.nodes[child as usize].next_sibling;
+                }
+            }
+        }
+        self.refresh_visible();
+    }
+
+    /// Jump to the next sibling (within the same object) whose key starts with
+    /// `prefix` (case-insensitive).  Single-char prefix cycles from current+1;
+    /// multi-char prefix finds the first match from the beginning.
+    pub fn type_ahead_select(&mut self, prefix: &str) {
+        let Some(sel) = self.selected else { return };
+
+        let (parent_kind, first_child) = {
+            let nodes = &self.index.nodes;
+            let parent = nodes[sel as usize].parent;
+            if parent == u32::MAX { return; }
+            let pn = &nodes[parent as usize];
+            (pn.kind, pn.first_child)
+        };
+        if !matches!(parent_kind, NodeKind::Object) { return; }
+
+        let prefix_lower = prefix.to_lowercase();
+
+        let siblings: Vec<u32> = {
+            let nodes = &self.index.nodes;
+            let mut v = Vec::new();
+            let mut child = first_child;
+            while child != u32::MAX {
+                v.push(child);
+                child = nodes[child as usize].next_sibling;
+            }
+            v
+        };
+        if siblings.is_empty() { return; }
+
+        let cur_pos = siblings.iter().position(|&n| n == sel).unwrap_or(0);
+        let n = siblings.len();
+        // Single char: start from next sibling (cycle); multi-char: from start.
+        let start = if prefix.chars().count() == 1 { 1 } else { 0 };
+
+        let found = (0..n).find_map(|i| {
+            let idx = (cur_pos + start + i) % n;
+            let nid = siblings[idx];
+            let key = self.index.key_of(&self.index.nodes[nid as usize]);
+            if key.to_lowercase().starts_with(&prefix_lower) { Some(nid) } else { None }
+        });
+
+        if let Some(target) = found {
+            self.selected = Some(target);
+            if let Some(pos) = self.visible.iter().position(|&n| n == target) {
+                self.scroll_to_row = Some(pos);
+            }
+        }
     }
 
     /// Replace search results (called from UI after background search finishes).
