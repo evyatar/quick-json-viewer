@@ -47,7 +47,7 @@ pub fn parse_bytes(
     let root = scan_value(bytes, &mut pos, 0, u32::MAX, 0, 0, &mut nodes, key_arena, &mut prog, u32::MAX)?;
 
     // Detect NDJSON: remaining non-whitespace after the first value
-    skip_ws_newlines(bytes, &mut pos);
+    skip_ws(bytes, &mut pos);
     if pos < bytes.len() {
         // NDJSON mode — re-parse from scratch
         nodes.clear();
@@ -74,7 +74,7 @@ pub fn parse_bytes(
         let mut child_count: u32 = 0;
 
         while pos < bytes.len() {
-            skip_ws_newlines(bytes, &mut pos);
+            skip_ws(bytes, &mut pos);
             if pos >= bytes.len() { break; }
 
             let child_idx = scan_value(
@@ -104,12 +104,6 @@ pub fn parse_bytes(
 }
 
 fn skip_ws(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\r' | b'\n') {
-        *pos += 1;
-    }
-}
-
-fn skip_ws_newlines(bytes: &[u8], pos: &mut usize) {
     while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\r' | b'\n') {
         *pos += 1;
     }
@@ -323,5 +317,155 @@ fn scan_value(
     }
 
     Ok(own_idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::NodeKind;
+
+    fn parse(s: &str) -> (Vec<Node>, u32, bool) {
+        let mut ka = Vec::new();
+        parse_bytes(s.as_bytes(), &mut ka, &mut |_| {}).unwrap()
+    }
+
+    fn parse_err(s: &str) -> ParseError {
+        let mut ka = Vec::new();
+        parse_bytes(s.as_bytes(), &mut ka, &mut |_| {}).unwrap_err()
+    }
+
+    #[test]
+    fn empty_input_is_error() {
+        parse_err("");
+        parse_err("   ");
+    }
+
+    #[test]
+    fn empty_object() {
+        let (nodes, root, is_ndjson) = parse("{}");
+        assert_eq!(nodes[root as usize].kind, NodeKind::Object);
+        assert_eq!(nodes[root as usize].child_count, 0);
+        assert!(!is_ndjson);
+    }
+
+    #[test]
+    fn empty_array() {
+        let (nodes, root, _) = parse("[]");
+        assert_eq!(nodes[root as usize].kind, NodeKind::Array);
+        assert_eq!(nodes[root as usize].child_count, 0);
+    }
+
+    #[test]
+    fn object_with_string_value() {
+        let mut ka = Vec::new();
+        let (nodes, root, _) =
+            parse_bytes(b"{\"key\": \"value\"}", &mut ka, &mut |_| {}).unwrap();
+        assert_eq!(nodes[root as usize].child_count, 1);
+        let child = nodes[root as usize].first_child as usize;
+        assert_eq!(nodes[child].kind, NodeKind::String);
+        assert_eq!(&ka[..nodes[child].key_len as usize], b"key");
+    }
+
+    #[test]
+    fn array_with_numbers() {
+        let (nodes, root, _) = parse("[1, 2, 3]");
+        assert_eq!(nodes[root as usize].kind, NodeKind::Array);
+        assert_eq!(nodes[root as usize].child_count, 3);
+        let first = nodes[root as usize].first_child as usize;
+        assert_eq!(nodes[first].kind, NodeKind::Number);
+    }
+
+    #[test]
+    fn bool_and_null_values() {
+        let (nodes, root, _) = parse("[true, false, null]");
+        let first = nodes[root as usize].first_child as usize;
+        assert_eq!(nodes[first].kind, NodeKind::Bool);
+        let second = nodes[first].next_sibling as usize;
+        assert_eq!(nodes[second].kind, NodeKind::Bool);
+        let third = nodes[second].next_sibling as usize;
+        assert_eq!(nodes[third].kind, NodeKind::Null);
+    }
+
+    #[test]
+    fn nested_object() {
+        let (nodes, root, _) = parse(r#"{"a": {"b": 1}}"#);
+        assert_eq!(nodes[root as usize].child_count, 1);
+        let a = nodes[root as usize].first_child as usize;
+        assert_eq!(nodes[a].kind, NodeKind::Object);
+        assert_eq!(nodes[a].child_count, 1);
+    }
+
+    #[test]
+    fn trailing_comma_in_object() {
+        let (nodes, root, _) = parse(r#"{"a": 1,}"#);
+        assert_eq!(nodes[root as usize].child_count, 1);
+    }
+
+    #[test]
+    fn trailing_comma_in_array() {
+        let (nodes, root, _) = parse("[1, 2,]");
+        assert_eq!(nodes[root as usize].child_count, 2);
+    }
+
+    #[test]
+    fn ndjson_detected() {
+        let (nodes, root, is_ndjson) = parse("{}\n{}\n");
+        assert!(is_ndjson);
+        assert_eq!(nodes[root as usize].kind, NodeKind::Array);
+        assert_eq!(nodes[root as usize].child_count, 2);
+    }
+
+    #[test]
+    fn parent_links_are_correct() {
+        let (nodes, root, _) = parse(r#"{"a": 1}"#);
+        let child = nodes[root as usize].first_child;
+        assert_eq!(nodes[child as usize].parent, root);
+        assert_eq!(nodes[root as usize].parent, u32::MAX);
+    }
+
+    #[test]
+    fn sibling_links_are_correct() {
+        let (nodes, root, _) = parse("[1, 2]");
+        let first = nodes[root as usize].first_child;
+        let second = nodes[first as usize].next_sibling;
+        assert_ne!(second, u32::MAX);
+        assert_eq!(nodes[second as usize].next_sibling, u32::MAX);
+    }
+
+    #[test]
+    fn array_indices_are_zero_based() {
+        let (nodes, root, _) = parse("[10, 20, 30]");
+        let mut child = nodes[root as usize].first_child;
+        for expected_idx in 0u32..3 {
+            assert_eq!(nodes[child as usize].array_index, expected_idx);
+            child = nodes[child as usize].next_sibling;
+        }
+    }
+
+    #[test]
+    fn unclosed_object_is_error() {
+        parse_err(r#"{"a": 1"#);
+    }
+
+    #[test]
+    fn unterminated_string_is_error() {
+        parse_err(r#"{"a"#);
+    }
+
+    #[test]
+    fn invalid_literal_is_error() {
+        parse_err("xyz");
+    }
+
+    #[test]
+    fn value_byte_ranges_are_correct() {
+        let input = b"[42]";
+        let mut ka = Vec::new();
+        let (nodes, root, _) = parse_bytes(input, &mut ka, &mut |_| {}).unwrap();
+        let child = nodes[root as usize].first_child as usize;
+        let start = nodes[child].value_start as usize;
+        let end = nodes[child].value_end as usize;
+        assert_eq!(&input[start..end], b"42");
+    }
 }
 

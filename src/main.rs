@@ -480,7 +480,7 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("JSON Viewer").heading().strong());
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Version 1.0.0").small());
+                    ui.label(egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).small());
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(12.0);
@@ -905,6 +905,8 @@ impl App {
                 if let Some(t) = &self.tree {
                     ui.separator();
                     ui.label(format!("{} nodes", t.index.nodes.len()));
+                    ui.separator();
+                    ui.label(if t.index.is_ndjson { "NDJSON" } else { "JSON" });
                 }
             }
 

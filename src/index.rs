@@ -1,6 +1,5 @@
 use memmap2::Mmap;
 use std::fs::File;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -31,7 +30,6 @@ pub struct Node {
     pub array_index:  u32,   // u32::MAX = not an array element; else 0-based index in parent array
 }
 
-#[allow(dead_code)]
 pub struct JsonIndex {
     pub _file:     File,
     pub mmap:      Mmap,
@@ -39,7 +37,6 @@ pub struct JsonIndex {
     pub key_arena: Vec<u8>,
     pub root:      u32,
     pub is_ndjson: bool,
-    pub file_path: PathBuf,
 }
 
 impl JsonIndex {

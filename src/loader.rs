@@ -40,13 +40,12 @@ fn load_inner(path: PathBuf, tx: mpsc::Sender<LoadMsg>) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
     let index = Arc::new(JsonIndex {
-        _file:     file,
+        _file: file,
         mmap,
         nodes,
         key_arena,
         root,
         is_ndjson,
-        file_path: path,
     });
 
     let _ = tx.send(LoadMsg::Done(index));

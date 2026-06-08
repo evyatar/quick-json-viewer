@@ -1,7 +1,10 @@
 [package]
 name = "quick-json-viewer"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "A fast, native JSON viewer for macOS"
+authors = ["Evyatar Shalom"]
+repository = "https://github.com/evyatar/quick-json-viewer"
 
 [dependencies]
 eframe        = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "persistence"] }

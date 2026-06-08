@@ -3,13 +3,11 @@ use std::sync::Arc;
 
 use crate::index::{JsonIndex, Node, NodeKind};
 
-#[allow(dead_code)]
 pub struct TreeState {
     pub index:             Arc<JsonIndex>,
     pub expanded:          HashSet<u32>,
     pub visible:           Vec<u32>,
     pub selected:          Option<u32>,
-    pub search_query:      String,
     pub search_use_regex:  bool,
     pub search_results:    Vec<u32>,
     pub search_cursor:     usize,
@@ -28,7 +26,6 @@ impl TreeState {
             expanded,
             visible,
             selected: Some(root),
-            search_query: String::new(),
             search_use_regex: false,
             search_results: Vec::new(),
             search_cursor: 0,
@@ -309,4 +306,162 @@ pub fn rebuild_visible(
     }
 
     visible
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{JsonIndex, Node, NodeKind};
+    use std::sync::Arc;
+
+    fn make_node(
+        kind: NodeKind,
+        first_child: u32,
+        next_sibling: u32,
+        child_count: u32,
+        parent: u32,
+    ) -> Node {
+        Node {
+            kind,
+            depth: 0,
+            value_start: 0,
+            value_end: 0,
+            key_start: 0,
+            key_len: 0,
+            first_child,
+            next_sibling,
+            child_count,
+            parent,
+            array_index: u32::MAX,
+        }
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn make_index(json: &str) -> Arc<JsonIndex> {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("qjv_tree_{n}.json"));
+        std::fs::write(&path, json.as_bytes()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let _ = std::fs::remove_file(&path);
+        let mut key_arena = Vec::new();
+        let (nodes, root, is_ndjson) =
+            crate::parser::parse_bytes(&mmap[..], &mut key_arena, &mut |_| {}).unwrap();
+        Arc::new(JsonIndex { _file: file, mmap, nodes, key_arena, root, is_ndjson })
+    }
+
+    // ── rebuild_visible ──────────────────────────────────────────────────────
+
+    #[test]
+    fn root_only_when_nothing_expanded() {
+        let ns = vec![
+            make_node(NodeKind::Object, 1, u32::MAX, 2, u32::MAX), // 0 root
+            make_node(NodeKind::String, u32::MAX, 2, 0, 0),        // 1 a
+            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 0), // 2 b
+        ];
+        let visible = rebuild_visible(0, &ns, &HashSet::new());
+        assert_eq!(visible, vec![0]);
+    }
+
+    #[test]
+    fn expanded_root_shows_children() {
+        let ns = vec![
+            make_node(NodeKind::Object, 1, u32::MAX, 2, u32::MAX),
+            make_node(NodeKind::String, u32::MAX, 2, 0, 0),
+            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 0),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(0u32);
+        assert_eq!(rebuild_visible(0, &ns, &expanded), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn dfs_order_is_preserved() {
+        // root(0) -> a(1) -> c(3); root(0) -> b(2)
+        let ns = vec![
+            make_node(NodeKind::Object, 1, u32::MAX, 2, u32::MAX), // 0 root
+            make_node(NodeKind::Object, 3, 2, 1, 0),               // 1 a
+            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 0), // 2 b
+            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 1), // 3 c (child of a)
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(0u32);
+        expanded.insert(1u32);
+        assert_eq!(rebuild_visible(0, &ns, &expanded), vec![0, 1, 3, 2]);
+    }
+
+    // ── TreeState ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_state_expands_root() {
+        let idx = make_index(r#"[1, 2, 3]"#);
+        let state = TreeState::new(idx);
+        assert_eq!(state.visible.len(), 4); // root + 3 items
+        assert_eq!(state.selected, Some(state.index.root));
+    }
+
+    #[test]
+    fn select_down_advances_selection() {
+        let idx = make_index(r#"[1, 2, 3]"#);
+        let mut state = TreeState::new(idx);
+        let initial = state.selected;
+        state.select_down();
+        assert_ne!(state.selected, initial);
+        assert_eq!(state.selected, Some(state.visible[1]));
+    }
+
+    #[test]
+    fn select_up_from_root_stays_at_root() {
+        let idx = make_index(r#"[1, 2]"#);
+        let mut state = TreeState::new(idx);
+        state.select_up();
+        assert_eq!(state.selected, Some(state.visible[0]));
+    }
+
+    #[test]
+    fn home_and_end_navigate_to_extremes() {
+        let idx = make_index(r#"[1, 2, 3]"#);
+        let mut state = TreeState::new(idx);
+        state.select_end();
+        assert_eq!(state.selected, state.visible.last().copied());
+        state.select_home();
+        assert_eq!(state.selected, Some(state.visible[0]));
+    }
+
+    #[test]
+    fn collapse_all_hides_all_children() {
+        let idx = make_index(r#"{"a": {"b": 1}}"#);
+        let mut state = TreeState::new(idx);
+        state.expand_all();
+        assert!(state.visible.len() > 1);
+        state.collapse_all();
+        assert_eq!(state.visible.len(), 1);
+    }
+
+    #[test]
+    fn ensure_visible_expands_ancestors() {
+        let idx = make_index(r#"{"a": 1}"#);
+        let mut state = TreeState::new(idx);
+        // Collapse root so child is hidden
+        state.expanded.clear();
+        state.refresh_visible();
+        let child = state.index.nodes[state.index.root as usize].first_child;
+        assert!(!state.visible.contains(&child));
+        state.ensure_visible(child);
+        assert!(state.visible.contains(&child));
+    }
+
+    #[test]
+    fn toggle_expands_then_collapses() {
+        let idx = make_index(r#"{"a": 1}"#);
+        let mut state = TreeState::new(idx);
+        let root = state.index.root;
+        // Root starts expanded (TreeState::new inserts root into expanded)
+        assert_eq!(state.visible.len(), 2); // root + child
+        state.toggle(root);
+        assert_eq!(state.visible.len(), 1); // collapsed
+        state.toggle(root);
+        assert_eq!(state.visible.len(), 2); // expanded again
+    }
 }
