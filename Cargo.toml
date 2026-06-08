@@ -1,0 +1,20 @@
+[package]
+name = "quick-json-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe        = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "persistence"] }
+egui          = "0.34"
+memmap2       = "0.9"
+regex         = "1"
+rfd           = "0.17"
+serde         = { version = "1", features = ["derive"] }
+unicode-bidi  = "0.3"
+image         = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level     = 3
+codegen-units = 1
+lto           = true
+strip         = true

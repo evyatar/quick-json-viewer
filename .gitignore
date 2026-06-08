@@ -1,0 +1,16 @@
+# Rust
+/target/
+Cargo.lock
+
+# macOS
+.DS_Store
+*.app
+
+# Editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+quick-json-viewer.app
