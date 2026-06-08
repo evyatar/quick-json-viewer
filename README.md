@@ -4,6 +4,14 @@ A fast, native macOS app for viewing and navigating large JSON and NDJSON files.
 
 Built with Rust + [egui](https://github.com/emilk/egui). Uses memory-mapped file I/O so even multi-GB files open instantly.
 
+## Installation
+
+```sh
+brew install --cask evyatar/tap/quick-json-viewer
+```
+
+Installs to `/Applications` — find it in Launchpad or open files with right-click → Open With.
+
 ## Features
 
 - **JSON & NDJSON** — single-document JSON and newline-delimited JSON both supported
