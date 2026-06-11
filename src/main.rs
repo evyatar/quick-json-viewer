@@ -542,11 +542,21 @@ impl App {
 
             // Clear button — only visible when the field has content
             if !self.search_input.is_empty() {
-                let clear = ui.add(
-                    egui::Button::new("✕")
-                        .small()
-                        .frame(false),
-                );
+                let size = egui::Vec2::splat(16.0);
+                let (rect, clear) = ui.allocate_exact_size(size, egui::Sense::click());
+                let color = if clear.hovered() {
+                    ui.visuals().widgets.hovered.text_color()
+                } else {
+                    ui.visuals().widgets.inactive.text_color()
+                };
+                if clear.hovered() {
+                    ui.painter().circle_filled(rect.center(), 7.0, ui.visuals().widgets.hovered.bg_fill);
+                }
+                let stroke = egui::Stroke::new(1.5, color);
+                let d = 3.5;
+                let c = rect.center();
+                ui.painter().line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
+                ui.painter().line_segment([c + egui::vec2(d, -d), c + egui::vec2(-d, d)], stroke);
                 if clear.clicked() {
                     self.search_input.clear();
                     self.kick_search();
