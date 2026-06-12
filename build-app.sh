@@ -54,7 +54,8 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
         <string>json</string><string>jsonl</string><string>ndjson</string>
       </array>
       <key>CFBundleTypeName</key><string>JSON File</string>
-      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Owner</string>
       <key>LSItemContentTypes</key>
       <array><string>public.json</string></array>
     </dict>

@@ -159,6 +159,12 @@ fn app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Arrange for application:openFile: to be injected into the app delegate at
+    // will-finish-launching time — after winit sets its delegate, before macOS
+    // dispatches the initial open-document Apple Event from Finder.
+    #[cfg(target_os = "macos")]
+    macos_menu::register_open_file_handler();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("JSON Viewer")
         .with_inner_size([1200.0, 800.0])
@@ -222,6 +228,7 @@ impl eframe::App for App {
             }
             if acts & macos_menu::ACT_HELP         != 0 { self.help_open  = true; }
             if acts & macos_menu::ACT_ABOUT        != 0 { self.about_open = true; }
+            if let Some(path) = macos_menu::take_open_file() { self.open_file(path); }
         }
 
         // ── 1. Poll background loader ──

@@ -1,6 +1,41 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "json_viewer_settings_v1";
+
+// 0 = untried, 1 = success, 2 = failure
+static SET_DEFAULT_STATUS: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    fn LSSetDefaultRoleHandlerForContentType(
+        content_type: *const std::ffi::c_void,
+        role: u32,
+        handler: *const std::ffi::c_void,
+    ) -> i32;
+}
+
+fn set_as_default_json_viewer() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::NSString;
+        unsafe {
+            let uti = NSString::from_str("public.json");
+            let bundle = NSString::from_str("com.evyatar.quick-json-viewer");
+            LSSetDefaultRoleHandlerForContentType(
+                &*uti as *const NSString as *const std::ffi::c_void,
+                0xFFFF_FFFF, // kLSRolesAll
+                &*bundle as *const NSString as *const std::ffi::c_void,
+            ) == 0
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum Theme {
@@ -174,6 +209,26 @@ pub fn show_settings_window(
                     ui.checkbox(&mut settings.show_menu_bar, "");
                     ui.end_row();
                 });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(12.0);
+
+            // ── System ───────────────────────────────────────────────────────
+            ui.heading("System");
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("Set as Default JSON Viewer").clicked() {
+                    let ok = set_as_default_json_viewer();
+                    SET_DEFAULT_STATUS.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+                }
+                match SET_DEFAULT_STATUS.load(Ordering::Relaxed) {
+                    1 => { ui.colored_label(egui::Color32::from_rgb(52, 199, 89), "✓ Set as default"); }
+                    2 => { ui.colored_label(egui::Color32::from_rgb(255, 69, 58), "✗ Failed — run from .app bundle"); }
+                    _ => {}
+                }
+            });
 
             ui.add_space(8.0);
         });

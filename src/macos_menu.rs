@@ -1,13 +1,15 @@
 #![cfg(target_os = "macos")]
 
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject as RtNSObject};
-use objc2::{ClassType, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyClass, AnyObject, Imp, NSObject as RtNSObject, Sel};
+use objc2::{ClassType, MainThreadMarker, MainThreadOnly, ffi};
 use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
 use objc2_foundation::NSString;
 
@@ -23,9 +25,103 @@ pub const ACT_ABOUT:        u32 = 1 << 6;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
+static PENDING_OPEN_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub fn take_actions() -> u32 {
     PENDING.swap(0, Ordering::AcqRel)
+}
+
+pub fn take_open_file() -> Option<PathBuf> {
+    PENDING_OPEN_FILE.lock().ok()?.take()
+}
+
+/// Add `application:openFile:` to the NSApp delegate's class so that macOS
+/// delivers Finder file-opens to the app (winit 0.30 doesn't implement it).
+/// Safe to call repeatedly — `class_addMethod` is a no-op once the method exists.
+unsafe fn inject_open_file_method() {
+    extern "C" {
+        static NSApp: Option<&'static NSApplication>;
+    }
+    let Some(app) = NSApp else { return };
+    let delegate_ptr: *mut AnyObject = msg_send![app, delegate];
+    if delegate_ptr.is_null() {
+        return;
+    }
+    let cls = (*delegate_ptr).class() as *const AnyClass as *mut AnyClass;
+    let sel = objc2::sel!(application:openFile:);
+    let imp: Imp = std::mem::transmute(
+        open_file_imp
+            as unsafe extern "C-unwind" fn(
+                *mut AnyObject,
+                Sel,
+                *mut AnyObject,
+                *mut AnyObject,
+            ) -> bool,
+    );
+    // Encoding B@:@@ — BOOL return, self, _cmd, NSApplication*, NSString*
+    ffi::class_addMethod(cls, sel, imp, b"B@:@@\0".as_ptr().cast());
+}
+
+unsafe extern "C-unwind" fn open_file_imp(
+    _this: *mut AnyObject,
+    _sel: Sel,
+    _app: *mut AnyObject,
+    filename: *mut AnyObject,
+) -> bool {
+    if filename.is_null() {
+        return false;
+    }
+    let ns_str = &*(filename as *const NSString);
+    let path = PathBuf::from(ns_str.to_string());
+    if let Ok(mut lock) = PENDING_OPEN_FILE.lock() {
+        *lock = Some(path);
+    }
+    if let Some(ctx) = CTX.get() {
+        ctx.request_repaint();
+    }
+    true
+}
+
+// Observes NSApplicationWillFinishLaunching: at that point winit has already
+// set its delegate on NSApp, but macOS has not yet dispatched the initial
+// open-document Apple Event (which arrives before didFinishLaunching).
+// That is the only reliable window for injecting application:openFile:.
+define_class!(
+    #[unsafe(super(RtNSObject))]
+    struct LaunchObserver;
+
+    impl LaunchObserver {
+        #[unsafe(method(appWillFinishLaunching:))]
+        fn app_will_finish_launching(&self, _note: &AnyObject) {
+            unsafe { inject_open_file_method() };
+        }
+    }
+);
+
+/// Call from `main()` before `eframe::run_native()`.
+pub fn register_open_file_handler() {
+    unsafe {
+        let nc_cls = ffi::objc_getClass(b"NSNotificationCenter\0".as_ptr().cast());
+        if nc_cls.is_null() {
+            return;
+        }
+        let center: *mut AnyObject = msg_send![&*nc_cls, defaultCenter];
+        if center.is_null() {
+            return;
+        }
+        let observer: Retained<LaunchObserver> = msg_send![LaunchObserver::class(), new];
+        let observer_ptr = observer.as_ref() as *const LaunchObserver as *const AnyObject;
+        let name = NSString::from_str("NSApplicationWillFinishLaunchingNotification");
+        let _: () = msg_send![
+            center,
+            addObserver: observer_ptr,
+            selector: objc2::sel!(appWillFinishLaunching:),
+            name: &*name,
+            object: std::ptr::null::<AnyObject>()
+        ];
+        // NSNotificationCenter holds the observer unretained; keep it alive.
+        std::mem::forget(observer);
+    }
 }
 
 // ─── ObjC action handler ─────────────────────────────────────────────────────
@@ -104,6 +200,9 @@ pub fn install(ctx: &egui::Context) {
             static NSApp: Option<&'static NSApplication>;
         }
         let Some(app) = NSApp else { return };
+
+        // Fallback in case the will-finish-launching notification was missed.
+        inject_open_file_method();
 
         let handler: Retained<MenuHandler> = msg_send![MenuHandler::class(), new];
         let handler_ref: &AnyObject = &*(handler.as_ref() as *const MenuHandler as *const AnyObject);
