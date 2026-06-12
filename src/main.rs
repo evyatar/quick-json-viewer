@@ -614,8 +614,7 @@ impl App {
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(12.0);
-                    ui.label("A fast, lightweight JSON tree viewer");
-                    ui.label("with search, BiDi text support, and more.");
+                    ui.label("A fast, lightweight JSON tree viewer with advanced search, BiDi text support, and more.");
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(12.0);

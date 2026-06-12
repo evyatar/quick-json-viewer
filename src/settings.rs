@@ -152,6 +152,17 @@ pub fn show_settings_window(
         .min_width(360.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
+            // Pin this window's fonts to a fixed size: its widgets edit the
+            // global font settings, and letting those changes resize the
+            // window mid-drag shifts the slider under the cursor.
+            let style = ui.style_mut();
+            for text_style in [egui::TextStyle::Body, egui::TextStyle::Button, egui::TextStyle::Monospace] {
+                style.text_styles.insert(
+                    text_style,
+                    egui::FontId::new(14.0, egui::FontFamily::Monospace),
+                );
+            }
+
             ui.add_space(8.0);
 
             // ── Appearance ───────────────────────────────────────────────────
