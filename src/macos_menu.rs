@@ -22,6 +22,7 @@ pub const ACT_COLLAPSE_ALL: u32 = 1 << 3;
 pub const ACT_EXPAND_ALL:   u32 = 1 << 4;
 pub const ACT_HELP:         u32 = 1 << 5;
 pub const ACT_ABOUT:        u32 = 1 << 6;
+pub const ACT_PASTE:        u32 = 1 << 7;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -136,6 +137,11 @@ define_class!(
             PENDING.fetch_or(ACT_OPEN_FILE, Ordering::Relaxed);
             if let Some(c) = CTX.get() { c.request_repaint(); }
         }
+        #[unsafe(method(handlePaste:))]
+        fn handle_paste(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_PASTE, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
         #[unsafe(method(handleSettings:))]
         fn handle_settings(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_SETTINGS, Ordering::Relaxed);
@@ -214,6 +220,10 @@ pub fn install(ctx: &egui::Context) {
         // ── File ─────────────────────────────────────────────────────────────
         let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
         add_item(&file_menu, "Open…",    "o", cmd,  objc2::sel!(handleOpenFile:),   handler_ref);
+        // ⇧⌘V — a plain ⌘V key equivalent here would be swallowed by the menu
+        // and never reach the search box; bare ⌘V is handled in the egui layer.
+        add_item(&file_menu, "Paste JSON / JWT", "v", cmd | NSEventModifierFlags::Shift,
+                 objc2::sel!(handlePaste:), handler_ref);
         file_menu.addItem(&NSMenuItem::separatorItem(mtm));
         add_item(&file_menu, "Settings", ",", cmd,  objc2::sel!(handleSettings:),   handler_ref);
 

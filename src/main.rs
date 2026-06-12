@@ -3,6 +3,7 @@ mod loader;
 #[cfg(target_os = "macos")]
 mod macos_menu;
 mod parser;
+mod paste;
 mod search;
 mod settings;
 mod tree;
@@ -62,7 +63,7 @@ enum RowAction {
 // ─── app state ───────────────────────────────────────────────────────────────
 
 struct FileInfo {
-    path:       PathBuf,
+    name:       String,
     size_bytes: u64,
 }
 
@@ -75,6 +76,7 @@ struct App {
     search_pending: Option<std::thread::JoinHandle<Vec<u32>>>,
     file_info:      Option<FileInfo>,
     focus_search:   bool,
+    paste_pending:  bool,
     settings:       Settings,
     settings_open:  bool,
     help_open:      bool,
@@ -97,6 +99,7 @@ impl Default for App {
             search_pending: None,
             file_info:      None,
             focus_search:    false,
+            paste_pending:   false,
             settings:        Settings::default(),
             settings_open:   false,
             help_open:       false,
@@ -221,6 +224,7 @@ impl eframe::App for App {
             }
             let acts = macos_menu::take_actions();
             if acts & macos_menu::ACT_OPEN_FILE    != 0 { self.open_file_dialog(); }
+            if acts & macos_menu::ACT_PASTE        != 0 { self.request_paste(ui.ctx()); }
             if acts & macos_menu::ACT_SETTINGS     != 0 { self.settings_open = true; }
             if acts & macos_menu::ACT_FOCUS_SEARCH != 0 { self.focus_search = true; }
             if acts & macos_menu::ACT_COLLAPSE_ALL != 0 {
@@ -277,6 +281,31 @@ impl eframe::App for App {
         });
         if let Some(path) = dropped_path {
             self.open_file(path);
+        }
+
+        // ── 3b. Paste — view clipboard text as a document. Fires on ⌘V when no
+        // text field is focused, or unconditionally after a menu/toolbar paste
+        // request (`paste_pending`). The event is removed from the input queue
+        // so the search box never sees it.
+        let no_text_focus = ui.ctx().memory(|m| m.focused().is_none());
+        if self.paste_pending || no_text_focus {
+            let pasted = ui.input_mut(|i| {
+                let mut found = None;
+                i.events.retain(|e| {
+                    if found.is_none() {
+                        if let egui::Event::Paste(s) = e {
+                            found = Some(s.clone());
+                            return false;
+                        }
+                    }
+                    true
+                });
+                found
+            });
+            if let Some(text) = pasted {
+                self.paste_pending = false;
+                self.open_pasted(&text);
+            }
         }
 
         // ── 4. Keyboard shortcuts ──
@@ -382,6 +411,11 @@ impl App {
                     ui.close();
                     self.open_file_dialog();
                 }
+                if ui.add(egui::Button::new("Paste JSON / JWT").shortcut_text("⌘V")).clicked() {
+                    ui.close();
+                    let ctx = ui.ctx().clone();
+                    self.request_paste(&ctx);
+                }
                 ui.separator();
                 if ui.add(egui::Button::new("Settings").shortcut_text("⌘,")).clicked() {
                     ui.close();
@@ -459,6 +493,7 @@ impl App {
                     .show(ui, |ui| {
                         section(ui, "File");
                         row(ui, "⌘ O",       "Open file");
+                        row(ui, "⌘ V",       "Paste JSON / JWT from clipboard");
                         row(ui, "⌘ ,",       "Settings");
 
                         section(ui, "Navigation");
@@ -684,7 +719,7 @@ impl App {
                 if self.load_rx.is_some() {
                     ui.spinner();
                 } else {
-                    ui.label("Open a JSON file to get started\n(⌘O or drag-and-drop)");
+                    ui.label("Open a JSON file to get started\n(⌘O, drag-and-drop, or ⌘V to paste JSON / JWT)");
                 }
             });
             return;
@@ -978,13 +1013,7 @@ impl App {
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             if let Some(info) = &self.file_info {
-                ui.label(
-                    info.path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .as_ref(),
-                );
+                ui.label(&info.name);
                 ui.separator();
                 ui.label(format_size(info.size_bytes));
                 if let Some(t) = &self.tree {
@@ -1023,13 +1052,40 @@ impl App {
 
     fn open_file(&mut self, path: PathBuf) {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        self.file_info    = Some(FileInfo { path: path.clone(), size_bytes: size });
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.file_info    = Some(FileInfo { name, size_bytes: size });
         self.tree         = None;
         self.load_error   = None;
         self.load_progress = 0.0;
         self.search_input.clear();
         self.search_pending = None;
         self.load_rx      = Some(loader::spawn_load(path));
+    }
+
+    /// Ask the windowing backend for the clipboard contents; they arrive as an
+    /// `Event::Paste` on a following frame, which `paste_pending` routes to
+    /// `open_pasted` even if a text field has focus.
+    fn request_paste(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        self.paste_pending = true;
+    }
+
+    fn open_pasted(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let (data, name) = match paste::decode_jwt(text) {
+            Some(decoded) => (decoded, "Pasted JWT"),
+            None          => (text.as_bytes().to_vec(), "Pasted JSON"),
+        };
+        self.file_info    = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64 });
+        self.tree         = None;
+        self.load_error   = None;
+        self.load_progress = 0.0;
+        self.search_input.clear();
+        self.search_pending = None;
+        self.load_rx      = Some(loader::spawn_parse(data));
     }
 
     fn kick_search(&mut self) {

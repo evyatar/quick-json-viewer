@@ -320,19 +320,15 @@ mod tests {
     use crate::parser::parse_bytes;
     use std::sync::Arc;
 
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
     fn make_index(json: &str) -> Arc<JsonIndex> {
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("qjv_search_{n}.json"));
-        std::fs::write(&path, json.as_bytes()).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
-        let _ = std::fs::remove_file(&path);
+        let data = json.as_bytes().to_vec();
         let mut key_arena = Vec::new();
         let (nodes, root, is_ndjson) =
-            parse_bytes(&mmap[..], &mut key_arena, &mut |_| {}).unwrap();
-        Arc::new(JsonIndex { _file: file, mmap, nodes, key_arena, root, is_ndjson })
+            parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
+        Arc::new(JsonIndex {
+            data: crate::index::JsonData::Memory(data),
+            nodes, key_arena, root, is_ndjson,
+        })
     }
 
     #[test]

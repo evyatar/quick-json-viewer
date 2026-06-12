@@ -8,6 +8,7 @@ Built with Rust + [egui](https://github.com/emilk/egui). Uses memory-mapped file
 
 - **JSON & NDJSON** — single-document JSON and newline-delimited JSON both supported
 - **Large file support** — memory-mapped I/O; the file is never fully loaded into RAM
+- **Paste to view** — ⌘V pastes JSON straight from the clipboard; JWT tokens are decoded into header / payload / signature
 - **Full-text & regex search** — highlights all matches, navigate with ⌘G / ⌘⇧G
 - **Keyboard-driven navigation** — arrow keys, Page Up/Down, Home/End
 - **BiDi text** — correct display of Hebrew, Arabic, and other RTL content
@@ -40,6 +41,7 @@ cargo test
 | Key | Action |
 |-----|--------|
 | ⌘O | Open file |
+| ⌘V | Paste JSON / JWT from clipboard |
 | ⌘F | Focus search |
 | ⌘, | Settings |
 | ↑ / ↓ | Select previous / next row |
@@ -59,9 +61,10 @@ Right-click any row to copy its JSON path, key, or value.
 |------|---------|
 | `src/main.rs` | UI layout, keyboard handling, app state |
 | `src/parser.rs` | Hand-written JSON / NDJSON parser |
-| `src/index.rs` | Flat node array and memory-mapped file handle |
+| `src/index.rs` | Flat node array over the backing data (mmap or pasted buffer) |
 | `src/tree.rs` | Tree expansion, selection, and search state |
 | `src/search.rs` | Full-text and regex search over node keys/values |
 | `src/loader.rs` | Background file loading via message-passing channel |
+| `src/paste.rs` | Pasted-text handling and JWT decoding |
 | `src/settings.rs` | Persistent user preferences |
 | `src/macos_menu.rs` | Native macOS menu bar via Objective-C FFI |

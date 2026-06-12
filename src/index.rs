@@ -17,7 +17,7 @@ pub enum NodeKind {
 pub struct Node {
     pub kind:         NodeKind,
     pub depth:        u16,
-    /// Byte range in the mmap (value_start..value_end).
+    /// Byte range in the source data (value_start..value_end).
     pub value_start:  u64,
     pub value_end:    u64,
     /// Byte range in JsonIndex::key_arena for the object-key string.
@@ -30,9 +30,24 @@ pub struct Node {
     pub array_index:  u32,   // u32::MAX = not an array element; else 0-based index in parent array
 }
 
+/// Backing storage for the raw JSON text — an mmap'd file or an in-memory
+/// buffer (pasted text).
+pub enum JsonData {
+    Mapped { _file: File, mmap: Mmap },
+    Memory(Vec<u8>),
+}
+
+impl JsonData {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            JsonData::Mapped { mmap, .. } => &mmap[..],
+            JsonData::Memory(buf)         => buf,
+        }
+    }
+}
+
 pub struct JsonIndex {
-    pub _file:     File,
-    pub mmap:      Mmap,
+    pub data:      JsonData,
     pub nodes:     Vec<Node>,
     pub key_arena: Vec<u8>,
     pub root:      u32,
@@ -50,8 +65,8 @@ impl JsonIndex {
         std::str::from_utf8(&self.key_arena[s..e]).unwrap_or("?")
     }
 
-    /// Borrow the raw bytes of a value from the mmap.
+    /// Borrow the raw bytes of a value from the source data.
     pub fn value_bytes<'a>(&'a self, n: &Node) -> &'a [u8] {
-        &self.mmap[n.value_start as usize..n.value_end as usize]
+        &self.data.bytes()[n.value_start as usize..n.value_end as usize]
     }
 }
