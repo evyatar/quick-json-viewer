@@ -389,6 +389,14 @@ impl eframe::App for App {
                 self.toolbar(ui);
             });
 
+        if self.settings.show_breadcrumbs && self.tree.is_some() {
+            egui::Panel::top("breadcrumbs")
+                .exact_size(self.settings.font_size + 14.0)
+                .show_inside(ui, |ui| {
+                    self.breadcrumbs_bar(ui);
+                });
+        }
+
         egui::Panel::bottom("statusbar")
             .exact_size(22.0)
             .show_inside(ui, |ui| {
@@ -707,6 +715,83 @@ impl App {
                 }
             });
         });
+    }
+}
+
+// ─── breadcrumbs bar ─────────────────────────────────────────────────────────
+
+impl App {
+    fn breadcrumbs_bar(&mut self, ui: &mut egui::Ui) {
+        let (index, sel) = {
+            let Some(tree) = &self.tree else { return };
+            let Some(sel) = tree.selected else { return };
+            (Arc::clone(&tree.index), sel)
+        };
+
+        // Ancestor chain, root first.
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = sel;
+        loop {
+            chain.push(cur);
+            let parent = index.nodes[cur as usize].parent;
+            if parent == u32::MAX {
+                break;
+            }
+            cur = parent;
+        }
+        chain.reverse();
+
+        let mut jump_to: Option<u32> = None;
+
+        egui::ScrollArea::horizontal()
+            .id_salt("breadcrumbs_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, &node_idx) in chain.iter().enumerate() {
+                        if i > 0 {
+                            ui.label(egui::RichText::new(">").weak());
+                        }
+                        let node = &index.nodes[node_idx as usize];
+                        let label: String = if node.parent == u32::MAX {
+                            "$".to_owned()
+                        } else if node.key_len > 0 {
+                            index.key_of(node).to_owned()
+                        } else if node.array_index != u32::MAX {
+                            format!("[{}]", node.array_index)
+                        } else {
+                            "\"\"".to_owned()
+                        };
+                        let display = bidi_reorder(&label).into_owned();
+                        let is_last = i + 1 == chain.len();
+                        let text = if is_last {
+                            egui::RichText::new(display).strong()
+                        } else {
+                            egui::RichText::new(display)
+                        };
+                        let resp = ui
+                            .selectable_label(false, text)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            jump_to = Some(node_idx);
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Copy Path").clicked() {
+                                ui.ctx().copy_text(build_path(&index.nodes, &index, node_idx));
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+            });
+
+        if let Some(node_idx) = jump_to {
+            if let Some(t) = &mut self.tree {
+                t.selected = Some(node_idx);
+                t.ensure_visible(node_idx);
+            }
+        }
     }
 }
 

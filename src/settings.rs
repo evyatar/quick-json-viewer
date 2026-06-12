@@ -52,12 +52,18 @@ pub enum FontFamily {
     Monospace,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub theme:         Theme,
     pub font_family:   FontFamily,
     pub font_size:     f32,
     pub show_menu_bar: bool,
+    #[serde(default = "default_true")]
+    pub show_breadcrumbs: bool,
 }
 
 impl Default for Settings {
@@ -67,6 +73,7 @@ impl Default for Settings {
             font_family:   FontFamily::Monospace,
             font_size:     14.0,
             show_menu_bar: false,
+            show_breadcrumbs: true,
         }
     }
 }
@@ -207,6 +214,10 @@ pub fn show_settings_window(
                 .show(ui, |ui| {
                     ui.label("Show menu bar");
                     ui.checkbox(&mut settings.show_menu_bar, "");
+                    ui.end_row();
+
+                    ui.label("Show breadcrumbs");
+                    ui.checkbox(&mut settings.show_breadcrumbs, "");
                     ui.end_row();
                 });
 
