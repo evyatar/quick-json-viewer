@@ -30,10 +30,6 @@ pub const STRING:      Color32 = Color32::from_rgb(206, 145, 120); // tan
 pub const BOOL:        Color32 = Color32::from_rgb(86, 156, 214);  // blue
 pub const NULL:        Color32 = Color32::from_rgb(160, 160, 160); // gray
 
-// ── Badges ───────────────────────────────────────────────────────────────
-pub const BADGE_BG:     Color32 = Color32::from_rgb(0x1A, 0x22, 0x38); // neutral badge background (e.g. ARRAY[43])
-pub const BADGE_BORDER: Color32 = Color32::from_rgb(0x2A, 0x36, 0x56);
-
 /// Yellow highlight behind search matches (unmultiplied rgba 255,235,100,76).
 pub const MATCH_BG: Color32 = Color32::from_rgba_unmultiplied_const(255, 235, 100, 76);
 

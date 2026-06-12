@@ -941,6 +941,8 @@ fn render_row(
     let is_match     = search_result_set.contains(&node_idx);
     let is_container = matches!(kind, NodeKind::Object | NodeKind::Array);
     let has_children = child_count > 0;
+    // The root is always expanded — no caret, no toggling.
+    let can_toggle   = is_container && has_children && node_idx != index.root;
 
     let dark = ui.visuals().dark_mode;
     // Key text + color (the " : " separator is painted separately, in PUNCT)
@@ -1061,7 +1063,7 @@ fn render_row(
         egui::pos2(rect.left() + indent, rect.top()),
         egui::vec2(16.0, row_h),
     );
-    if is_container && has_children {
+    if can_toggle {
         let tri      = if is_expanded { "▼" } else { "▶" };
         let tri_font = egui::FontId::new((val_font.size - 3.0).max(8.0), val_font.family.clone());
         let tri_col  = if dark { theme::TEXT_FAINT } else { text_col };
@@ -1085,7 +1087,7 @@ fn render_row(
     if response.clicked() {
         actions.push(RowAction::Select(node_idx));
         // Toggle if click was on triangle
-        if is_container && has_children {
+        if can_toggle {
             if let Some(click_pos) = response.interact_pointer_pos() {
                 if tri_rect.contains(click_pos) {
                     actions.push(RowAction::Toggle(node_idx));
@@ -1093,7 +1095,7 @@ fn render_row(
             }
         }
     }
-    if response.double_clicked() && is_container && has_children {
+    if response.double_clicked() && can_toggle {
         // Double-click anywhere on a container toggles it
         actions.push(RowAction::Toggle(node_idx));
     }
@@ -1226,23 +1228,6 @@ impl App {
                         theme::ACCENT,
                         egui::Stroke::NONE,
                     );
-
-                    if let Some(root) = t.index.nodes.first() {
-                        let label = match root.kind {
-                            index::NodeKind::Array  => Some(format!("ARRAY[{}]",   root.child_count)),
-                            index::NodeKind::Object => Some(format!("OBJECT{{{}}}", root.child_count)),
-                            _                       => None,
-                        };
-                        if let Some(label) = label {
-                            ui.add_space(8.0);
-                            status_badge(
-                                ui,
-                                egui::RichText::new(label).small().color(theme::TEXT_MUTED),
-                                theme::BADGE_BG,
-                                egui::Stroke::new(1.0, theme::BADGE_BORDER),
-                            );
-                        }
-                    }
                 });
             }
         });

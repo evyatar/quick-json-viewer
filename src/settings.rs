@@ -105,6 +105,8 @@ impl Settings {
             egui::TextStyle::Button,
             egui::FontId::new(self.font_size, family),
         );
+        // egui's default (4, 1) plus 2 px on every side.
+        style.spacing.button_padding = egui::vec2(6.0, 3.0);
         ctx.set_global_style(style);
     }
 

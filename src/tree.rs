@@ -44,6 +44,8 @@ impl TreeState {
     }
 
     pub fn refresh_visible(&mut self) {
+        // The root has no caret and is always expanded.
+        self.expanded.insert(self.index.root);
         self.visible = rebuild_visible(self.index.root, &self.index.nodes, &self.expanded);
     }
 
