@@ -78,6 +78,7 @@ struct App {
     settings:       Settings,
     settings_open:  bool,
     help_open:      bool,
+    search_help_open: bool,
     about_open:     bool,
     type_ahead:     String,
     type_ahead_time: f64,
@@ -99,6 +100,7 @@ impl Default for App {
             settings:        Settings::default(),
             settings_open:   false,
             help_open:       false,
+            search_help_open: false,
             about_open:      false,
             type_ahead:      String::new(),
             type_ahead_time: 0.0,
@@ -207,6 +209,7 @@ impl eframe::App for App {
             show_settings_window(settings, ui.ctx(), open);
         }
         self.show_help_window(ui.ctx());
+        self.show_search_help_window(ui.ctx());
         self.show_about_window(ui.ctx());
 
         // ── macOS native menu bar (installed once, actions polled every frame) ──
@@ -406,6 +409,10 @@ impl App {
                     ui.close();
                     self.help_open = true;
                 }
+                if ui.button("Search Syntax").clicked() {
+                    ui.close();
+                    self.search_help_open = true;
+                }
                 ui.separator();
                 if ui.button("About JSON Viewer").clicked() {
                     ui.close();
@@ -475,6 +482,62 @@ impl App {
             });
     }
 
+    fn show_search_help_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("🔍  Search Syntax")
+            .open(&mut self.search_help_open)
+            .collapsible(false)
+            .resizable(false)
+            .min_width(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+
+                let row = |ui: &mut egui::Ui, syntax: &str, desc: &str| {
+                    ui.label(egui::RichText::new(syntax).monospace().strong());
+                    ui.label(desc);
+                    ui.end_row();
+                };
+
+                let section = |ui: &mut egui::Ui, title: &str| {
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+                    ui.label(egui::RichText::new(title).strong());
+                    ui.label("");
+                    ui.end_row();
+                };
+
+                egui::Grid::new("search_syntax_grid")
+                    .num_columns(2)
+                    .spacing([24.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        section(ui, "Text");
+                        row(ui, "error",          "Keys or values containing \"error\"");
+                        row(ui, "\"foo bar\"",    "Quote to match text with spaces");
+
+                        section(ui, "Target");
+                        row(ui, "key:name",       "Keys containing \"name\"");
+                        row(ui, "value:err",      "Values containing \"err\"");
+
+                        section(ui, "Comparison");
+                        row(ui, "age > 30",       "Key \"age\" with numeric value > 30");
+                        row(ui, "price <= 9.99",  "Operators:  =  !=  <  <=  >  >=");
+                        row(ui, "status = active","Exact string equality");
+                        row(ui, "value > 100",    "Any key with numeric value > 100");
+                        row(ui, "date >= 2024-01-01", "Non-numbers compare alphabetically");
+
+                        section(ui, "Combining");
+                        row(ui, "key:user value > 1000", "Space-separated parts — all must match");
+
+                        section(ui, "Regex");
+                        row(ui, ".* toggle",      "Regex on keys and values (disables the above)");
+                    });
+
+                ui.add_space(8.0);
+            });
+    }
+
     fn show_about_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("About JSON Viewer")
             .open(&mut self.about_open)
@@ -529,7 +592,7 @@ impl App {
                     ui.painter().layout_job(job)
                 };
                 let te = egui::TextEdit::singleline(&mut self.search_input)
-                    .hint_text("Search…")
+                    .hint_text("Search…  (key:id, age > 30)")
                     .desired_width(300.0)
                     .layouter(&mut layouter);
                 ui.add(te)
@@ -580,6 +643,11 @@ impl App {
                     t.search_use_regex = re;
                 }
                 self.kick_search();
+            }
+
+            // Search syntax help
+            if ui.button("?").on_hover_text("Search syntax help").clicked() {
+                self.search_help_open = true;
             }
 
             let has_results = !self.search_input.is_empty();
