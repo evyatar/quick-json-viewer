@@ -110,11 +110,11 @@ impl Settings {
 
     pub fn apply_theme(&self, ctx: &egui::Context, prefer_dark: bool) {
         let visuals = match self.theme {
-            Theme::Dark => egui::Visuals::dark(),
+            Theme::Dark => crate::theme::visuals(),
             Theme::Light => egui::Visuals::light(),
             Theme::Auto => {
                 if prefer_dark {
-                    egui::Visuals::dark()
+                    crate::theme::visuals()
                 } else {
                     egui::Visuals::light()
                 }

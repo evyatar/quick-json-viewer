@@ -6,6 +6,7 @@ mod parser;
 mod paste;
 mod search;
 mod settings;
+mod theme;
 mod tree;
 
 use std::path::PathBuf;
@@ -384,7 +385,12 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("toolbar")
-            .exact_size(36.0)
+            .exact_size(44.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_PANEL)
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
+            )
             .show_inside(ui, |ui| {
                 self.toolbar(ui);
             });
@@ -392,13 +398,23 @@ impl eframe::App for App {
         if self.settings.show_breadcrumbs && self.tree.is_some() {
             egui::Panel::top("breadcrumbs")
                 .exact_size(self.settings.font_size + 14.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BG_BREADCRUMBS)
+                        .inner_margin(egui::Margin::symmetric(10, 0)),
+                )
                 .show_inside(ui, |ui| {
                     self.breadcrumbs_bar(ui);
                 });
         }
 
         egui::Panel::bottom("statusbar")
-            .exact_size(22.0)
+            .exact_size(26.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_PANEL)
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
+            )
             .show_inside(ui, |ui| {
                 self.status_bar(ui);
             });
@@ -618,69 +634,89 @@ impl App {
             if ui.button("Open File  ⌘O").clicked() {
                 self.open_file_dialog();
             }
-            ui.separator();
+            ui.add_space(8.0);
 
-            let resp = {
-                let font_id = egui::TextStyle::Body.resolve(ui.style());
-                let color   = ui.visuals().text_color();
-                let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let display = bidi_reorder(text.as_str());
-                    let mut job = egui::text::LayoutJob::simple(
-                        display.into_owned(),
-                        font_id.clone(),
-                        color,
-                        wrap_width,
-                    );
-                    job.wrap.max_rows = 1;
-                    ui.painter().layout_job(job)
-                };
-                let te = egui::TextEdit::singleline(&mut self.search_input)
-                    .hint_text("Search…  (key:id, age > 30)")
-                    .desired_width(300.0)
-                    .layouter(&mut layouter);
-                ui.add(te)
-            };
-            if resp.changed() {
-                self.kick_search();
-            }
-            if self.focus_search {
-                resp.request_focus();
-                self.focus_search = false;
-            }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some(t) = &mut self.tree {
-                    t.search_next();
-                }
-            }
+            // Search pill — rounded container holding the search field
+            egui::Frame::new()
+                .fill(theme::BG_SEARCH)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(8, 2))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
 
-            // Clear button — only visible when the field has content
-            if !self.search_input.is_empty() {
-                let size = egui::Vec2::splat(16.0);
-                let (rect, clear) = ui.allocate_exact_size(size, egui::Sense::click());
-                let color = if clear.hovered() {
-                    ui.visuals().widgets.hovered.text_color()
-                } else {
-                    ui.visuals().widgets.inactive.text_color()
-                };
-                if clear.hovered() {
-                    ui.painter().circle_filled(rect.center(), 7.0, ui.visuals().widgets.hovered.bg_fill);
-                }
-                let stroke = egui::Stroke::new(1.5, color);
-                let d = 3.5;
-                let c = rect.center();
-                ui.painter().line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
-                ui.painter().line_segment([c + egui::vec2(d, -d), c + egui::vec2(-d, d)], stroke);
-                if clear.clicked() {
-                    self.search_input.clear();
-                    self.kick_search();
-                    resp.request_focus();
-                }
-            }
+                        ui.label(egui::RichText::new("🔍").color(theme::TEXT_MUTED));
+
+                        let resp = {
+                            let font_id = egui::TextStyle::Body.resolve(ui.style());
+                            let color   = ui.visuals().text_color();
+                            let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                                let display = bidi_reorder(text.as_str());
+                                let mut job = egui::text::LayoutJob::simple(
+                                    display.into_owned(),
+                                    font_id.clone(),
+                                    color,
+                                    wrap_width,
+                                );
+                                job.wrap.max_rows = 1;
+                                ui.painter().layout_job(job)
+                            };
+                            let te = egui::TextEdit::singleline(&mut self.search_input)
+                                .hint_text("Search…  (key:id, age > 30)")
+                                .desired_width(260.0)
+                                .frame(egui::Frame::NONE)
+                                .layouter(&mut layouter);
+                            ui.add(te)
+                        };
+                        if resp.changed() {
+                            self.kick_search();
+                        }
+                        if self.focus_search {
+                            resp.request_focus();
+                            self.focus_search = false;
+                        }
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            if let Some(t) = &mut self.tree {
+                                t.search_next();
+                            }
+                        }
+
+                        // Clear button — only visible when the field has content
+                        if !self.search_input.is_empty() {
+                            let size = egui::Vec2::splat(16.0);
+                            let (rect, clear) = ui.allocate_exact_size(size, egui::Sense::click());
+                            let color = if clear.hovered() {
+                                ui.visuals().widgets.hovered.text_color()
+                            } else {
+                                ui.visuals().widgets.inactive.text_color()
+                            };
+                            if clear.hovered() {
+                                ui.painter().circle_filled(rect.center(), 7.0, ui.visuals().widgets.hovered.bg_fill);
+                            }
+                            let stroke = egui::Stroke::new(1.5, color);
+                            let d = 3.5;
+                            let c = rect.center();
+                            ui.painter().line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
+                            ui.painter().line_segment([c + egui::vec2(d, -d), c + egui::vec2(-d, d)], stroke);
+                            if clear.clicked() {
+                                self.search_input.clear();
+                                self.kick_search();
+                                resp.request_focus();
+                            }
+                        }
+
+                    });
+                });
 
             // Regex toggle
             let use_re = self.tree.as_ref().map(|t| t.search_use_regex).unwrap_or(false);
+            let re_color = if use_re { theme::ACCENT } else { theme::TEXT_MUTED };
             let mut re = use_re;
-            if ui.selectable_label(re, ".*").clicked() {
+            if ui
+                .selectable_label(re, egui::RichText::new(".*").monospace().color(re_color))
+                .clicked()
+            {
                 re = !re;
                 if let Some(t) = &mut self.tree {
                     t.search_use_regex = re;
@@ -704,7 +740,10 @@ impl App {
             // Result counter
             if let Some(t) = &self.tree {
                 if !t.search_results.is_empty() {
-                    ui.label(format!("{}/{}", t.search_cursor + 1, t.search_results.len()));
+                    ui.label(
+                        egui::RichText::new(format!("{}/{}", t.search_cursor + 1, t.search_results.len()))
+                            .color(theme::TEXT_MUTED),
+                    );
                 }
             }
 
@@ -715,6 +754,10 @@ impl App {
                 }
             });
         });
+
+        // 1 px bottom border under the header
+        let r = ui.max_rect();
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, theme::BORDER));
     }
 }
 
@@ -722,6 +765,12 @@ impl App {
 
 impl App {
     fn breadcrumbs_bar(&mut self, ui: &mut egui::Ui) {
+        // 1 px bottom border under the strip
+        let r = ui.max_rect();
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, theme::BORDER));
+
+        let font_size = self.settings.font_size - 1.0;
+
         let (index, sel) = {
             let Some(tree) = &self.tree else { return };
             let Some(sel) = tree.selected else { return };
@@ -751,11 +800,16 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for (i, &node_idx) in chain.iter().enumerate() {
                         if i > 0 {
-                            ui.label(egui::RichText::new(">").weak());
+                            ui.label(
+                                egui::RichText::new("›")
+                                    .monospace()
+                                    .size(font_size)
+                                    .color(theme::TEXT_FAINT),
+                            );
                         }
                         let node = &index.nodes[node_idx as usize];
                         let label: String = if node.parent == u32::MAX {
-                            "$".to_owned()
+                            "root".to_owned()
                         } else if node.key_len > 0 {
                             index.key_of(node).to_owned()
                         } else if node.array_index != u32::MAX {
@@ -765,11 +819,10 @@ impl App {
                         };
                         let display = bidi_reorder(&label).into_owned();
                         let is_last = i + 1 == chain.len();
-                        let text = if is_last {
-                            egui::RichText::new(display).strong()
-                        } else {
-                            egui::RichText::new(display)
-                        };
+                        let text = egui::RichText::new(display)
+                            .monospace()
+                            .size(font_size)
+                            .color(if is_last { theme::KEY } else { theme::TEXT_MUTED });
                         let resp = ui
                             .selectable_label(false, text)
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -804,7 +857,10 @@ impl App {
                 if self.load_rx.is_some() {
                     ui.spinner();
                 } else {
-                    ui.label("Open a JSON file to get started\n(⌘O, drag-and-drop, or ⌘V to paste JSON / JWT)");
+                    ui.label(
+                        egui::RichText::new("Open a JSON file to get started\n(⌘O, drag-and-drop, or ⌘V to paste JSON / JWT)")
+                            .color(theme::TEXT_MUTED),
+                    );
                 }
             });
             return;
@@ -887,32 +943,29 @@ fn render_row(
     let has_children = child_count > 0;
 
     let dark = ui.visuals().dark_mode;
-    // Key text + color
+    // Key text + color (the " : " separator is painted separately, in PUNCT)
     let (key_text, key_color): (String, egui::Color32) = if node.key_len > 0 {
         (
-            format!("\"{}\": ", index.key_of(node)),
-            if dark { egui::Color32::from_rgb(156, 220, 254) } else { egui::Color32::from_rgb(0, 90, 158) },
+            format!("\"{}\"", index.key_of(node)),
+            if dark { theme::KEY } else { egui::Color32::from_rgb(0, 90, 158) },
         )
     } else if node.array_index != u32::MAX {
         (
-            format!("{}: ", node.array_index),
-            if dark { egui::Color32::from_rgb(150, 200, 150) } else { egui::Color32::from_rgb(40, 120, 40) },
+            format!("{}", node.array_index),
+            if dark { theme::ARRAY_INDEX } else { egui::Color32::from_rgb(40, 120, 40) },
         )
     } else {
         (String::new(), egui::Color32::TRANSPARENT)
     };
+    let sep_text  = " : ";
+    let sep_color = if dark { theme::PUNCT } else { egui::Color32::from_rgb(120, 120, 120) };
 
     // Value text + color
-    let str_color = if dark { egui::Color32::from_rgb(206, 145, 120) } else { egui::Color32::from_rgb(163, 21, 21) };
+    let str_color       = if dark { theme::STRING }    else { egui::Color32::from_rgb(163, 21, 21) };
+    let container_color = if dark { theme::CONTAINER } else { egui::Color32::from_rgb(100, 100, 100) };
     let (value_text, value_color): (String, egui::Color32) = match kind {
-        NodeKind::Object => (
-            format!("{{ {} }}", child_count),
-            if dark { egui::Color32::from_rgb(180, 180, 180) } else { egui::Color32::from_rgb(100, 100, 100) },
-        ),
-        NodeKind::Array => (
-            format!("[ {} ]", child_count),
-            if dark { egui::Color32::from_rgb(180, 180, 180) } else { egui::Color32::from_rgb(100, 100, 100) },
-        ),
+        NodeKind::Object => (format!("{{ {} }}", child_count), container_color),
+        NodeKind::Array  => (format!("[ {} ]",   child_count), container_color),
         NodeKind::String => {
             let raw = index.value_bytes(node);
             let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { raw };
@@ -927,13 +980,13 @@ fn render_row(
         }
         NodeKind::Number => {
             let raw = index.value_bytes(node);
-            (String::from_utf8_lossy(raw).into_owned(), if dark { egui::Color32::from_rgb(181, 206, 168) } else { egui::Color32::from_rgb(9, 134, 88) })
+            (String::from_utf8_lossy(raw).into_owned(), if dark { theme::NUMBER } else { egui::Color32::from_rgb(9, 134, 88) })
         }
         NodeKind::Bool => {
             let raw = index.value_bytes(node);
-            (String::from_utf8_lossy(raw).into_owned(), if dark { egui::Color32::from_rgb(86, 156, 214) } else { egui::Color32::from_rgb(0, 0, 210) })
+            (String::from_utf8_lossy(raw).into_owned(), if dark { theme::BOOL } else { egui::Color32::from_rgb(0, 0, 210) })
         }
-        NodeKind::Null => ("null".to_owned(), if dark { egui::Color32::from_rgb(160, 160, 160) } else { egui::Color32::from_rgb(100, 100, 100) }),
+        NodeKind::Null => ("null".to_owned(), if dark { theme::NULL } else { egui::Color32::from_rgb(100, 100, 100) }),
     };
 
     let indent  = 4.0 + depth as f32 * 16.0;
@@ -941,19 +994,23 @@ fn render_row(
     // Pre-compute display strings and key width (needed before allocation in both modes).
     let key_display   = bidi_reorder(&key_text);
     let value_display = bidi_reorder(&value_text);
-    let key_w = if !key_text.is_empty() {
-        ui.painter()
+    let (key_w, sep_w) = if !key_text.is_empty() {
+        let kw = ui.painter()
             .layout_no_wrap(key_display.as_ref().to_owned(), key_font.clone(), egui::Color32::BLACK)
-            .rect.width()
+            .rect.width();
+        let sw = ui.painter()
+            .layout_no_wrap(sep_text.to_owned(), key_font.clone(), egui::Color32::BLACK)
+            .rect.width();
+        (kw, sw)
     } else {
-        0.0
+        (0.0, 0.0)
     };
 
     // Widen the row so ScrollArea::both() can scroll horizontally.
     let val_w = ui.painter()
         .layout_no_wrap(value_display.as_ref().to_owned(), val_font.clone(), egui::Color32::BLACK)
         .rect.width();
-    let content_w = indent + 18.0 + key_w + val_w + 8.0;
+    let content_w = indent + 18.0 + key_w + sep_w + val_w + 8.0;
     let row_w = content_w.max(ui.available_width());
     let (id, rect) = ui.allocate_space(egui::vec2(row_w, row_h));
 
@@ -963,17 +1020,37 @@ fn render_row(
     if is_match {
         ui.painter().rect_filled(
             rect, 0.0,
-            if dark { egui::Color32::from_rgba_unmultiplied(255, 235, 100, 76) } else { egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140) },
+            if dark { theme::MATCH_BG } else { egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140) },
         );
     }
     if is_selected {
-        ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
+        if dark {
+            ui.painter().rect_filled(rect, 0.0, theme::SELECTION_BG);
+            // 2 px accent bar flush against the left edge of the row.
+            let bar = egui::Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2(rect.left() + 2.0, rect.bottom()),
+            );
+            ui.painter().rect_filled(bar, 0.0, theme::ACCENT);
+        } else {
+            ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
+        }
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        let hover_bg = if dark { theme::HOVER_BG } else { ui.visuals().widgets.hovered.weak_bg_fill };
+        ui.painter().rect_filled(rect, 0.0, hover_bg);
     }
 
     let painter  = ui.painter();
     let text_col = if is_selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
+
+    // Indent guides — one 1 px vertical line per ancestor level, aligned under
+    // the parent chevrons.
+    if dark {
+        for d in 0..depth {
+            let gx = rect.left() + 4.0 + d as f32 * 16.0 + 8.0;
+            painter.vline(gx, rect.y_range(), egui::Stroke::new(1.0, theme::INDENT_GUIDE));
+        }
+    }
 
     // y position for single-line elements: centred in the first row_h band.
     let y1 = rect.top() + row_h / 2.0;
@@ -985,15 +1062,19 @@ fn render_row(
         egui::vec2(16.0, row_h),
     );
     if is_container && has_children {
-        let tri = if is_expanded { "▼" } else { "▶" };
-        painter.text(egui::pos2(x + 2.0, y1), egui::Align2::LEFT_CENTER, tri, val_font.clone(), text_col);
+        let tri      = if is_expanded { "▼" } else { "▶" };
+        let tri_font = egui::FontId::new((val_font.size - 3.0).max(8.0), val_font.family.clone());
+        let tri_col  = if dark { theme::TEXT_FAINT } else { text_col };
+        painter.text(egui::pos2(x + 2.0, y1), egui::Align2::LEFT_CENTER, tri, tri_font, tri_col);
     }
     x += 18.0;
 
-    // Key (always single-line, vertically centred in the first band).
+    // Key + " : " separator (always single-line, vertically centred in the first band).
     if !key_text.is_empty() {
         painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, key_display.as_ref(), key_font.clone(), key_color);
         x += key_w;
+        painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, sep_text, key_font.clone(), sep_color);
+        x += sep_w;
     }
 
     // Value — single line, vertically centred.
@@ -1096,31 +1177,85 @@ fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) 
 
 impl App {
     fn status_bar(&self, ui: &mut egui::Ui) {
+        // 1 px top border above the bar
+        let r = ui.max_rect();
+        ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, theme::BORDER));
+
         ui.horizontal_centered(|ui| {
             if let Some(info) = &self.file_info {
-                ui.label(&info.name);
-                ui.separator();
-                ui.label(format_size(info.size_bytes));
+                ui.label(
+                    egui::RichText::new(format!("📄 {}", info.name)).color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format_size(info.size_bytes)).color(theme::TEXT_MUTED),
+                );
                 if let Some(t) = &self.tree {
-                    ui.separator();
-                    ui.label(format!("{} nodes", t.index.nodes.len()));
-                    ui.separator();
-                    ui.label(if t.index.is_ndjson { "NDJSON" } else { "JSON" });
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(format!("{} nodes", t.index.nodes.len()))
+                            .color(theme::TEXT_FAINT),
+                    );
                 }
             }
 
             if self.load_rx.is_some() {
-                ui.separator();
+                ui.add_space(10.0);
                 ui.label(format!("Loading… {:.0}%", self.load_progress * 100.0));
                 ui.spinner();
             }
 
             if let Some(e) = &self.load_error {
-                ui.separator();
+                ui.add_space(10.0);
                 ui.colored_label(egui::Color32::RED, format!("Error: {}", e));
+            }
+
+            // Right-aligned: encoding, format badge, root-type badge.
+            if let Some(t) = &self.tree {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("UTF-8").small().color(theme::TEXT_FAINT));
+                    ui.add_space(8.0);
+
+                    let fmt = if t.index.is_ndjson { "NDJSON" } else { "JSON" };
+                    status_badge(
+                        ui,
+                        egui::RichText::new(fmt).small().strong().color(egui::Color32::WHITE),
+                        theme::ACCENT,
+                        egui::Stroke::NONE,
+                    );
+
+                    if let Some(root) = t.index.nodes.first() {
+                        let label = match root.kind {
+                            index::NodeKind::Array  => Some(format!("ARRAY[{}]",   root.child_count)),
+                            index::NodeKind::Object => Some(format!("OBJECT{{{}}}", root.child_count)),
+                            _                       => None,
+                        };
+                        if let Some(label) = label {
+                            ui.add_space(8.0);
+                            status_badge(
+                                ui,
+                                egui::RichText::new(label).small().color(theme::TEXT_MUTED),
+                                theme::BADGE_BG,
+                                egui::Stroke::new(1.0, theme::BADGE_BORDER),
+                            );
+                        }
+                    }
+                });
             }
         });
     }
+}
+
+/// Small rounded badge used in the status bar.
+fn status_badge(ui: &mut egui::Ui, text: egui::RichText, fill: egui::Color32, stroke: egui::Stroke) {
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(text);
+        });
 }
 
 // ─── file helpers ────────────────────────────────────────────────────────────
