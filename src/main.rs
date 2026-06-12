@@ -174,7 +174,7 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("JSON Viewer")
         .with_inner_size([1200.0, 800.0])
-        .with_min_inner_size([600.0, 400.0]);
+        .with_min_inner_size([700.0, 400.0]);
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -636,6 +636,36 @@ impl App {
             }
             ui.add_space(8.0);
 
+            // Shrink the search field on narrow windows so the controls to its
+            // right (.*  ?  ▲  ▼  counter  ⚙) stay visible instead of being
+            // pushed off-screen.
+            let search_width = {
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let text_w = |s: &str| {
+                    ui.painter()
+                        .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                        .size()
+                        .x
+                };
+                let pad = 2.0 * ui.spacing().button_padding.x;
+                let gap = ui.spacing().item_spacing.x;
+                let counter = self
+                    .tree
+                    .as_ref()
+                    .filter(|t| !t.search_results.is_empty())
+                    .map(|t| {
+                        text_w(&format!("{}/{}", t.search_cursor + 1, t.search_results.len())) + gap
+                    })
+                    .unwrap_or(0.0);
+                let buttons: f32 = [".*", "?", "▲", "▼", "⚙"]
+                    .iter()
+                    .map(|s| text_w(s) + pad + gap)
+                    .sum();
+                // pill chrome: inner margins, icon, clear button, item gaps, stroke
+                let pill = 16.0 + text_w("🔍") + 4.0 + 16.0 + 4.0 + 2.0;
+                (ui.available_width() - buttons - counter - pill - gap).clamp(80.0, 260.0)
+            };
+
             // Search pill — rounded container holding the search field
             egui::Frame::new()
                 .fill(theme::BG_SEARCH)
@@ -664,7 +694,7 @@ impl App {
                             };
                             let te = egui::TextEdit::singleline(&mut self.search_input)
                                 .hint_text("Search…  (key:id, age > 30)")
-                                .desired_width(260.0)
+                                .desired_width(search_width)
                                 .frame(egui::Frame::NONE)
                                 .layouter(&mut layouter);
                             ui.add(te)
