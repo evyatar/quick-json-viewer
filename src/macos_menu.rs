@@ -23,6 +23,7 @@ pub const ACT_EXPAND_ALL:   u32 = 1 << 4;
 pub const ACT_HELP:         u32 = 1 << 5;
 pub const ACT_ABOUT:        u32 = 1 << 6;
 pub const ACT_PASTE:        u32 = 1 << 7;
+pub const ACT_SEARCH_SYNTAX: u32 = 1 << 8;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -167,6 +168,11 @@ define_class!(
             PENDING.fetch_or(ACT_HELP, Ordering::Relaxed);
             if let Some(c) = CTX.get() { c.request_repaint(); }
         }
+        #[unsafe(method(handleSearchSyntax:))]
+        fn handle_search_syntax(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_SEARCH_SYNTAX, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
         #[unsafe(method(handleAbout:))]
         fn handle_about(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_ABOUT, Ordering::Relaxed);
@@ -237,6 +243,7 @@ pub fn install(ctx: &egui::Context) {
         // ── Help ─────────────────────────────────────────────────────────────
         let help_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Help"));
         add_item(&help_menu, "Keyboard Shortcuts", "", none, objc2::sel!(handleHelp:),  handler_ref);
+        add_item(&help_menu, "Search Syntax",      "", none, objc2::sel!(handleSearchSyntax:), handler_ref);
         help_menu.addItem(&NSMenuItem::separatorItem(mtm));
         add_item(&help_menu, "About JSON Viewer",  "", none, objc2::sel!(handleAbout:), handler_ref);
 

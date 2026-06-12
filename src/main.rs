@@ -235,6 +235,7 @@ impl eframe::App for App {
                 if let Some(t) = &mut self.tree { t.expand_all(); }
             }
             if acts & macos_menu::ACT_HELP         != 0 { self.help_open  = true; }
+            if acts & macos_menu::ACT_SEARCH_SYNTAX != 0 { self.search_help_open = true; }
             if acts & macos_menu::ACT_ABOUT        != 0 { self.about_open = true; }
             if let Some(path) = macos_menu::take_open_file() { self.open_file(path); }
         }
