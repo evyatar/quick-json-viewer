@@ -1193,7 +1193,10 @@ impl App {
                 if let Some(t) = &self.tree {
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new(format!("{} nodes", t.index.nodes.len()))
+                        egui::RichText::new(format!(
+                            "{} nodes",
+                            format_count(t.index.nodes.len().saturating_sub(1))
+                        ))
                             .color(theme::TEXT_FAINT),
                     );
                 }
@@ -1326,6 +1329,18 @@ impl App {
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+fn format_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
 
 fn format_size(n: u64) -> String {
     const GB: u64 = 1 << 30;
