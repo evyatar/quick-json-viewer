@@ -18,6 +18,7 @@ pub const TEXT_FAINT:   Color32 = Color32::from_rgb(0x4C, 0x58, 0x74);
 // ── Interaction ──────────────────────────────────────────────────────────
 pub const ACCENT:       Color32 = Color32::from_rgb(0x3D, 0x7E, 0xFF); // blue accent (selection bar, JSON badge, focus)
 pub const SELECTION_BG: Color32 = Color32::from_rgb(0x1A, 0x23, 0x42); // selected row fill
+pub const TEXT_SELECT_BG: Color32 = Color32::from_rgb(0x2E, 0x5C, 0xB8); // selected text in text fields
 pub const HOVER_BG:     Color32 = Color32::from_rgb(0x12, 0x1A, 0x2F); // hovered row fill
 
 // ── JSON syntax (classic VS Code-style palette — easy type distinction) ─────
@@ -48,7 +49,7 @@ pub fn visuals() -> egui::Visuals {
     visuals.extreme_bg_color = BG_SEARCH; // TextEdit background
     visuals.faint_bg_color   = HOVER_BG;
 
-    visuals.selection.bg_fill = SELECTION_BG;
+    visuals.selection.bg_fill = TEXT_SELECT_BG;
     visuals.selection.stroke  = Stroke::new(1.0, TEXT_PRIMARY);
     visuals.hyperlink_color   = ACCENT;
 
