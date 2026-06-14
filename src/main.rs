@@ -1951,7 +1951,15 @@ impl App {
 /// A small toggle button for the compare options bar. Returns `true` when
 /// toggled this frame.
 fn diff_option_toggle(ui: &mut egui::Ui, pal: &theme::Palette, label: &str, hover: &str, value: &mut bool) -> bool {
-    let resp = tab_button(ui, pal, egui::RichText::new(label), *value).on_hover_text(hover);
+    let active = *value;
+    let fg = if active { pal.tab_active_fg } else { pal.text_muted };
+    let fill   = if active { pal.tab_active_bg } else { egui::Color32::TRANSPARENT };
+    let stroke = egui::Stroke::new(1.0, if active { pal.tab_active_fg } else { pal.border });
+    let button = egui::Button::new(egui::RichText::new(label).color(fg))
+        .frame(true)
+        .fill(fill)
+        .stroke(stroke);
+    let resp = ui.add(button).on_hover_text(hover);
     if resp.clicked() { *value = !*value; true } else { false }
 }
 
