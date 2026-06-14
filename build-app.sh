@@ -12,7 +12,7 @@ mkdir -p "$APP/Contents/Resources"
 cp target/aarch64-apple-darwin/release/quick-json-viewer "$APP/Contents/MacOS/quick-json-viewer"
 chmod +x "$APP/Contents/MacOS/quick-json-viewer"
 
-# ── App icon ──────────────────────────────────────────────────────────────────
+# App icon
 SRC_ICON="src/icon.png"
 if [ -f "$SRC_ICON" ]; then
     ICONSET=$(mktemp -d)/AppIcon.iconset
@@ -33,6 +33,7 @@ else
     echo "Warning: $SRC_ICON not found, skipping icon"
 fi
 
+# plist
 cat > "$APP/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -63,6 +64,9 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
 </dict>
 </plist>
 EOF
+
+# ad-hoc codesign
+codesign --force --deep --sign - "$APP"
 
 echo "Built: $APP"
 echo "Run:   open $APP"
