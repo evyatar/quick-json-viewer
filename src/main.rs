@@ -172,14 +172,14 @@ fn main() -> eframe::Result<()> {
     macos_menu::register_open_file_handler();
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("JSON Viewer")
+        .with_title("Quick JSON Viewer")
         .with_inner_size([1200.0, 800.0])
         .with_min_inner_size([700.0, 400.0]);
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
     eframe::run_native(
-        "JSON Viewer",
+        "Quick JSON Viewer",
         eframe::NativeOptions {
             viewport,
             ..Default::default()
