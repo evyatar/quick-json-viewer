@@ -1815,28 +1815,51 @@ impl App {
         };
         let title = name.unwrap_or_else(|| "— no document —".to_string());
 
-        egui::Frame::new()
-            .fill(if active { theme::SELECTION_BG } else { theme::BG_PANEL })
-            .inner_margin(egui::Margin::symmetric(8, 4))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(active, egui::RichText::new(format!("📄 {title}")).color(theme::TEXT_PRIMARY)).clicked() {
-                        self.compare.active_pane = side;
-                    }
-                    if loading { ui.spinner(); }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Paste").clicked() {
-                            self.compare.active_pane = side;
-                            let ctx = ui.ctx().clone();
-                            self.request_paste(&ctx);
-                        }
-                        if ui.small_button("Open").clicked() {
-                            self.compare.active_pane = side;
-                            self.open_into_pane_dialog(side);
-                        }
-                    });
-                });
+        // Reserve the whole header rect up-front and sense clicks on it, so a
+        // click anywhere on the header (the area not covered by the Open / Paste
+        // buttons, which are drawn on top and keep their own clicks) activates
+        // the pane. The buttons are laid out inside via a child UI.
+        let margin = egui::vec2(8.0, 4.0);
+        let height = ui.spacing().interact_size.y + 2.0 * margin.y;
+        let (rect, bg) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+        if bg.clicked() {
+            self.compare.active_pane = side;
+        }
+
+        ui.painter().rect_filled(
+            rect, 0.0,
+            if active { theme::SELECTION_BG } else { theme::BG_PANEL },
+        );
+
+        let content_rect = egui::Rect::from_min_max(rect.min + margin, rect.max - margin);
+        let mut content_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        {
+            let ui = &mut content_ui;
+            ui.label(egui::RichText::new(format!("📄 {title}")).color(theme::TEXT_PRIMARY));
+            if loading { ui.spinner(); }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Paste").clicked() {
+                    self.compare.active_pane = side;
+                    let ctx = ui.ctx().clone();
+                    self.request_paste(&ctx);
+                }
+                if ui.small_button("Open").clicked() {
+                    self.compare.active_pane = side;
+                    self.open_into_pane_dialog(side);
+                }
             });
+        }
+
+        // Pointer cursor across the entire header (set last so it wins over the
+        // buttons' default cursor).
+        if ui.rect_contains_pointer(rect) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
     }
 
     fn compare_panel(&mut self, ui: &mut egui::Ui) {
