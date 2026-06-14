@@ -17,11 +17,13 @@ Installs to `/Applications` — find it in Launchpad or open files with right-cl
 - **JSON & NDJSON** — single-document JSON and newline-delimited JSON both supported
 - **Large file support** — memory-mapped I/O; the file is never fully loaded into RAM
 - **Paste to view** — ⌘V pastes JSON straight from the clipboard; JWT tokens are decoded into header / payload / signature
-- **Full-text & regex search** — highlights all matches, navigate with ⌘G / ⌘⇧G
+- **Advanced search** — `key:name`, `value:err`, `age > 30`, operators `= != < <= > >=`, space-ANDed clauses, regex mode; all matches highlighted and navigable with ⌘G / ⌘⇧G
+- **Compare two documents** — side-by-side semantic diff; additions, removals, and changes colour-coded; configurable ignore options; ▲/▼ or ⌘G / ⌘⇧G to jump between differences
+- **Breadcrumbs bar** — shows the JSON path of the selected node; click any segment to jump to an ancestor
 - **Keyboard-driven navigation** — arrow keys, Page Up/Down, Home/End
 - **BiDi text** — correct display of Hebrew, Arabic, and other RTL content
 - **Dark / light / auto themes**
-- **Native macOS menu bar**
+- **Set as default JSON viewer** — register the app as the system-wide handler for `.json` files from Settings
 
 ## Requirements
 
@@ -56,12 +58,12 @@ cargo test
 | ← / → | Collapse / expand node |
 | ⌥C | Collapse all |
 | ⌥X | Expand all |
-| ⌘G | Next search result |
-| ⌘⇧G | Previous search result |
+| ⌘G | Next search result / next difference (Compare) |
+| ⌘⇧G | Previous search result / previous difference (Compare) |
 | Page Up/Down | Jump 20 rows |
 | Home / End | First / last row |
 
-Right-click any row to copy its JSON path, key, or value.
+Right-click any row to copy its JSON path, key, or value. Right-clicking a container also offers **Expand All** / **Collapse All** for that subtree. In Compare mode the context menu provides **Copy Left Value**, **Copy Right Value**, and **Copy Path**.
 
 ## Architecture
 
@@ -71,8 +73,9 @@ Right-click any row to copy its JSON path, key, or value.
 | `src/parser.rs` | Hand-written JSON / NDJSON parser |
 | `src/index.rs` | Flat node array over the backing data (mmap or pasted buffer) |
 | `src/tree.rs` | Tree expansion, selection, and search state |
-| `src/search.rs` | Full-text and regex search over node keys/values |
+| `src/search.rs` | Full-text, structured-query, and regex search over node keys/values |
+| `src/diff.rs` | Semantic JSON diff engine; merged tree model for the Compare view |
 | `src/loader.rs` | Background file loading via message-passing channel |
 | `src/paste.rs` | Pasted-text handling and JWT decoding |
-| `src/settings.rs` | Persistent user preferences |
+| `src/settings.rs` | Persistent user preferences; set-as-default JSON viewer |
 | `src/macos_menu.rs` | Native macOS menu bar via Objective-C FFI |
