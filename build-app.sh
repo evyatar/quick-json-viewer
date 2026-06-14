@@ -40,7 +40,8 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>JSON Viewer</string>
+  <key>CFBundleName</key><string>Quick JSON Viewer</string>
+  <key>CFBundleDisplayName</key><string>Quick JSON Viewer</string>
   <key>CFBundleIdentifier</key><string>com.evyatar.quick-json-viewer</string>
   <key>CFBundleVersion</key><string>1.0.0</string>
   <key>CFBundleExecutable</key><string>quick-json-viewer</string>
