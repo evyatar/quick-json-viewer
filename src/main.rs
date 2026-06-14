@@ -484,6 +484,11 @@ impl eframe::App for App {
         }
 
         // ── 5. Layout ──
+        // Chrome palette for this frame's theme. Derived from settings (not
+        // `ui.visuals()`) so the panel fills set here match the visuals
+        // `apply_theme` installed above, even on the first frame after a toggle.
+        let pal = theme::Palette::for_dark(self.settings.is_dark(prefer_dark));
+
         if self.settings.show_menu_bar {
             egui::Panel::top("menubar")
                 .exact_size(20.0)
@@ -496,7 +501,7 @@ impl eframe::App for App {
             .exact_size(44.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG_PANEL)
+                    .fill(pal.bg_panel)
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show_inside(ui, |ui| {
@@ -508,7 +513,7 @@ impl eframe::App for App {
                 .exact_size(self.settings.font_size + 14.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::BG_BREADCRUMBS)
+                        .fill(pal.bg_breadcrumbs)
                         .inner_margin(egui::Margin::symmetric(10, 0)),
                 )
                 .show_inside(ui, |ui| {
@@ -521,7 +526,7 @@ impl eframe::App for App {
                 .exact_size(self.settings.font_size + 20.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::BG_BREADCRUMBS)
+                        .fill(pal.bg_breadcrumbs)
                         .inner_margin(egui::Margin::symmetric(10, 0)),
                 )
                 .show_inside(ui, |ui| {
@@ -533,7 +538,7 @@ impl eframe::App for App {
             .exact_size(26.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG_PANEL)
+                    .fill(pal.bg_panel)
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show_inside(ui, |ui| {
@@ -751,8 +756,28 @@ impl App {
 
 // ─── toolbar ─────────────────────────────────────────────────────────────────
 
+/// A tab / toggle rendered as a pill. When `active` it gets a filled
+/// background with high-contrast text; when inactive it is plain (frameless)
+/// muted text. Used for the Viewer/Compare tabs and the toolbar toggles so the
+/// active state stays readable in both light and dark themes (an accent-on-
+/// accent `selectable_label` did not).
+fn tab_button(
+    ui:     &mut egui::Ui,
+    pal:    &theme::Palette,
+    label:  egui::RichText,
+    active: bool,
+) -> egui::Response {
+    let fg = if active { pal.tab_active_fg } else { pal.tab_inactive_fg };
+    let mut button = egui::Button::new(label.color(fg)).frame(active);
+    if active {
+        button = button.fill(pal.tab_active_bg);
+    }
+    ui.add(button)
+}
+
 impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         ui.horizontal_centered(|ui| {
             self.mode_tabs(ui);
             ui.add_space(10.0);
@@ -772,23 +797,21 @@ impl App {
 
         // 1 px bottom border under the header
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, theme::BORDER));
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
     }
 
     fn mode_tabs(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         for (label, mode) in [("Viewer", AppMode::Viewer), ("Compare", AppMode::Compare)] {
             let active = self.mode == mode;
-            let color = if active { theme::ACCENT } else { theme::TEXT_MUTED };
-            if ui
-                .selectable_label(active, egui::RichText::new(label).strong().color(color))
-                .clicked()
-            {
+            if tab_button(ui, &pal, egui::RichText::new(label).strong(), active).clicked() {
                 self.set_mode(mode);
             }
         }
     }
 
     fn viewer_toolbar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         if ui.button("Open File  ⌘O").clicked() {
             self.open_file_dialog();
         }
@@ -826,15 +849,15 @@ impl App {
 
             // Search pill — rounded container holding the search field
             egui::Frame::new()
-                .fill(theme::BG_SEARCH)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .fill(pal.bg_search)
+                .stroke(egui::Stroke::new(1.0, pal.border))
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(8, 2))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
 
-                        ui.label(egui::RichText::new("🔍").color(theme::TEXT_MUTED));
+                        ui.label(egui::RichText::new("🔍").color(pal.text_muted));
 
                         let resp = {
                             let font_id = egui::TextStyle::Body.resolve(ui.style());
@@ -899,15 +922,9 @@ impl App {
 
             // Regex toggle
             let use_re = self.tree.as_ref().map(|t| t.search_use_regex).unwrap_or(false);
-            let re_color = if use_re { theme::ACCENT } else { theme::TEXT_MUTED };
-            let mut re = use_re;
-            if ui
-                .selectable_label(re, egui::RichText::new(".*").monospace().color(re_color))
-                .clicked()
-            {
-                re = !re;
+            if tab_button(ui, &pal, egui::RichText::new(".*").monospace(), use_re).clicked() {
                 if let Some(t) = &mut self.tree {
-                    t.search_use_regex = re;
+                    t.search_use_regex = !use_re;
                 }
                 self.kick_search();
             }
@@ -930,13 +947,14 @@ impl App {
                 if !t.search_results.is_empty() {
                     ui.label(
                         egui::RichText::new(format!("{}/{}", t.search_cursor + 1, t.search_results.len()))
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     );
                 }
             }
     }
 
     fn compare_toolbar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // Summary of the current diff.
         if let Some(result) = &self.compare.result {
             let badge = |ui: &mut egui::Ui, n: usize, label: &str, color: egui::Color32| {
@@ -946,7 +964,7 @@ impl App {
             badge(ui, result.added,   "added",   egui::Color32::from_rgb(0x3F, 0xB9, 0x50));
             badge(ui, result.removed, "removed", egui::Color32::from_rgb(0xE5, 0x53, 0x4B));
         } else {
-            ui.label(egui::RichText::new("Load both panes to compare").color(theme::TEXT_MUTED));
+            ui.label(egui::RichText::new("Load both panes to compare").color(pal.text_muted));
         }
 
         ui.add_space(6.0);
@@ -963,9 +981,7 @@ impl App {
 
         // "diffs only" filter.
         let only = self.compare.show_only_diffs;
-        let color = if only { theme::ACCENT } else { theme::TEXT_MUTED };
-        if ui
-            .selectable_label(only, egui::RichText::new("diffs only").color(color))
+        if tab_button(ui, &pal, egui::RichText::new("diffs only"), only)
             .on_hover_text("Hide unchanged nodes")
             .clicked()
         {
@@ -978,9 +994,10 @@ impl App {
 
 impl App {
     fn breadcrumbs_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px bottom border under the strip
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, theme::BORDER));
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
 
         let font_size = self.settings.font_size - 1.0;
 
@@ -1017,7 +1034,7 @@ impl App {
                                 egui::RichText::new("›")
                                     .monospace()
                                     .size(font_size)
-                                    .color(theme::TEXT_FAINT),
+                                    .color(pal.text_faint),
                             );
                         }
                         let node = &index.nodes[node_idx as usize];
@@ -1035,7 +1052,7 @@ impl App {
                         let text = egui::RichText::new(display)
                             .monospace()
                             .size(font_size)
-                            .color(if is_last { theme::KEY } else { theme::TEXT_MUTED });
+                            .color(if is_last { pal.key } else { pal.text_muted });
                         let resp = ui
                             .selectable_label(false, text)
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1070,9 +1087,10 @@ impl App {
                 if self.load_rx.is_some() {
                     ui.spinner();
                 } else {
+                    let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
                     ui.label(
                         egui::RichText::new("Open a JSON file to get started\n(⌘O, drag-and-drop, or ⌘V to paste JSON / JWT)")
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     );
                 }
             });
@@ -1265,8 +1283,7 @@ fn render_row(
             ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
         }
     } else if response.hovered() {
-        let hover_bg = if dark { theme::HOVER_BG } else { ui.visuals().widgets.hovered.weak_bg_fill };
-        ui.painter().rect_filled(rect, 0.0, hover_bg);
+        ui.painter().rect_filled(rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
     }
 
     let painter  = ui.painter();
@@ -1406,9 +1423,10 @@ fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) 
 
 impl App {
     fn status_bar(&self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px top border above the bar
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, theme::BORDER));
+        ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, pal.border));
 
         if self.mode == AppMode::Compare {
             self.compare_status_bar(ui);
@@ -1418,11 +1436,11 @@ impl App {
         ui.horizontal_centered(|ui| {
             if let Some(info) = &self.file_info {
                 ui.label(
-                    egui::RichText::new(format!("📄 {}", info.name)).color(theme::TEXT_PRIMARY),
+                    egui::RichText::new(format!("📄 {}", info.name)).color(pal.text_primary),
                 );
                 ui.add_space(10.0);
                 ui.label(
-                    egui::RichText::new(format_size(info.size_bytes)).color(theme::TEXT_MUTED),
+                    egui::RichText::new(format_size(info.size_bytes)).color(pal.text_muted),
                 );
                 if let Some(t) = &self.tree {
                     ui.add_space(10.0);
@@ -1431,7 +1449,7 @@ impl App {
                             "{} nodes",
                             format_count(t.index.nodes.len().saturating_sub(1))
                         ))
-                            .color(theme::TEXT_FAINT),
+                            .color(pal.text_faint),
                     );
                 }
             }
@@ -1450,14 +1468,14 @@ impl App {
             // Right-aligned: encoding, format badge, root-type badge.
             if let Some(t) = &self.tree {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("UTF-8").small().color(theme::TEXT_FAINT));
+                    ui.label(egui::RichText::new("UTF-8").small().color(pal.text_faint));
                     ui.add_space(8.0);
 
                     let fmt = if t.index.is_ndjson { "NDJSON" } else { "JSON" };
                     status_badge(
                         ui,
                         egui::RichText::new(fmt).small().strong().color(egui::Color32::WHITE),
-                        theme::ACCENT,
+                        pal.accent,
                         egui::Stroke::NONE,
                     );
                 });
@@ -1736,25 +1754,26 @@ impl App {
     }
 
     fn compare_options_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, theme::BORDER));
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
 
         let mut changed = false;
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                changed |= diff_option_toggle(ui, "Aa",    "Ignore case (values & keys)", &mut self.compare.options.ignore_case);
-                changed |= diff_option_toggle(ui, "[≈]",   "Ignore array order",          &mut self.compare.options.ignore_array_order);
-                changed |= diff_option_toggle(ui, "∅=–",   "Treat null as missing",       &mut self.compare.options.null_equals_missing);
-                changed |= diff_option_toggle(ui, "1≈\"1\"", "Type coercion",             &mut self.compare.options.type_coercion);
-                changed |= diff_option_toggle(ui, "␣",     "Trim whitespace in strings",  &mut self.compare.options.trim_whitespace);
+                changed |= diff_option_toggle(ui, &pal, "Aa",    "Ignore case (values & keys)", &mut self.compare.options.ignore_case);
+                changed |= diff_option_toggle(ui, &pal, "[≈]",   "Ignore array order",          &mut self.compare.options.ignore_array_order);
+                changed |= diff_option_toggle(ui, &pal, "∅=–",   "Treat null as missing",       &mut self.compare.options.null_equals_missing);
+                changed |= diff_option_toggle(ui, &pal, "1≈\"1\"", "Type coercion",             &mut self.compare.options.type_coercion);
+                changed |= diff_option_toggle(ui, &pal, "␣",     "Trim whitespace in strings",  &mut self.compare.options.trim_whitespace);
 
                 ui.separator();
-                ui.label(egui::RichText::new("ignore keys").color(theme::TEXT_MUTED));
+                ui.label(egui::RichText::new("ignore keys").color(pal.text_muted));
                 if ui.add(egui::TextEdit::singleline(&mut self.compare.ignore_keys_raw).desired_width(130.0).hint_text("id, ts")).changed() {
                     changed = true;
                 }
-                ui.label(egui::RichText::new("regex").color(theme::TEXT_MUTED));
+                ui.label(egui::RichText::new("regex").color(pal.text_muted));
                 if ui.add(egui::TextEdit::singleline(&mut self.compare.ignore_pattern_raw).desired_width(110.0).hint_text("^_")).changed() {
                     changed = true;
                 }
@@ -1771,13 +1790,14 @@ impl App {
     }
 
     fn compare_status_bar(&self, ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         ui.horizontal_centered(|ui| {
             fn name(p: &ComparePane) -> &str {
                 p.file_info.as_ref().map(|f| f.name.as_str()).unwrap_or("—")
             }
-            ui.label(egui::RichText::new(format!("◧ {}", name(&self.compare.left))).color(theme::TEXT_PRIMARY));
-            ui.label(egui::RichText::new("vs").color(theme::TEXT_FAINT));
-            ui.label(egui::RichText::new(format!("{} ◨", name(&self.compare.right))).color(theme::TEXT_PRIMARY));
+            ui.label(egui::RichText::new(format!("◧ {}", name(&self.compare.left))).color(pal.text_primary));
+            ui.label(egui::RichText::new("vs").color(pal.text_faint));
+            ui.label(egui::RichText::new(format!("{} ◨", name(&self.compare.right))).color(pal.text_primary));
 
             if self.compare.left.load_rx.is_some() || self.compare.right.load_rx.is_some() {
                 ui.spinner();
@@ -1786,11 +1806,11 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.compare.diff_rx.is_some() {
                     ui.spinner();
-                    ui.label(egui::RichText::new("Comparing…").small().color(theme::TEXT_FAINT));
+                    ui.label(egui::RichText::new("Comparing…").small().color(pal.text_faint));
                 } else if let Some(result) = &self.compare.result {
                     let total = result.changed + result.added + result.removed;
                     let txt = if total == 0 { "identical".to_string() } else { format!("{total} differences") };
-                    ui.label(egui::RichText::new(txt).small().color(theme::TEXT_FAINT));
+                    ui.label(egui::RichText::new(txt).small().color(pal.text_faint));
                 }
             });
         });
@@ -1802,12 +1822,14 @@ impl App {
             self.pane_header(&mut cols[1], Side::Right);
         });
         // 1 px divider beneath the headers.
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), ui.min_rect().bottom(), egui::Stroke::new(1.0, theme::BORDER));
+        ui.painter().hline(r.x_range(), ui.min_rect().bottom(), egui::Stroke::new(1.0, pal.border));
         let _ = r;
     }
 
     fn pane_header(&mut self, ui: &mut egui::Ui, side: Side) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         let active = self.compare.active_pane == side;
         let (name, loading) = {
             let pane = self.compare.pane(side);
@@ -1829,7 +1851,7 @@ impl App {
 
         ui.painter().rect_filled(
             rect, 0.0,
-            if active { theme::SELECTION_BG } else { theme::BG_PANEL },
+            if active { pal.selection_bg } else { pal.bg_panel },
         );
 
         let content_rect = egui::Rect::from_min_max(rect.min + margin, rect.max - margin);
@@ -1840,7 +1862,7 @@ impl App {
         );
         {
             let ui = &mut content_ui;
-            ui.label(egui::RichText::new(format!("📄 {title}")).color(theme::TEXT_PRIMARY));
+            ui.label(egui::RichText::new(format!("📄 {title}")).color(pal.text_primary));
             if loading { ui.spinner(); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Paste").clicked() {
@@ -1871,10 +1893,11 @@ impl App {
 
         let both = self.compare.left.index.is_some() && self.compare.right.index.is_some();
         if !both {
+            let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("Load JSON into both panes to compare.\nClick a pane, then ⌘O to open or ⌘V to paste.")
-                        .color(theme::TEXT_MUTED),
+                        .color(pal.text_muted),
                 );
             });
             return;
@@ -1927,11 +1950,8 @@ impl App {
 
 /// A small toggle button for the compare options bar. Returns `true` when
 /// toggled this frame.
-fn diff_option_toggle(ui: &mut egui::Ui, label: &str, hover: &str, value: &mut bool) -> bool {
-    let color = if *value { theme::ACCENT } else { theme::TEXT_MUTED };
-    let resp = ui
-        .selectable_label(*value, egui::RichText::new(label).color(color))
-        .on_hover_text(hover);
+fn diff_option_toggle(ui: &mut egui::Ui, pal: &theme::Palette, label: &str, hover: &str, value: &mut bool) -> bool {
+    let resp = tab_button(ui, pal, egui::RichText::new(label), *value).on_hover_text(hover);
     if resp.clicked() { *value = !*value; true } else { false }
 }
 
@@ -1971,8 +1991,7 @@ fn render_diff_row(
 
     // Hover first, so status tints layer over it.
     if !is_selected && response.hovered() {
-        let hover_bg = if dark { theme::HOVER_BG } else { ui.visuals().widgets.hovered.weak_bg_fill };
-        ui.painter().rect_filled(rect, 0.0, hover_bg);
+        ui.painter().rect_filled(rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
     }
 
     // Per-cell status tints.
@@ -1993,7 +2012,7 @@ fn render_diff_row(
     }
 
     // Center divider.
-    ui.painter().vline(mid_x, rect.y_range(), egui::Stroke::new(1.0, theme::BORDER));
+    ui.painter().vline(mid_x, rect.y_range(), egui::Stroke::new(1.0, theme::Palette::for_dark(dark).border));
 
     let text_col = if is_selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
 

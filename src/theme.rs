@@ -40,6 +40,71 @@ pub const DIFF_REMOVED_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xE5,
 pub const DIFF_CHANGED_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xE3, 0xB3, 0x41, 55); // amber
 pub const DIFF_EMPTY_BG:   Color32 = Color32::from_rgba_unmultiplied_const(0x80, 0x80, 0x80, 22); // gap cell
 
+// ── Runtime chrome palette ──────────────────────────────────────────────────
+// The tree/diff *content* colors above are chosen inline per row (see
+// `key_parts` / `value_parts`). The surrounding chrome — panels, headers,
+// breadcrumbs, status bar, dividers, tabs — pulls its colors from this palette
+// so it tracks the active light/dark theme instead of staying navy in light
+// mode.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub bg_panel:        Color32,
+    pub bg_breadcrumbs:  Color32,
+    pub bg_search:       Color32,
+    pub border:          Color32,
+    pub text_primary:    Color32,
+    pub text_muted:      Color32,
+    pub text_faint:      Color32,
+    pub accent:          Color32,
+    pub key:             Color32,
+    pub selection_bg:    Color32,
+    pub hover_bg:        Color32,
+    /// Active tab / toggle pill — a filled background with high-contrast text.
+    pub tab_active_bg:   Color32,
+    pub tab_active_fg:   Color32,
+    pub tab_inactive_fg: Color32,
+}
+
+impl Palette {
+    pub fn for_dark(dark: bool) -> Self {
+        if dark { Self::DARK } else { Self::LIGHT }
+    }
+
+    const DARK: Palette = Palette {
+        bg_panel:        BG_PANEL,
+        bg_breadcrumbs:  BG_BREADCRUMBS,
+        bg_search:       BG_SEARCH,
+        border:          BORDER,
+        text_primary:    TEXT_PRIMARY,
+        text_muted:      TEXT_MUTED,
+        text_faint:      TEXT_FAINT,
+        accent:          ACCENT,
+        key:             KEY,
+        selection_bg:    SELECTION_BG,
+        hover_bg:        HOVER_BG,
+        tab_active_bg:   Color32::from_rgb(0x1C, 0x27, 0x42),
+        tab_active_fg:   ACCENT,
+        tab_inactive_fg: TEXT_MUTED,
+    };
+
+    const LIGHT: Palette = Palette {
+        bg_panel:        Color32::from_rgb(0xEC, 0xEF, 0xF4),
+        bg_breadcrumbs:  Color32::from_rgb(0xF0, 0xF3, 0xF8),
+        bg_search:       Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        border:          Color32::from_rgb(0xD3, 0xD9, 0xE3),
+        text_primary:    Color32::from_rgb(0x1A, 0x22, 0x30),
+        text_muted:      Color32::from_rgb(0x5A, 0x6B, 0x85),
+        text_faint:      Color32::from_rgb(0x8A, 0x97, 0xAD),
+        accent:          ACCENT,
+        key:             Color32::from_rgb(0x00, 0x5A, 0x9E),
+        selection_bg:    Color32::from_rgb(0xDC, 0xE7, 0xF7),
+        hover_bg:        Color32::from_rgb(0xEA, 0xED, 0xF2),
+        tab_active_bg:   Color32::from_rgb(0xDA, 0xE6, 0xF9),
+        tab_active_fg:   Color32::from_rgb(0x0A, 0x4F, 0xB8),
+        tab_inactive_fg: Color32::from_rgb(0x5A, 0x6B, 0x85),
+    };
+}
+
 /// Custom dark navy visuals for the whole chrome.
 pub fn visuals() -> egui::Visuals {
     use egui::{CornerRadius, Stroke};

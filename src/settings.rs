@@ -110,6 +110,16 @@ impl Settings {
         ctx.set_global_style(style);
     }
 
+    /// Resolve the effective light/dark choice (mirrors `apply_theme`), so the
+    /// chrome palette and the egui visuals always agree within a frame.
+    pub fn is_dark(&self, prefer_dark: bool) -> bool {
+        match self.theme {
+            Theme::Dark  => true,
+            Theme::Light => false,
+            Theme::Auto  => prefer_dark,
+        }
+    }
+
     pub fn apply_theme(&self, ctx: &egui::Context, prefer_dark: bool) {
         let visuals = match self.theme {
             Theme::Dark => crate::theme::visuals(),
