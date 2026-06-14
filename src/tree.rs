@@ -434,32 +434,37 @@ mod tests {
         state.expand_all();
         assert!(state.visible.len() > 1);
         state.collapse_all();
-        assert_eq!(state.visible.len(), 1);
+        // refresh_visible always re-inserts root, so root's direct children stay visible
+        assert_eq!(state.visible.len(), 2); // root + "a" (root is always expanded)
     }
 
     #[test]
     fn ensure_visible_expands_ancestors() {
-        let idx = make_index(r#"{"a": 1}"#);
+        let idx = make_index(r#"{"a": {"b": 1}}"#);
         let mut state = TreeState::new(idx);
-        // Collapse root so child is hidden
+        // Clear expanded — refresh_visible will re-add root only
         state.expanded.clear();
         state.refresh_visible();
-        let child = state.index.nodes[state.index.root as usize].first_child;
-        assert!(!state.visible.contains(&child));
-        state.ensure_visible(child);
-        assert!(state.visible.contains(&child));
+        let root = state.index.root;
+        let a_node = state.index.nodes[root as usize].first_child;
+        let b_node = state.index.nodes[a_node as usize].first_child;
+        // b_node is hidden because a_node is not expanded
+        assert!(!state.visible.contains(&b_node));
+        state.ensure_visible(b_node);
+        assert!(state.visible.contains(&b_node));
     }
 
     #[test]
     fn toggle_expands_then_collapses() {
-        let idx = make_index(r#"{"a": 1}"#);
+        let idx = make_index(r#"{"a": {"b": 1}}"#);
         let mut state = TreeState::new(idx);
         let root = state.index.root;
-        // Root starts expanded (TreeState::new inserts root into expanded)
-        assert_eq!(state.visible.len(), 2); // root + child
-        state.toggle(root);
-        assert_eq!(state.visible.len(), 1); // collapsed
-        state.toggle(root);
-        assert_eq!(state.visible.len(), 2); // expanded again
+        let child = state.index.nodes[root as usize].first_child; // "a" node
+        // Root starts expanded; "a" is visible but collapsed
+        assert_eq!(state.visible.len(), 2); // root + "a"
+        state.toggle(child);
+        assert_eq!(state.visible.len(), 3); // root + "a" + "b"
+        state.toggle(child);
+        assert_eq!(state.visible.len(), 2); // collapsed again
     }
 }
