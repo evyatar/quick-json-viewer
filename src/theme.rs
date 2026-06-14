@@ -34,6 +34,12 @@ pub const NULL:        Color32 = Color32::from_rgb(160, 160, 160); // gray
 /// Yellow highlight behind search matches (unmultiplied rgba 255,235,100,76).
 pub const MATCH_BG: Color32 = Color32::from_rgba_unmultiplied_const(255, 235, 100, 76);
 
+// ── Diff row tints (low-alpha so they layer over the row background) ─────────
+pub const DIFF_ADDED_BG:   Color32 = Color32::from_rgba_unmultiplied_const(0x3F, 0xB9, 0x50, 60); // green
+pub const DIFF_REMOVED_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xE5, 0x53, 0x4B, 60); // red
+pub const DIFF_CHANGED_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xE3, 0xB3, 0x41, 55); // amber
+pub const DIFF_EMPTY_BG:   Color32 = Color32::from_rgba_unmultiplied_const(0x80, 0x80, 0x80, 22); // gap cell
+
 /// Custom dark navy visuals for the whole chrome.
 pub fn visuals() -> egui::Visuals {
     use egui::{CornerRadius, Stroke};
