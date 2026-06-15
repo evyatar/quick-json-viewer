@@ -1,3 +1,5 @@
+use memchr::memchr2;
+
 use crate::index::{Node, NodeKind};
 
 #[derive(Debug)]
@@ -35,7 +37,10 @@ pub fn parse_bytes(
 ) -> Result<(Vec<Node>, u32, bool), ParseError> {
     let total = bytes.len();
     let mut prog = Progress { last: 0, total, cb: progress_cb };
-    let mut nodes: Vec<Node> = Vec::new();
+    // Pre-allocate based on file size to avoid repeated doubling reallocations.
+    // Empirically, dense JSON produces ~1 node per 16 bytes; key bytes ~1/8 of file.
+    let mut nodes: Vec<Node> = Vec::with_capacity((total / 16).max(64));
+    key_arena.reserve((total / 8).max(64));
 
     let mut pos = 0usize;
     skip_ws(bytes, &mut pos);
@@ -116,18 +121,22 @@ fn scan_string(bytes: &[u8], pos: &mut usize) -> Result<(usize, usize), ParseErr
     }
     *pos += 1; // skip opening '"'
     let start = *pos;
-    while *pos < bytes.len() {
-        match bytes[*pos] {
-            b'\\' => { *pos += 2; } // escape sequence — skip both bytes
-            b'"'  => {
-                let end = *pos;
-                *pos += 1; // skip closing '"'
-                return Ok((start, end));
+    // Use SIMD-backed memchr2 to jump past plain bytes in bulk.
+    loop {
+        match memchr2(b'"', b'\\', &bytes[*pos..]) {
+            None => return Err(ParseError { offset: bytes.len() as u64, msg: "unterminated string" }),
+            Some(i) => {
+                *pos += i;
+                if bytes[*pos] == b'"' {
+                    let end = *pos;
+                    *pos += 1;
+                    return Ok((start, end));
+                }
+                // backslash escape — skip both bytes
+                *pos += 2;
             }
-            _ => { *pos += 1; }
         }
     }
-    Err(ParseError { offset: *pos as u64, msg: "unterminated string" })
 }
 
 fn scan_number(bytes: &[u8], pos: &mut usize) -> usize {
