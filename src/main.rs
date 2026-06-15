@@ -2002,8 +2002,9 @@ fn render_diff_row(
         ui.painter().rect_filled(rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
     }
 
-    // Per-cell status tints.
-    let (lt, rt) = match status {
+    // Per-cell status tints — skip on expanded containers (diffs are visible inside).
+    let tint_status = if is_expanded && dn.child_count > 0 { DiffStatus::Unchanged } else { status };
+    let (lt, rt) = match tint_status {
         DiffStatus::Removed   => (Some(theme::DIFF_REMOVED_BG), Some(theme::DIFF_EMPTY_BG)),
         DiffStatus::Added     => (Some(theme::DIFF_EMPTY_BG),   Some(theme::DIFF_ADDED_BG)),
         DiffStatus::Changed   => (Some(theme::DIFF_CHANGED_BG), Some(theme::DIFF_CHANGED_BG)),
