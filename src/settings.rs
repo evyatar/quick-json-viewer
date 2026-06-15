@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +6,15 @@ const STORAGE_KEY: &str = "json_viewer_settings_v1";
 
 // 0 = untried, 1 = success, 2 = failure
 static SET_DEFAULT_STATUS: AtomicU8 = AtomicU8::new(0);
+
+// Set by the "Check for Updates" button; consumed by the app loop, which owns
+// the update channel (`show_settings_window` does not).
+static REQUEST_UPDATE_CHECK: AtomicBool = AtomicBool::new(false);
+
+/// Returns and clears the "user asked to check for updates" flag.
+pub fn take_update_check_request() -> bool {
+    REQUEST_UPDATE_CHECK.swap(false, Ordering::Relaxed)
+}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreServices", kind = "framework")]
@@ -64,6 +73,10 @@ pub struct Settings {
     pub show_menu_bar: bool,
     #[serde(default = "default_true")]
     pub show_breadcrumbs: bool,
+    /// Version string of an update the user dismissed; the banner stays hidden
+    /// for this version but reappears once a newer one is published.
+    #[serde(default)]
+    pub dismissed_update: Option<String>,
 }
 
 impl Default for Settings {
@@ -74,6 +87,7 @@ impl Default for Settings {
             font_size:     14.0,
             show_menu_bar: false,
             show_breadcrumbs: true,
+            dismissed_update: None,
         }
     }
 }
@@ -263,6 +277,12 @@ pub fn show_settings_window(
                     _ => {}
                 }
             });
+
+            ui.add_space(8.0);
+
+            if ui.button("Check for Updates").clicked() {
+                REQUEST_UPDATE_CHECK.store(true, Ordering::Relaxed);
+            }
 
             ui.add_space(8.0);
         });

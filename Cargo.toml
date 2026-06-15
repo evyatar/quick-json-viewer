@@ -1,6 +1,6 @@
 [package]
 name = "quick-json-viewer"
-version = "1.0.0"
+version = "1.0.4"
 edition = "2021"
 description = "A fast, native JSON viewer for macOS"
 authors = ["Evyatar Shalom"]
@@ -14,6 +14,8 @@ memmap2       = "0.9"
 regex         = "1"
 rfd           = "0.17"
 serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+ureq          = { version = "2", features = ["tls"] }
 unicode-bidi  = "0.3"
 image         = { version = "0.25", default-features = false, features = ["png"] }
 

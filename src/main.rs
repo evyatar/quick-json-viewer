@@ -9,6 +9,7 @@ mod search;
 mod settings;
 mod theme;
 mod tree;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -152,6 +153,9 @@ struct App {
     type_ahead_time: f64,
     mode:           AppMode,
     compare:        CompareState,
+    update_rx:        Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
+    update_available: Option<update::ReleaseInfo>,
+    update_check_started: bool,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
 }
@@ -177,6 +181,9 @@ impl Default for App {
             type_ahead_time: 0.0,
             mode:            AppMode::Viewer,
             compare:         CompareState::default(),
+            update_rx:        None,
+            update_available: None,
+            update_check_started: false,
             #[cfg(target_os = "macos")]
             menu_installed: false,
         }
@@ -304,6 +311,20 @@ impl eframe::App for App {
             if acts & macos_menu::ACT_ABOUT        != 0 { self.about_open = true; }
             if let Some(path) = macos_menu::take_open_file() { self.open_file(path); }
         }
+
+        // ── Update check: fire once on launch, plus on manual request ──
+        if !self.update_check_started {
+            self.update_check_started = true;
+            self.update_rx = Some(update::spawn_check());
+        }
+        if settings::take_update_check_request() {
+            // A manual check is an explicit "show me" — override any prior
+            // dismissal so the banner reappears even for the same release.
+            self.settings.dismissed_update = None;
+            self.update_available = None;
+            self.update_rx = Some(update::spawn_check());
+        }
+        self.poll_update(ui.ctx());
 
         // ── 1. Poll background loader ──
         if let Some(rx) = &self.load_rx {
@@ -507,6 +528,8 @@ impl eframe::App for App {
             .show_inside(ui, |ui| {
                 self.toolbar(ui);
             });
+
+        self.update_banner(ui, &pal);
 
         if self.mode == AppMode::Viewer && self.settings.show_breadcrumbs && self.tree.is_some() {
             egui::Panel::top("breadcrumbs")
@@ -726,7 +749,78 @@ impl App {
             });
     }
 
+    /// Whether an update banner/badge should currently be shown — there is a
+    /// newer release and the user hasn't dismissed that particular version.
+    fn pending_update(&self) -> Option<&update::ReleaseInfo> {
+        let info = self.update_available.as_ref()?;
+        if self.settings.dismissed_update.as_deref() == Some(info.version.as_str()) {
+            return None;
+        }
+        Some(info)
+    }
+
+    /// Thin top strip shown when a newer release is available. Notify-only: it
+    /// links to the release page and offers the `brew upgrade` command — it
+    /// never downloads or replaces the binary.
+    fn update_banner(&mut self, ui: &mut egui::Ui, pal: &theme::Palette) {
+        let Some(info) = self.pending_update() else { return };
+        let version = info.version.clone();
+        let html_url = info.html_url.clone();
+        // Show the first few lines of the release notes as a hover hint.
+        let notes_hint: String = info.notes.lines().take(12).collect::<Vec<_>>().join("\n");
+
+        let mut dismiss = false;
+        egui::Panel::top("update_banner")
+            .exact_size(self.settings.font_size + 16.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.accent)
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
+            )
+            .show_inside(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("⬆  Update available — v{version}"))
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("X").on_hover_text("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                        if ui
+                        .button("Upgrade now")
+                        .on_hover_text(format!("Opens Terminal and runs:\n{}", update::BREW_UPGRADE_CMD))
+                        .clicked()
+                        {
+                            update::launch_brew_upgrade();
+                        }
+                        if ui.button("Copy command").clicked() {
+                            ui.ctx().copy_text(update::BREW_UPGRADE_CMD.to_string());
+                        }
+                        let view = ui.button("View release");
+                        let view = if notes_hint.trim().is_empty() {
+                            view
+                        } else {
+                            view.on_hover_text(&notes_hint)
+                        };
+                        if view.clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&html_url));
+                        }
+                    });
+                });
+            });
+
+        if dismiss {
+            self.settings.dismissed_update = Some(version);
+        }
+    }
+
     fn show_about_window(&mut self, ctx: &egui::Context) {
+        // Snapshot update state before borrowing `self.about_open` mutably.
+        let update_badge = self
+            .pending_update()
+            .map(|info| (info.version.clone(), info.html_url.clone()));
         egui::Window::new("About JSON Viewer")
             .open(&mut self.about_open)
             .collapsible(false)
@@ -739,6 +833,24 @@ impl App {
                     ui.label(egui::RichText::new("JSON Viewer").heading().strong());
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).small());
+                    ui.add_space(6.0);
+                    match &update_badge {
+                        Some((version, url)) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 159, 10),
+                                format!("⬆ Update available: v{version}"),
+                            );
+                            if ui.link("View release").clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        }
+                        None => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(52, 199, 89),
+                                "✓ Up to date",
+                            );
+                        }
+                    }
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(12.0);
@@ -1685,6 +1797,32 @@ impl App {
         self.compare.tree    = Some(tree);
         self.compare.diff_rx = None;
         ctx.request_repaint();
+    }
+
+    /// Collect the result of a background update check.
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        let msg = match &self.update_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_rx = None;
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.update_rx = None;
+        match msg {
+            update::UpdateMsg::Available(info) => {
+                self.update_available = Some(info);
+                ctx.request_repaint();
+            }
+            update::UpdateMsg::UpToDate => {}
+            update::UpdateMsg::Error(e) => {
+                eprintln!("update check failed: {e}");
+            }
+        }
     }
 
     /// Parse the option text buffers (ignore-keys list, regex) into the live
