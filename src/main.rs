@@ -588,6 +588,7 @@ impl eframe::App for App {
                 });
         }
 
+        let mut export_req: Option<(ExportScope, ExportFormat)> = None;
         egui::Panel::bottom("statusbar")
             .exact_size(26.0)
             .frame(
@@ -596,8 +597,11 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show_inside(ui, |ui| {
-                self.status_bar(ui);
+                export_req = self.status_bar(ui);
             });
+        if let Some((scope, fmt)) = export_req {
+            self.export(scope, fmt);
+        }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             match self.mode {
@@ -1493,7 +1497,11 @@ fn render_row(
         egui::pos2(rect.left() + 2.0, rect.top()),
         egui::vec2(checkbox_w, row_h),
     );
-    if multi_select {
+    // Leaf ("edge") nodes hold no subtree, so they get no checkbox — only
+    // containers are selectable for export. The gutter width is unchanged so
+    // every row stays aligned.
+    let can_check = multi_select && is_container;
+    if can_check {
         let glyph = if is_checked { "☑" } else { "☐" };
         let col   = if is_checked { theme::ACCENT } else if dark { theme::TEXT_FAINT } else { text_col };
         painter.text(egui::pos2(rect.left() + 4.0, y1), egui::Align2::LEFT_CENTER, glyph, val_font.clone(), col);
@@ -1530,7 +1538,7 @@ fn render_row(
     if response.clicked() {
         let click_pos = response.interact_pointer_pos();
         // A click in the checkbox gutter toggles the multi-selection only.
-        if multi_select && click_pos.is_some_and(|p| check_rect.contains(p)) {
+        if can_check && click_pos.is_some_and(|p| check_rect.contains(p)) {
             actions.push(RowAction::ToggleCheck(node_idx));
         } else {
             actions.push(RowAction::Select(node_idx));
@@ -1661,7 +1669,7 @@ fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) 
 // ─── status bar ──────────────────────────────────────────────────────────────
 
 impl App {
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&self, ui: &mut egui::Ui) -> Option<(ExportScope, ExportFormat)> {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px top border above the bar
         let r = ui.max_rect();
@@ -1669,9 +1677,10 @@ impl App {
 
         if self.mode == AppMode::Compare {
             self.compare_status_bar(ui);
-            return;
+            return None;
         }
 
+        let mut export_req = None;
         ui.horizontal_centered(|ui| {
             if let Some(info) = &self.file_info {
                 ui.label(
@@ -1711,28 +1720,34 @@ impl App {
                     ui.add_space(8.0);
 
                     let fmt = if t.index.is_ndjson { "NDJSON" } else { "JSON" };
-                    status_badge(
-                        ui,
-                        egui::RichText::new(fmt).small().strong().color(egui::Color32::WHITE),
-                        pal.accent,
-                        egui::Stroke::NONE,
-                    );
+                    ui.label(egui::RichText::new(fmt).small().color(pal.text_faint));
+
+
+                    // When select mode is active and rows are checked, surface
+                    // an export action for the selection right in the footer.
+                    if t.multi_select && !t.checked.is_empty() {
+                        ui.add_space(12.0);
+                        let n = t.checked.len();
+                        let json_btn = egui::Button::new(
+                            egui::RichText::new("Export JSON").color(egui::Color32::WHITE),
+                        )
+                            .fill(pal.accent);
+                        if ui.add(json_btn).clicked() {
+                            export_req = Some((ExportScope::Selection, ExportFormat::Json));
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} selected",
+                                format_count(n)
+                            ))
+                                .color(pal.text_muted),
+                        );
+                    }
                 });
             }
         });
+        export_req
     }
-}
-
-/// Small rounded badge used in the status bar.
-fn status_badge(ui: &mut egui::Ui, text: egui::RichText, fill: egui::Color32, stroke: egui::Stroke) {
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(text);
-        });
 }
 
 // ─── export ──────────────────────────────────────────────────────────────────
