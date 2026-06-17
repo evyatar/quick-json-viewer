@@ -8,6 +8,9 @@ pub struct TreeState {
     pub expanded:          HashSet<u32>,
     pub visible:           Vec<u32>,
     pub selected:          Option<u32>,
+    /// When true, rows show a checkbox and `checked` drives multi-node export.
+    pub multi_select:      bool,
+    pub checked:           HashSet<u32>,
     pub search_use_regex:  bool,
     pub search_results:    Vec<u32>,
     pub search_cursor:     usize,
@@ -26,11 +29,27 @@ impl TreeState {
             expanded,
             visible,
             selected: Some(root),
+            multi_select: false,
+            checked: HashSet::new(),
             search_use_regex: false,
             search_results: Vec::new(),
             search_cursor: 0,
             search_result_set: HashSet::new(),
             scroll_to_row: None,
+        }
+    }
+
+    pub fn toggle_check(&mut self, node_idx: u32) {
+        if !self.checked.insert(node_idx) {
+            self.checked.remove(&node_idx);
+        }
+    }
+
+    /// Turn multi-select mode on/off; leaving it clears the checked set.
+    pub fn set_multi_select(&mut self, on: bool) {
+        self.multi_select = on;
+        if !on {
+            self.checked.clear();
         }
     }
 

@@ -1,4 +1,5 @@
 mod diff;
+mod export;
 mod index;
 mod loader;
 #[cfg(target_os = "macos")]
@@ -59,8 +60,36 @@ use tree::TreeState;
 enum RowAction {
     Select(u32),
     Toggle(u32),
+    ToggleCheck(u32),
     ExpandRecursive(u32),
     CollapseRecursive(u32),
+    Export(ExportScope, ExportFormat),
+}
+
+/// What an export operates on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportScope {
+    /// The whole document.
+    File,
+    /// A single node's subtree.
+    Node(u32),
+    /// The checked multi-selection (pruned common-ancestor subtree).
+    Selection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Json,
+    Csv,
+}
+
+impl ExportFormat {
+    fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Json => "json",
+            ExportFormat::Csv => "csv",
+        }
+    }
 }
 
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
@@ -309,6 +338,8 @@ impl eframe::App for App {
             if acts & macos_menu::ACT_HELP         != 0 { self.help_open  = true; }
             if acts & macos_menu::ACT_SEARCH_SYNTAX != 0 { self.search_help_open = true; }
             if acts & macos_menu::ACT_ABOUT        != 0 { self.about_open = true; }
+            if acts & macos_menu::ACT_EXPORT_JSON  != 0 { self.export(ExportScope::File, ExportFormat::Json); }
+            if acts & macos_menu::ACT_EXPORT_CSV   != 0 { self.export(ExportScope::File, ExportFormat::Csv); }
             if let Some(path) = macos_menu::take_open_file() { self.open_file(path); }
         }
 
@@ -592,6 +623,20 @@ impl App {
                     let ctx = ui.ctx().clone();
                     self.request_paste(&ctx);
                 }
+                ui.separator();
+                let has_tree = self.tree.is_some();
+                ui.add_enabled_ui(has_tree, |ui| {
+                    ui.menu_button("Export File", |ui| {
+                        if ui.button("As JSON…").clicked() {
+                            ui.close();
+                            self.export(ExportScope::File, ExportFormat::Json);
+                        }
+                        if ui.button("As CSV…").clicked() {
+                            ui.close();
+                            self.export(ExportScope::File, ExportFormat::Csv);
+                        }
+                    });
+                });
                 ui.separator();
                 if ui.add(egui::Button::new("Settings").shortcut_text("⌘,")).clicked() {
                     ui.close();
@@ -929,6 +974,15 @@ impl App {
         if ui.button("Open File  ⌘O").clicked() {
             self.open_file_dialog();
         }
+        if let Some(tree) = &mut self.tree {
+            let mut on = tree.multi_select;
+            let resp = ui.selectable_label(on, "☑ Select");
+            if resp.clicked() {
+                on = !on;
+                tree.set_multi_select(on);
+            }
+            resp.on_hover_text("Multi-select mode — check rows, then right-click → Export");
+        }
         ui.add_space(8.0);
 
             // Shrink the search field on narrow windows so the controls to its
@@ -1229,6 +1283,8 @@ impl App {
             let search_res_set = &tree.search_result_set;
             let visible        = &tree.visible;
             let selected       = tree.selected;
+            let multi_select   = tree.multi_select;
+            let checked        = &tree.checked;
 
             let avail_h   = ui.available_height();
             let row_pitch = row_h + ui.spacing().item_spacing.y;
@@ -1244,6 +1300,7 @@ impl App {
                     let row_actions = render_row(
                         ui, index, expanded, selected, search_res_set, node_idx,
                         row_h, key_font.clone(), val_font.clone(),
+                        multi_select, checked.contains(&node_idx), !checked.is_empty(),
                     );
                     actions.extend(row_actions);
                 }
@@ -1251,13 +1308,20 @@ impl App {
         }
 
         // Apply actions after borrows released
+        let mut export_req: Option<(ExportScope, ExportFormat)> = None;
         for action in actions {
             match action {
                 RowAction::Select(n)           => { tree.selected = Some(n); }
                 RowAction::Toggle(n)           => { tree.toggle(n); }
+                RowAction::ToggleCheck(n)       => { tree.toggle_check(n); }
                 RowAction::ExpandRecursive(n)   => { tree.expand_recursive(n); }
                 RowAction::CollapseRecursive(n) => { tree.collapse_recursive(n); }
+                RowAction::Export(scope, fmt)   => { export_req = Some((scope, fmt)); }
             }
+        }
+        // `tree` borrow ends here; export needs &mut self for the save dialog.
+        if let Some((scope, fmt)) = export_req {
+            self.export(scope, fmt);
         }
     }
 }
@@ -1326,6 +1390,9 @@ fn render_row(
     row_h:            f32,
     key_font:         egui::FontId,
     val_font:         egui::FontId,
+    multi_select:     bool,
+    is_checked:       bool,
+    any_checked:      bool,
 ) -> Vec<RowAction> {
     use index::NodeKind;
 
@@ -1350,7 +1417,10 @@ fn render_row(
     // Value text + color
     let (value_text, value_color) = value_parts(index, node, dark);
 
-    let indent  = 4.0 + depth as f32 * 16.0;
+    // In multi-select mode a fixed left gutter holds the per-row checkbox; the
+    // whole tree (indent guides included) shifts right by this amount.
+    let checkbox_w = if multi_select { 20.0 } else { 0.0 };
+    let indent  = checkbox_w + 4.0 + depth as f32 * 16.0;
 
     // Pre-compute display strings and key width (needed before allocation in both modes).
     let key_display   = bidi_reorder(&key_text);
@@ -1407,13 +1477,25 @@ fn render_row(
     // the parent chevrons.
     if dark {
         for d in 0..depth {
-            let gx = rect.left() + 4.0 + d as f32 * 16.0 + 8.0;
+            let gx = rect.left() + checkbox_w + 4.0 + d as f32 * 16.0 + 8.0;
             painter.vline(gx, rect.y_range(), egui::Stroke::new(1.0, theme::INDENT_GUIDE));
         }
     }
 
     // y position for single-line elements: centred in the first row_h band.
     let y1 = rect.top() + row_h / 2.0;
+
+    // Checkbox gutter (multi-select mode) — fixed at the far left, not indented.
+    let check_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 2.0, rect.top()),
+        egui::vec2(checkbox_w, row_h),
+    );
+    if multi_select {
+        let glyph = if is_checked { "☑" } else { "☐" };
+        let col   = if is_checked { theme::ACCENT } else if dark { theme::TEXT_FAINT } else { text_col };
+        painter.text(egui::pos2(rect.left() + 4.0, y1), egui::Align2::LEFT_CENTER, glyph, val_font.clone(), col);
+    }
+
     let mut x = rect.left() + indent;
 
     // Triangle region (always 16 px wide, in the first line band).
@@ -1443,12 +1525,18 @@ fn render_row(
     // Collect actions
     let mut actions: Vec<RowAction> = Vec::new();
     if response.clicked() {
-        actions.push(RowAction::Select(node_idx));
-        // Toggle if click was on triangle
-        if can_toggle {
-            if let Some(click_pos) = response.interact_pointer_pos() {
-                if tri_rect.contains(click_pos) {
-                    actions.push(RowAction::Toggle(node_idx));
+        let click_pos = response.interact_pointer_pos();
+        // A click in the checkbox gutter toggles the multi-selection only.
+        if multi_select && click_pos.is_some_and(|p| check_rect.contains(p)) {
+            actions.push(RowAction::ToggleCheck(node_idx));
+        } else {
+            actions.push(RowAction::Select(node_idx));
+            // Toggle if click was on triangle
+            if can_toggle {
+                if let Some(click_pos) = click_pos {
+                    if tri_rect.contains(click_pos) {
+                        actions.push(RowAction::Toggle(node_idx));
+                    }
                 }
             }
         }
@@ -1499,6 +1587,40 @@ fn render_row(
                 ui.close();
             }
         }
+
+        ui.separator();
+        ui.menu_button("Export", |ui| {
+            // When the multi-selection is non-empty, offer to export it (pruned
+            // to the closest common ancestor); otherwise export this node.
+            if any_checked {
+                if ui.button("Selected nodes as JSON…").clicked() {
+                    actions.push(RowAction::Export(ExportScope::Selection, ExportFormat::Json));
+                    ui.close();
+                }
+                if ui.button("Selected nodes as CSV…").clicked() {
+                    actions.push(RowAction::Export(ExportScope::Selection, ExportFormat::Csv));
+                    ui.close();
+                }
+                ui.separator();
+            }
+            if ui.button("This node as JSON…").clicked() {
+                actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Json));
+                ui.close();
+            }
+            if ui.button("This node as CSV…").clicked() {
+                actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Csv));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Whole file as JSON…").clicked() {
+                actions.push(RowAction::Export(ExportScope::File, ExportFormat::Json));
+                ui.close();
+            }
+            if ui.button("Whole file as CSV…").clicked() {
+                actions.push(RowAction::Export(ExportScope::File, ExportFormat::Csv));
+                ui.close();
+            }
+        });
     });
 
     actions
@@ -1608,6 +1730,81 @@ fn status_badge(ui: &mut egui::Ui, text: egui::RichText, fill: egui::Color32, st
         .show(ui, |ui| {
             ui.label(text);
         });
+}
+
+// ─── export ──────────────────────────────────────────────────────────────────
+
+impl App {
+    /// Generate the export contents for `scope`/`fmt`, prompt for a save
+    /// location, and write the file. Errors surface in `load_error`.
+    fn export(&mut self, scope: ExportScope, fmt: ExportFormat) {
+        let Some(tree) = &self.tree else { return };
+        let index = &*tree.index;
+        let empty = std::collections::HashSet::new();
+
+        // Resolve the export root + pruning, then render bytes.
+        let (bytes, scope_tag): (Vec<u8>, &str) = match scope {
+            ExportScope::File => {
+                let out = match fmt {
+                    // NDJSON has no enclosing array, so reconstruct one.
+                    ExportFormat::Json if index.is_ndjson => {
+                        export::json_pretty(index, index.root, &empty, None).into_bytes()
+                    }
+                    ExportFormat::Json => export::json_verbatim(index, index.root),
+                    ExportFormat::Csv => export::csv(index, index.root, &empty, None).into_bytes(),
+                };
+                (out, "")
+            }
+            ExportScope::Node(idx) => {
+                let out = match fmt {
+                    ExportFormat::Json => export::json_verbatim(index, idx),
+                    ExportFormat::Csv => export::csv(index, idx, &empty, None).into_bytes(),
+                };
+                (out, "-node")
+            }
+            ExportScope::Selection => {
+                let selected: Vec<u32> = tree.checked.iter().copied().collect();
+                if selected.is_empty() {
+                    return;
+                }
+                let (lca, keep) = export::build_keep_set(index, &selected);
+                let sel: std::collections::HashSet<u32> = selected.into_iter().collect();
+                let out = match fmt {
+                    ExportFormat::Json => {
+                        export::json_pretty(index, lca, &sel, Some(&keep)).into_bytes()
+                    }
+                    ExportFormat::Csv => export::csv(index, lca, &sel, Some(&keep)).into_bytes(),
+                };
+                (out, "-selection")
+            }
+        };
+
+        let stem = self
+            .file_info
+            .as_ref()
+            .map(|f| {
+                std::path::Path::new(&f.name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| f.name.clone())
+            })
+            .unwrap_or_else(|| "export".to_owned());
+        let default_name = format!("{stem}{scope_tag}.{}", fmt.ext());
+
+        let (filter_name, exts): (&str, &[&str]) = match fmt {
+            ExportFormat::Json => ("JSON", &["json"]),
+            ExportFormat::Csv => ("CSV", &["csv"]),
+        };
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, exts)
+            .set_file_name(default_name)
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&path, &bytes) {
+                self.load_error = Some(format!("Export failed: {e}"));
+            }
+        }
+    }
 }
 
 // ─── file helpers ────────────────────────────────────────────────────────────

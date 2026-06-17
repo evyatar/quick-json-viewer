@@ -24,6 +24,8 @@ pub const ACT_HELP:         u32 = 1 << 5;
 pub const ACT_ABOUT:        u32 = 1 << 6;
 pub const ACT_PASTE:        u32 = 1 << 7;
 pub const ACT_SEARCH_SYNTAX: u32 = 1 << 8;
+pub const ACT_EXPORT_JSON:  u32 = 1 << 9;
+pub const ACT_EXPORT_CSV:   u32 = 1 << 10;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -143,6 +145,16 @@ define_class!(
             PENDING.fetch_or(ACT_PASTE, Ordering::Relaxed);
             if let Some(c) = CTX.get() { c.request_repaint(); }
         }
+        #[unsafe(method(handleExportJson:))]
+        fn handle_export_json(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_EXPORT_JSON, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
+        #[unsafe(method(handleExportCsv:))]
+        fn handle_export_csv(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_EXPORT_CSV, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
         #[unsafe(method(handleSettings:))]
         fn handle_settings(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_SETTINGS, Ordering::Relaxed);
@@ -230,6 +242,11 @@ pub fn install(ctx: &egui::Context) {
         // and never reach the search box; bare ⌘V is handled in the egui layer.
         add_item(&file_menu, "Paste JSON / JWT", "v", cmd | NSEventModifierFlags::Shift,
                  objc2::sel!(handlePaste:), handler_ref);
+        file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        add_item(&file_menu, "Export File as JSON…", "e", cmd,
+                 objc2::sel!(handleExportJson:), handler_ref);
+        add_item(&file_menu, "Export File as CSV…", "e", cmd | NSEventModifierFlags::Shift,
+                 objc2::sel!(handleExportCsv:), handler_ref);
         file_menu.addItem(&NSMenuItem::separatorItem(mtm));
         add_item(&file_menu, "Settings", ",", cmd,  objc2::sel!(handleSettings:),   handler_ref);
 
