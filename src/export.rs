@@ -185,10 +185,12 @@ pub fn csv(
     let mut col_seen: HashMap<String, ()> = HashMap::new();
     let mut rows: Vec<HashMap<String, String>> = Vec::new();
 
+    let mut prefix = String::new();
     for &rr in &row_roots {
         let mut cells: Vec<(String, String)> = Vec::new();
         let row_include = keep.is_none() || sel.contains(&rr);
-        flatten(index, rr, sel, keep, row_include, String::new(), &mut cells);
+        prefix.clear();
+        flatten(index, rr, sel, keep, row_include, &mut prefix, &mut cells);
         let mut map = HashMap::new();
         for (k, v) in cells {
             if col_seen.insert(k.clone(), ()).is_none() {
@@ -221,15 +223,20 @@ pub fn csv(
     out
 }
 
+/// Flatten `idx` into `(column, value)` cells, appending dotted/bracketed path
+/// segments onto the shared `prefix` buffer and truncating back after each
+/// child — so no per-node string allocation is needed.
 fn flatten(
     index: &JsonIndex,
     idx: u32,
     sel: &HashSet<u32>,
     keep: Option<&HashSet<u32>>,
     include_all: bool,
-    prefix: String,
+    prefix: &mut String,
     out: &mut Vec<(String, String)>,
 ) {
+    use std::fmt::Write;
+
     let node = &index.nodes[idx as usize];
     let include_all = include_all || sel.contains(&idx);
 
@@ -243,19 +250,18 @@ fn flatten(
                 let next = cn.next_sibling;
                 if included(c, include_all, keep) {
                     any = true;
-                    let seg = if is_obj {
-                        index.key_of(cn).to_owned()
+                    let restore = prefix.len();
+                    if is_obj {
+                        if restore != 0 {
+                            prefix.push('.');
+                        }
+                        prefix.push_str(index.key_of(cn));
                     } else {
-                        cn.array_index.to_string()
-                    };
-                    let new_prefix = match (prefix.is_empty(), is_obj) {
-                        (true, true) => seg,
-                        (true, false) => format!("[{}]", seg),
-                        (false, true) => format!("{}.{}", prefix, seg),
-                        (false, false) => format!("{}[{}]", prefix, seg),
-                    };
+                        let _ = write!(prefix, "[{}]", cn.array_index);
+                    }
                     let child_all = if include_all { true } else { sel.contains(&c) };
-                    flatten(index, c, sel, keep, child_all, new_prefix, out);
+                    flatten(index, c, sel, keep, child_all, prefix, out);
+                    prefix.truncate(restore);
                 }
                 c = next;
             }
@@ -267,11 +273,11 @@ fn flatten(
     }
 }
 
-fn column_name(prefix: String) -> String {
+fn column_name(prefix: &str) -> String {
     if prefix.is_empty() {
         "value".to_owned()
     } else {
-        prefix
+        prefix.to_owned()
     }
 }
 

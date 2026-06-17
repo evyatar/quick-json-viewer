@@ -1420,7 +1420,10 @@ fn render_row(
     // In multi-select mode a fixed left gutter holds the per-row checkbox; the
     // whole tree (indent guides included) shifts right by this amount.
     let checkbox_w = if multi_select { 20.0 } else { 0.0 };
-    let indent  = checkbox_w + 4.0 + depth as f32 * 16.0;
+    // Horizontal offset of a node at nesting level `d`. Used for both the row's
+    // own indent and the per-ancestor indent guides, so they can't drift apart.
+    let indent_at = |d: u16| checkbox_w + 4.0 + d as f32 * 16.0;
+    let indent  = indent_at(depth);
 
     // Pre-compute display strings and key width (needed before allocation in both modes).
     let key_display   = bidi_reorder(&key_text);
@@ -1477,7 +1480,7 @@ fn render_row(
     // the parent chevrons.
     if dark {
         for d in 0..depth {
-            let gx = rect.left() + checkbox_w + 4.0 + d as f32 * 16.0 + 8.0;
+            let gx = rect.left() + indent_at(d) + 8.0;
             painter.vline(gx, rect.y_range(), egui::Stroke::new(1.0, theme::INDENT_GUIDE));
         }
     }
