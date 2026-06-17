@@ -838,7 +838,7 @@ impl App {
                         Some((version, url)) => {
                             ui.colored_label(
                                 egui::Color32::from_rgb(255, 159, 10),
-                                format!("⬆ Update available: v{version}"),
+                                format!("Update available: v{version}"),
                             );
                             if ui.link("View release").clicked() {
                                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
@@ -847,7 +847,7 @@ impl App {
                         None => {
                             ui.colored_label(
                                 egui::Color32::from_rgb(52, 199, 89),
-                                "✓ Up to date",
+                                "Up to date",
                             );
                         }
                     }
@@ -880,10 +880,12 @@ fn tab_button(
     active: bool,
 ) -> egui::Response {
     let fg = if active { pal.tab_active_fg } else { pal.tab_inactive_fg };
-    let mut button = egui::Button::new(label.color(fg)).frame(active);
-    if active {
-        button = button.fill(pal.tab_active_bg);
-    }
+    let fill = if active { pal.tab_active_bg } else { egui::Color32::TRANSPARENT };
+    let stroke = egui::Stroke::new(1.0, if active { pal.tab_active_fg } else { pal.border });
+    let button = egui::Button::new(label.color(fg))
+        .frame(true)
+        .fill(fill)
+        .stroke(stroke);
     ui.add(button)
 }
 

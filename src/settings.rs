@@ -135,7 +135,7 @@ impl Settings {
     }
 
     pub fn apply_theme(&self, ctx: &egui::Context, prefer_dark: bool) {
-        let visuals = match self.theme {
+        let mut visuals = match self.theme {
             Theme::Dark => crate::theme::visuals(),
             Theme::Light => egui::Visuals::light(),
             Theme::Auto => {
@@ -146,6 +146,20 @@ impl Settings {
                 }
             }
         };
+
+        // Show the pointing-hand ("hand") cursor when hovering any button.
+        visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+
+        // egui derives a button's inner margin from `button_padding -
+        // bg_stroke.width`. The default `inactive` stroke is 0px wide but
+        // `hovered`/`active` are 1px, so buttons shrink by 1px per side on
+        // hover — a visible layout shift. Normalise the widths so the margin
+        // (and therefore the button size) stays constant across states.
+        let w = visuals.widgets.inactive.bg_stroke.width;
+        visuals.widgets.hovered.bg_stroke.width = w;
+        visuals.widgets.active.bg_stroke.width = w;
+        visuals.widgets.open.bg_stroke.width = w;
+
         ctx.set_visuals(visuals);
     }
 
