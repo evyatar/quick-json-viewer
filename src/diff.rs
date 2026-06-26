@@ -722,6 +722,7 @@ pub struct DiffTreeState {
     pub visible:        Vec<u32>,
     pub selected:       Option<u32>,
     pub scroll_to_row:  Option<usize>,
+    pub reveal_row:     Option<usize>,
     pub diff_cursor:    usize,
     pub only_diffs:     bool,
 }
@@ -742,6 +743,7 @@ impl DiffTreeState {
             visible: Vec::new(),
             selected: Some(result.root),
             scroll_to_row: None,
+            reveal_row: None,
             diff_cursor: 0,
             only_diffs: false,
         };
@@ -794,12 +796,12 @@ impl DiffTreeState {
 
     pub fn select_up(&mut self) {
         if let Some(p) = self.pos() {
-            if p > 0 { self.selected = Some(self.visible[p - 1]); self.scroll_to_row = Some(p - 1); }
+            if p > 0 { self.selected = Some(self.visible[p - 1]); self.reveal_row = Some(p - 1); }
         }
     }
     pub fn select_down(&mut self) {
         if let Some(p) = self.pos() {
-            if p + 1 < self.visible.len() { self.selected = Some(self.visible[p + 1]); self.scroll_to_row = Some(p + 1); }
+            if p + 1 < self.visible.len() { self.selected = Some(self.visible[p + 1]); self.reveal_row = Some(p + 1); }
         }
     }
     pub fn select_page_up(&mut self, page: usize) {

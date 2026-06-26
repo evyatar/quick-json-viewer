@@ -1276,6 +1276,7 @@ impl App {
         let tree = self.tree.as_mut().unwrap();
         let num_rows = tree.visible.len();
         let scroll_to_row = tree.scroll_to_row.take();
+        let reveal_row = tree.reveal_row.take();
 
         let mut actions: Vec<RowAction> = Vec::new();
 
@@ -1305,6 +1306,7 @@ impl App {
                         ui, index, expanded, selected, search_res_set, node_idx,
                         row_h, key_font.clone(), val_font.clone(),
                         multi_select, checked.contains(&node_idx), !checked.is_empty(),
+                        reveal_row == Some(row_idx),
                     );
                     actions.extend(row_actions);
                 }
@@ -1397,6 +1399,7 @@ fn render_row(
     multi_select:     bool,
     is_checked:       bool,
     any_checked:      bool,
+    reveal:           bool,
 ) -> Vec<RowAction> {
     use index::NodeKind;
 
@@ -1453,6 +1456,13 @@ fn render_row(
     let (id, rect) = ui.allocate_space(egui::vec2(row_w, row_h));
 
     let response = ui.interact(rect, id, egui::Sense::click());
+    if reveal {
+        let x = ui.clip_rect().left();
+        ui.scroll_to_rect(
+            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())),
+            None,
+        );
+    }
 
     // Background
     if is_match {
@@ -2266,6 +2276,7 @@ impl App {
         let root  = result.root;
         let num_rows = tree.visible.len();
         let scroll_to_row = tree.scroll_to_row.take();
+        let reveal_row = tree.reveal_row.take();
 
         let avail_h   = ui.available_height();
         let row_pitch = row_h + ui.spacing().item_spacing.y;
@@ -2286,6 +2297,7 @@ impl App {
                     let row_actions = render_diff_row(
                         ui, left, right, &result.nodes, expanded, selected, node_idx,
                         row_h, key_font.clone(), val_font.clone(), root,
+                        reveal_row == Some(r),
                     );
                     actions.extend(row_actions);
                 }
@@ -2333,6 +2345,7 @@ fn render_diff_row(
     key_font:  egui::FontId,
     val_font:  egui::FontId,
     root:      u32,
+    reveal:    bool,
 ) -> Vec<DiffRowAction> {
     use diff::DiffStatus;
 
@@ -2347,6 +2360,13 @@ fn render_diff_row(
     let full_w = ui.available_width().max(1.0);
     let (id, rect) = ui.allocate_space(egui::vec2(full_w, row_h));
     let response = ui.interact(rect, id, egui::Sense::click());
+    if reveal {
+        let x = ui.clip_rect().left();
+        ui.scroll_to_rect(
+            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())),
+            None,
+        );
+    }
 
     let mid_x = rect.center().x;
     let left_cell  = egui::Rect::from_min_max(rect.left_top(), egui::pos2(mid_x, rect.bottom()));

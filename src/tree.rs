@@ -16,6 +16,7 @@ pub struct TreeState {
     pub search_cursor:     usize,
     pub search_result_set: HashSet<u32>,
     pub scroll_to_row:     Option<usize>,
+    pub reveal_row:        Option<usize>,
 }
 
 impl TreeState {
@@ -36,6 +37,7 @@ impl TreeState {
             search_cursor: 0,
             search_result_set: HashSet::new(),
             scroll_to_row: None,
+            reveal_row: None,
         }
     }
 
@@ -73,7 +75,7 @@ impl TreeState {
             if let Some(pos) = self.visible.iter().position(|&n| n == sel) {
                 if pos > 0 {
                     self.selected = Some(self.visible[pos - 1]);
-                    self.scroll_to_row = Some(pos - 1);
+                    self.reveal_row = Some(pos - 1);
                 }
             }
         }
@@ -84,7 +86,7 @@ impl TreeState {
             if let Some(pos) = self.visible.iter().position(|&n| n == sel) {
                 if pos + 1 < self.visible.len() {
                     self.selected = Some(self.visible[pos + 1]);
-                    self.scroll_to_row = Some(pos + 1);
+                    self.reveal_row = Some(pos + 1);
                 }
             }
         }
@@ -426,6 +428,8 @@ mod tests {
         state.select_down();
         assert_ne!(state.selected, initial);
         assert_eq!(state.selected, Some(state.visible[1]));
+        assert_eq!(state.scroll_to_row, None);
+        assert_eq!(state.reveal_row, Some(1));
     }
 
     #[test]
