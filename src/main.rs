@@ -64,6 +64,9 @@ enum RowAction {
     ExpandRecursive(u32),
     CollapseRecursive(u32),
     Export(ExportScope, ExportFormat),
+    StartEditValue(u32),
+    StartEditKey(u32),
+    DeleteNode(u32),
 }
 
 /// What an export operates on.
@@ -92,6 +95,20 @@ impl ExportFormat {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditField { Key, Value }
+
+/// Which save operation a UI control is requesting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveAction { Overwrite, Copy }
+
+struct EditingState {
+    node_idx:        u32,
+    field:           EditField,
+    text:            String,
+    focus_requested: bool, // auto-focus TextEdit on first render
+}
+
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
 enum DiffRowAction {
     Select(u32),
@@ -118,6 +135,9 @@ enum Side {
 struct FileInfo {
     name:       String,
     size_bytes: u64,
+    /// Source path on disk, when the document was opened from a file. `None`
+    /// for pasted content — such documents can only be saved as a copy.
+    path:       Option<PathBuf>,
 }
 
 /// One side of the Compare view — an independently-loaded document.
@@ -185,6 +205,11 @@ struct App {
     update_rx:            Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
     update_available:     Option<update::ReleaseInfo>,
     update_check_started: bool,
+    editing_node:  Option<EditingState>,
+    edit_overlay:  std::collections::HashMap<u32, export::NodeEdit>,
+    /// Snapshot of `edit_overlay` at the last overwrite-save; edits matching it
+    /// are considered persisted (no dirty marker). Empty = nothing saved yet.
+    saved_overlay: std::collections::HashMap<u32, export::NodeEdit>,
     install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
     update_installed:     bool,
     #[cfg(target_os = "macos")]
@@ -215,6 +240,9 @@ impl Default for App {
             update_rx:            None,
             update_available:     None,
             update_check_started: false,
+            editing_node:  None,
+            edit_overlay:  std::collections::HashMap::new(),
+            saved_overlay: std::collections::HashMap::new(),
             install_watcher_rx:   None,
             update_installed:     false,
             #[cfg(target_os = "macos")]
@@ -324,6 +352,7 @@ impl eframe::App for App {
         self.show_help_window(ui.ctx());
         self.show_search_help_window(ui.ctx());
         self.show_about_window(ui.ctx());
+        self.show_edit_dialog(ui.ctx());
 
         // ── macOS native menu bar (installed once, actions polled every frame) ──
         #[cfg(target_os = "macos")]
@@ -344,6 +373,8 @@ impl eframe::App for App {
             if acts & macos_menu::ACT_ABOUT        != 0 { self.about_open = true; }
             if acts & macos_menu::ACT_EXPORT_JSON  != 0 { self.export(ExportScope::File, ExportFormat::Json); }
             if acts & macos_menu::ACT_EXPORT_CSV   != 0 { self.export(ExportScope::File, ExportFormat::Csv); }
+            if acts & macos_menu::ACT_SAVE         != 0 { self.save_overwrite(); }
+            if acts & macos_menu::ACT_SAVE_COPY    != 0 { self.save_copy(); }
             if let Some(path) = macos_menu::take_open_file() { self.open_file(path); }
         }
 
@@ -487,7 +518,7 @@ impl eframe::App for App {
         // ── 4. Keyboard shortcuts ──
         let (cmd_o, cmd_f, cmd_comma, arrow_up, arrow_down, arrow_left, arrow_right,
              cmd_g, cmd_shift_g, opt_c, opt_x,
-             page_up, page_down, home, end) =
+             page_up, page_down, home, end, f2, cmd_s, delete_key) =
             ui.input(|i| {
                 let cmd   = i.modifiers.command;
                 let shift = i.modifiers.shift;
@@ -509,6 +540,9 @@ impl eframe::App for App {
                     none && i.key_pressed(egui::Key::PageDown),
                     none && i.key_pressed(egui::Key::Home),
                     none && i.key_pressed(egui::Key::End),
+                    none && i.key_pressed(egui::Key::F2),
+                    cmd && !shift && i.key_pressed(egui::Key::S),
+                    none && i.key_pressed(egui::Key::Delete),
                 )
             });
 
@@ -545,6 +579,39 @@ impl eframe::App for App {
                     if home        { t.select_home(); }
                     if end         { t.select_end(); }
                 }
+            }
+        }
+
+        // F2 → edit selected leaf value.
+        if f2 && self.mode == AppMode::Viewer {
+            if let Some(t) = &self.tree {
+                if let Some(sel) = t.selected {
+                    let node = &t.index.nodes[sel as usize];
+                    if !matches!(node.kind, index::NodeKind::Object | index::NodeKind::Array) {
+                        let n = sel;
+                        self.start_edit(n, EditField::Value);
+                    }
+                }
+            }
+        }
+
+        // Delete → toggle delete on the selected node (skip the root).
+        if delete_key && self.mode == AppMode::Viewer && ui.ctx().memory(|m| m.focused().is_none()) {
+            let to_delete = self.tree.as_ref().and_then(|t| {
+                t.selected.filter(|&sel| t.index.nodes[sel as usize].parent != u32::MAX)
+            });
+            if let Some(n) = to_delete {
+                self.toggle_delete(n);
+            }
+        }
+
+        // Cmd+S → save: overwrite the original file, or save a copy when the
+        // document has no path (pasted). Only when there are unsaved changes.
+        if cmd_s && self.mode == AppMode::Viewer && self.is_dirty() {
+            if self.can_overwrite() {
+                self.save_overwrite();
+            } else {
+                self.save_copy();
             }
         }
 
@@ -623,7 +690,7 @@ impl eframe::App for App {
                 });
         }
 
-        let mut export_req: Option<(ExportScope, ExportFormat)> = None;
+        let mut status_req: (Option<(ExportScope, ExportFormat)>, Option<SaveAction>) = (None, None);
         egui::Panel::bottom("statusbar")
             .exact_size(26.0)
             .frame(
@@ -632,10 +699,15 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show_inside(ui, |ui| {
-                export_req = self.status_bar(ui);
+                status_req = self.status_bar(ui);
             });
-        if let Some((scope, fmt)) = export_req {
+        if let Some((scope, fmt)) = status_req.0 {
             self.export(scope, fmt);
+        }
+        match status_req.1 {
+            Some(SaveAction::Overwrite) => self.save_overwrite(),
+            Some(SaveAction::Copy)      => self.save_copy(),
+            None => {}
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -675,6 +747,26 @@ impl App {
                             self.export(ExportScope::File, ExportFormat::Csv);
                         }
                     });
+                });
+                ui.separator();
+                let dirty    = self.is_dirty();
+                let can_over = self.can_overwrite();
+                ui.add_enabled_ui(dirty && can_over, |ui| {
+                    if ui.add(egui::Button::new("Save").shortcut_text("⌘S")).clicked() {
+                        ui.close();
+                        self.save_overwrite();
+                    }
+                });
+                ui.add_enabled_ui(dirty, |ui| {
+                    if ui.add(egui::Button::new("Save a Copy…").shortcut_text("⇧⌘S")).clicked() {
+                        ui.close();
+                        self.save_copy();
+                    }
+                    if ui.button("Revert Changes").clicked() {
+                        ui.close();
+                        self.edit_overlay = self.saved_overlay.clone();
+                        self.editing_node = None;
+                    }
                 });
                 ui.separator();
                 if ui.add(egui::Button::new("Settings").shortcut_text("⌘,")).clicked() {
@@ -771,6 +863,12 @@ impl App {
                         row(ui, "Enter",      "Next result");
                         row(ui, "⌘ G",       "Next result");
                         row(ui, "⌘ ⇧ G",     "Previous result");
+
+                        section(ui, "Editing");
+                        row(ui, "Double-click",  "Edit leaf value");
+                        row(ui, "F2",            "Edit selected value");
+                        row(ui, "⌘ S",           "Save (overwrite original)");
+                        row(ui, "⇧ ⌘ S",         "Save a Copy…");
                     });
 
                 ui.add_space(8.0);
@@ -1348,6 +1446,8 @@ impl App {
         let key_font = self.settings.key_font();
         let val_font = self.settings.val_font();
 
+        let edit_overlay  = &self.edit_overlay;  // field-disjoint borrow from self.tree
+        let saved_overlay = &self.saved_overlay;
         let tree = self.tree.as_mut().unwrap();
         let num_rows = tree.visible.len();
         let scroll_to_row = tree.scroll_to_row.take();
@@ -1378,7 +1478,7 @@ impl App {
                 for row_idx in row_range {
                     let node_idx = visible[row_idx];
                     let row_actions = render_row(
-                        ui, index, expanded, selected, search_res_set, node_idx,
+                        ui, edit_overlay, saved_overlay, index, expanded, selected, search_res_set, node_idx,
                         row_h, key_font.clone(), val_font.clone(),
                         multi_select, checked.contains(&node_idx), !checked.is_empty(),
                         reveal_row == Some(row_idx),
@@ -1390,6 +1490,8 @@ impl App {
 
         // Apply actions after borrows released
         let mut export_req: Option<(ExportScope, ExportFormat)> = None;
+        let mut start_edit_req: Option<(u32, EditField)> = None;
+        let mut delete_req: Option<u32> = None;
         for action in actions {
             match action {
                 RowAction::Select(n)           => { tree.selected = Some(n); }
@@ -1398,11 +1500,20 @@ impl App {
                 RowAction::ExpandRecursive(n)   => { tree.expand_recursive(n); }
                 RowAction::CollapseRecursive(n) => { tree.collapse_recursive(n); }
                 RowAction::Export(scope, fmt)   => { export_req = Some((scope, fmt)); }
+                RowAction::StartEditValue(n)    => { start_edit_req = Some((n, EditField::Value)); }
+                RowAction::StartEditKey(n)      => { start_edit_req = Some((n, EditField::Key)); }
+                RowAction::DeleteNode(n)        => { delete_req = Some(n); }
             }
         }
-        // `tree` borrow ends here; export needs &mut self for the save dialog.
+        // `tree` borrow ends here; export/edit/delete need &mut self.
         if let Some((scope, fmt)) = export_req {
             self.export(scope, fmt);
+        }
+        if let Some((n, field)) = start_edit_req {
+            self.start_edit(n, field);
+        }
+        if let Some(n) = delete_req {
+            self.toggle_delete(n);
         }
     }
 }
@@ -1463,6 +1574,8 @@ fn value_parts(index: &index::JsonIndex, node: &index::Node, dark: bool) -> (Str
 
 fn render_row(
     ui:               &mut egui::Ui,
+    edit_overlay:     &std::collections::HashMap<u32, export::NodeEdit>,
+    saved_overlay:    &std::collections::HashMap<u32, export::NodeEdit>,
     index:            &index::JsonIndex,
     expanded:         &std::collections::HashSet<u32>,
     selected:         Option<u32>,
@@ -1492,12 +1605,35 @@ fn render_row(
 
     let dark = ui.visuals().dark_mode;
     // Key text + color (the " : " separator is painted separately, in PUNCT)
-    let (key_text, key_color) = key_parts(index, node, dark);
+    let (mut key_text, mut key_color) = key_parts(index, node, dark);
     let sep_text  = " : ";
     let sep_color = if dark { theme::PUNCT } else { egui::Color32::from_rgb(120, 120, 120) };
 
     // Value text + color
-    let (value_text, value_color) = value_parts(index, node, dark);
+    let (mut value_text, mut value_color) = value_parts(index, node, dark);
+
+    // Overlay: edited nodes show their edited text. A node whose edit differs
+    // from the last saved baseline is "pending" — rendered in the accent color
+    // with a dirty dot; already-saved edits render normally.
+    let pending = edit_overlay.get(&node_idx) != saved_overlay.get(&node_idx);
+    let is_deleted = edit_overlay.get(&node_idx).map_or(false, |e| e.deleted);
+    if let Some(ov) = edit_overlay.get(&node_idx) {
+        if let Some(k) = &ov.key_override {
+            key_text = format!("\"{}\"", k); // re-add display quotes
+            if pending { key_color = theme::ACCENT; }
+        }
+        if let Some(v) = &ov.value_override {
+            // `value_override` is stored as raw JSON text (string literals keep
+            // their quotes), matching how `value_parts` renders unedited nodes.
+            value_text = v.clone();
+            if pending { value_color = theme::ACCENT; }
+        }
+    }
+    if is_deleted {
+        key_color   = theme::DELETED;
+        value_color = theme::DELETED;
+    }
+    let has_edit = pending;
 
     // In multi-select mode a fixed left gutter holds the per-row checkbox; the
     // whole tree (indent guides included) shifts right by this amount.
@@ -1617,6 +1753,16 @@ fn render_row(
 
     // Value — single line, vertically centred.
     painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, value_display.as_ref(), val_font, value_color);
+    if has_edit {
+        let dot_x = rect.right() - 6.0;
+        let dot_y = rect.top() + row_h / 2.0;
+        painter.circle_filled(egui::pos2(dot_x, dot_y), 3.0, theme::ACCENT);
+    }
+    if is_deleted {
+        let strike_x0 = rect.left() + indent + 18.0;
+        let strike_x1 = strike_x0 + key_w + sep_w + val_w;
+        painter.hline(strike_x0..=strike_x1, y1, egui::Stroke::new(1.5, theme::DELETED));
+    }
 
     // Collect actions
     let mut actions: Vec<RowAction> = Vec::new();
@@ -1637,14 +1783,46 @@ fn render_row(
             }
         }
     }
-    if response.double_clicked() && can_toggle {
-        // Double-click anywhere on a container toggles it
-        actions.push(RowAction::Toggle(node_idx));
+    if response.double_clicked() {
+        if can_toggle {
+            // Double-click anywhere on a container toggles it.
+            actions.push(RowAction::Toggle(node_idx));
+        } else if !is_container {
+            actions.push(RowAction::StartEditValue(node_idx));
+        }
     }
 
     // Context menu (right-click)
     response.context_menu(|ui| {
         let n = &index.nodes[node_idx as usize];
+        let is_deleted = edit_overlay.get(&node_idx).map_or(false, |e| e.deleted);
+        let is_root = n.parent == u32::MAX;
+
+        // Edit items — hidden for deleted nodes.
+        if !is_deleted {
+            if !is_container {
+                if ui.button("Edit Value").clicked() {
+                    actions.push(RowAction::StartEditValue(node_idx));
+                    ui.close();
+                }
+            }
+            if n.key_len > 0 {
+                if ui.button("Edit Key").clicked() {
+                    actions.push(RowAction::StartEditKey(node_idx));
+                    ui.close();
+                }
+            }
+        }
+        if !is_root {
+            let label = if is_deleted { "Restore" } else { "Delete" };
+            if ui.button(label).clicked() {
+                actions.push(RowAction::DeleteNode(node_idx));
+                ui.close();
+            }
+        }
+        if (!is_container || n.key_len > 0) || !is_root {
+            ui.separator();
+        }
 
         if ui.button("Copy Path").clicked() {
             ui.ctx().copy_text(build_path(&index.nodes, index, node_idx));
@@ -1754,7 +1932,7 @@ fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) 
 // ─── status bar ──────────────────────────────────────────────────────────────
 
 impl App {
-    fn status_bar(&self, ui: &mut egui::Ui) -> Option<(ExportScope, ExportFormat)> {
+    fn status_bar(&self, ui: &mut egui::Ui) -> (Option<(ExportScope, ExportFormat)>, Option<SaveAction>) {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px top border above the bar
         let r = ui.max_rect();
@@ -1762,10 +1940,13 @@ impl App {
 
         if self.mode == AppMode::Compare {
             self.compare_status_bar(ui);
-            return None;
+            return (None, None);
         }
 
         let mut export_req = None;
+        let mut save_req: Option<SaveAction> = None;
+        let dirty    = self.is_dirty();
+        let can_over = self.can_overwrite();
         ui.horizontal_centered(|ui| {
             if let Some(info) = &self.file_info {
                 ui.label(
@@ -1801,6 +1982,33 @@ impl App {
             // Right-aligned: encoding, format badge, root-type badge.
             if let Some(t) = &self.tree {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if dirty {
+                        let label = if can_over { "● Save  ⌘S" } else { "● Save a Copy…" };
+                        let hover = if can_over {
+                            "Overwrite the original file and clear changes"
+                        } else {
+                            "Save the edited JSON to a new file"
+                        };
+                        let save_btn = egui::Button::new(
+                            egui::RichText::new(label).color(egui::Color32::WHITE),
+                        )
+                            .fill(pal.accent);
+                        if ui.add(save_btn).on_hover_text(hover).clicked() {
+                            save_req = Some(if can_over { SaveAction::Overwrite } else { SaveAction::Copy });
+                        }
+                        // When overwrite is available, also offer a copy.
+                        if can_over {
+                            ui.add_space(6.0);
+                            if ui
+                                .button(egui::RichText::new("Save a Copy…").small().color(pal.text_muted))
+                                .on_hover_text("Save the edited JSON to a new file")
+                                .clicked()
+                            {
+                                save_req = Some(SaveAction::Copy);
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
                     ui.label(egui::RichText::new("UTF-8").small().color(pal.text_faint));
                     ui.add_space(8.0);
 
@@ -1831,7 +2039,7 @@ impl App {
                 });
             }
         });
-        export_req
+        (export_req, save_req)
     }
 }
 
@@ -1925,12 +2133,15 @@ impl App {
     fn open_file(&mut self, path: PathBuf) {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        self.file_info    = Some(FileInfo { name, size_bytes: size });
+        self.file_info    = Some(FileInfo { name, size_bytes: size, path: Some(path.clone()) });
         self.tree         = None;
         self.load_error   = None;
         self.load_progress = 0.0;
         self.search_input.clear();
         self.search_pending = None;
+        self.edit_overlay.clear();
+        self.saved_overlay.clear();
+        self.editing_node = None;
         self.load_rx      = Some(loader::spawn_load(path));
     }
 
@@ -1951,12 +2162,15 @@ impl App {
             Some(decoded) => (decoded, "Pasted JWT"),
             None          => (text.as_bytes().to_vec(), "Pasted JSON"),
         };
-        self.file_info    = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64 });
+        self.file_info    = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64, path: None });
         self.tree         = None;
         self.load_error   = None;
         self.load_progress = 0.0;
         self.search_input.clear();
         self.search_pending = None;
+        self.edit_overlay.clear();
+        self.saved_overlay.clear();
+        self.editing_node = None;
         self.load_rx      = Some(loader::spawn_parse(data));
     }
 
@@ -1975,6 +2189,243 @@ impl App {
                 Some(std::thread::spawn(move || search::search(&index, &query, use_regex)));
         }
     }
+}
+
+// ─── editing ─────────────────────────────────────────────────────────────────
+
+impl App {
+    /// True when there are edits not yet persisted by an overwrite-save.
+    fn is_dirty(&self) -> bool {
+        self.edit_overlay != self.saved_overlay
+    }
+
+    /// True when the open document came from a file we can overwrite in place.
+    fn can_overwrite(&self) -> bool {
+        self.file_info.as_ref().and_then(|f| f.path.as_ref()).is_some()
+    }
+
+    /// Toggle the deleted flag on `node_idx`. Removes the overlay entry when it
+    /// becomes fully default (no key/value override, not deleted).
+    fn toggle_delete(&mut self, node_idx: u32) {
+        {
+            let entry = self.edit_overlay.entry(node_idx).or_default();
+            entry.deleted = !entry.deleted;
+        }
+        if let Some(e) = self.edit_overlay.get(&node_idx) {
+            if !e.deleted && e.key_override.is_none() && e.value_override.is_none() {
+                self.edit_overlay.remove(&node_idx);
+            }
+        }
+    }
+
+    /// Open the edit dialog for `node_idx`, pre-populating the buffer with the
+    /// current display text (unquoted for strings).
+    fn start_edit(&mut self, node_idx: u32, field: EditField) {
+        let Some(tree) = &self.tree else { return };
+        let node = &tree.index.nodes[node_idx as usize];
+        use index::NodeKind;
+
+        let text = match field {
+            EditField::Key => self
+                .edit_overlay
+                .get(&node_idx)
+                .and_then(|e| e.key_override.clone())
+                .unwrap_or_else(|| tree.index.key_of(node).to_owned()),
+            EditField::Value => {
+                if let Some(v) = self
+                    .edit_overlay
+                    .get(&node_idx)
+                    .and_then(|e| e.value_override.as_deref())
+                {
+                    // For strings, strip the JSON quotes for the edit box.
+                    if node.kind == NodeKind::String {
+                        serde_json::from_str::<String>(v).unwrap_or_else(|_| v.to_owned())
+                    } else {
+                        v.to_owned()
+                    }
+                } else {
+                    let raw = String::from_utf8_lossy(tree.index.value_bytes(node));
+                    if node.kind == NodeKind::String {
+                        // Strip outer quotes for display ("hello" → hello).
+                        serde_json::from_str::<String>(&raw).unwrap_or_else(|_| raw.into_owned())
+                    } else {
+                        raw.into_owned()
+                    }
+                }
+            }
+        };
+
+        self.editing_node = Some(EditingState {
+            node_idx,
+            field,
+            text,
+            focus_requested: true,
+        });
+    }
+
+    /// Store the committed edit into `edit_overlay` and clear `editing_node`.
+    fn commit_edit(&mut self) {
+        let Some(state) = self.editing_node.take() else { return };
+        let Some(tree) = &self.tree else { return };
+        let node = &tree.index.nodes[state.node_idx as usize];
+        use index::NodeKind;
+
+        let entry = self
+            .edit_overlay
+            .entry(state.node_idx)
+            .or_insert_with(export::NodeEdit::default);
+        match state.field {
+            EditField::Value => {
+                let raw = if node.kind == NodeKind::String {
+                    // Re-encode as a JSON string literal.
+                    serde_json::to_string(&state.text).unwrap_or_else(|_| {
+                        format!(
+                            "\"{}\"",
+                            state.text.replace('\\', "\\\\").replace('"', "\\\"")
+                        )
+                    })
+                } else {
+                    state.text
+                };
+                entry.value_override = Some(raw);
+            }
+            EditField::Key => {
+                entry.key_override = Some(state.text);
+            }
+        }
+    }
+
+    /// Save the edited document to a new file chosen via the platform dialog.
+    /// Does not change which file is open or clear the dirty state.
+    fn save_copy(&mut self) {
+        let Some(tree) = &self.tree else { return };
+        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay);
+        let stem = self
+            .file_info
+            .as_ref()
+            .map(|f| {
+                std::path::Path::new(&f.name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| f.name.clone())
+            })
+            .unwrap_or_else(|| "export".to_owned());
+        let default_name = format!("{stem}-copy.json");
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&path, json.as_bytes()) {
+                self.load_error = Some(format!("Save failed: {e}"));
+            }
+        }
+    }
+
+    /// Overwrite the original file with the edited document. When the overlay
+    /// contains deletions, reloads from the new file so deleted nodes
+    /// disappear from the tree. For pure key/value edits, keeps the tree in
+    /// place and just advances the saved baseline. Only valid for file-backed
+    /// documents (those with a known path).
+    fn save_overwrite(&mut self) {
+        let Some(path) = self.file_info.as_ref().and_then(|f| f.path.clone()) else { return };
+        let Some(tree) = &self.tree else { return };
+        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay);
+        // Atomic write (temp + rename): never truncate the file the current
+        // index may still be mmap'd against.
+        if let Err(e) = write_atomic(&path, json.as_bytes()) {
+            self.load_error = Some(format!("Save failed: {e}"));
+            return;
+        }
+        let has_deletes = self.edit_overlay.values().any(|e| e.deleted);
+        if has_deletes {
+            // Reload so deleted nodes disappear from the tree.
+            self.open_file(path);
+        } else {
+            self.saved_overlay = self.edit_overlay.clone();
+            if let Some(f) = &mut self.file_info {
+                f.size_bytes = json.len() as u64;
+            }
+        }
+    }
+
+    /// Modal dialog for editing a single key or value. Commits to `edit_overlay`
+    /// on OK/Enter; discards on Cancel/Escape/close.
+    fn show_edit_dialog(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.editing_node else { return };
+        let Some(tree) = &self.tree else { return };
+
+        let title = match state.field {
+            EditField::Key   => "Edit Key",
+            EditField::Value => "Edit Value",
+        };
+        let path = build_path(&tree.index.nodes, &*tree.index, state.node_idx);
+
+        let mut commit = false;
+        let mut cancel = false;
+        let mut open   = true;
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .min_width(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(path.as_str()).monospace().small().color(pal.text_muted));
+                ui.add_space(4.0);
+
+                let te = egui::TextEdit::singleline(&mut state.text)
+                    .desired_width(340.0)
+                    .font(egui::TextStyle::Monospace);
+                let resp = ui.add(te);
+
+                if state.focus_requested {
+                    resp.request_focus();
+                    state.focus_requested = false;
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked()     { commit = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+            });
+
+        // Borrows on `self.editing_node` / `self.tree` end here.
+        if commit {
+            self.commit_edit();
+        } else if cancel || !open {
+            self.editing_node = None;
+        }
+    }
+}
+
+/// Write `bytes` to `path` atomically (sibling temp file + rename) so that an
+/// existing memory map of `path` is never truncated out from under the app.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.json".to_owned());
+    let tmp = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join(format!(".{file_name}.jsonviewer.tmp")),
+        None      => std::path::PathBuf::from(format!(".{file_name}.jsonviewer.tmp")),
+    };
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 // ─── compare mode ────────────────────────────────────────────────────────────
@@ -2014,7 +2465,7 @@ impl App {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let pane = self.compare.pane_mut(side);
-        pane.file_info     = Some(FileInfo { name, size_bytes: size });
+        pane.file_info     = Some(FileInfo { name, size_bytes: size, path: None });
         pane.index         = None;
         pane.load_error    = None;
         pane.load_progress = 0.0;
@@ -2029,7 +2480,7 @@ impl App {
             None    => (text.as_bytes().to_vec(), "Pasted JSON"),
         };
         let pane = self.compare.pane_mut(side);
-        pane.file_info     = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64 });
+        pane.file_info     = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64, path: None });
         pane.index         = None;
         pane.load_error    = None;
         pane.load_progress = 0.0;
@@ -2117,7 +2568,7 @@ impl App {
                         update::UpdateMsg::Error(e) => {
                             eprintln!("update check failed: {e}");
                         }
-                        update::UpdateMsg::Installed(_) => {}
+                        update::UpdateMsg::Installed => {}
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -2130,7 +2581,7 @@ impl App {
         // Poll the install watcher receiver.
         if let Some(rx) = &self.install_watcher_rx {
             match rx.try_recv() {
-                Ok(update::UpdateMsg::Installed(_)) => {
+                Ok(update::UpdateMsg::Installed) => {
                     self.install_watcher_rx = None;
                     self.update_installed = true;
                     ctx.request_repaint();
@@ -2630,5 +3081,253 @@ fn format_size(n: u64) -> String {
         format!("{:.1} KB", n as f64 / KB as f64)
     } else {
         format!("{} B", n)
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use crate::index::{JsonData, JsonIndex};
+    use std::sync::Arc;
+
+    fn make_tree(json: &str) -> Arc<JsonIndex> {
+        let data = json.as_bytes().to_vec();
+        let mut key_arena = Vec::new();
+        let (nodes, root, is_ndjson) =
+            crate::parser::parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
+        Arc::new(JsonIndex {
+            data: JsonData::Memory(data),
+            nodes,
+            key_arena,
+            root,
+            is_ndjson,
+        })
+    }
+
+    /// Walk to the node at a sequence of object keys / array indices from root.
+    fn nav(index: &JsonIndex, path: &[&str]) -> u32 {
+        let mut cur = index.root;
+        for seg in path {
+            let node = &index.nodes[cur as usize];
+            let mut c = node.first_child;
+            let mut found = None;
+            while c != u32::MAX {
+                let cn = &index.nodes[c as usize];
+                let matches = if let Ok(i) = seg.parse::<u32>() {
+                    cn.array_index == i
+                } else {
+                    index.key_of(cn) == *seg
+                };
+                if matches {
+                    found = Some(c);
+                    break;
+                }
+                c = cn.next_sibling;
+            }
+            cur = found.unwrap_or_else(|| panic!("path segment {seg:?} not found"));
+        }
+        cur
+    }
+
+    fn app_with(json: &str) -> App {
+        let mut app = App::default();
+        app.tree = Some(TreeState::new(make_tree(json)));
+        app
+    }
+
+    #[test]
+    fn start_edit_strips_quotes_for_string_value() {
+        let mut app = app_with(r#"{"name": "Alice"}"#);
+        let name = nav(&app.tree.as_ref().unwrap().index, &["name"]);
+        app.start_edit(name, EditField::Value);
+        // The edit buffer shows the decoded string, without JSON quotes.
+        assert_eq!(app.editing_node.as_ref().unwrap().text, "Alice");
+    }
+
+    #[test]
+    fn commit_string_value_reencodes_and_serializes() {
+        let mut app = app_with(r#"{"name": "Alice", "age": 30}"#);
+        let name = nav(&app.tree.as_ref().unwrap().index, &["name"]);
+        app.start_edit(name, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
+        app.commit_edit();
+
+        assert!(app.editing_node.is_none());
+        assert_eq!(
+            app.edit_overlay.get(&name).unwrap().value_override.as_deref(),
+            Some("\"Bob\"")
+        );
+
+        let t = app.tree.as_ref().unwrap();
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"name": "Bob", "age": 30}));
+    }
+
+    #[test]
+    fn commit_string_value_escapes_embedded_quote() {
+        let mut app = app_with(r#"{"s": "x"}"#);
+        let s = nav(&app.tree.as_ref().unwrap().index, &["s"]);
+        app.start_edit(s, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "a\"b".to_owned();
+        app.commit_edit();
+
+        let t = app.tree.as_ref().unwrap();
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"s": "a\"b"}));
+    }
+
+    #[test]
+    fn commit_number_value_is_emitted_verbatim() {
+        let mut app = app_with(r#"{"age": 30}"#);
+        let age = nav(&app.tree.as_ref().unwrap().index, &["age"]);
+        app.start_edit(age, EditField::Value);
+        // Numbers are edited as their raw text (no quote stripping).
+        assert_eq!(app.editing_node.as_ref().unwrap().text, "30");
+        app.editing_node.as_mut().unwrap().text = "99".to_owned();
+        app.commit_edit();
+
+        let t = app.tree.as_ref().unwrap();
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"age": 99}));
+    }
+
+    #[test]
+    fn commit_key_edit_serializes() {
+        let mut app = app_with(r#"{"age": 30}"#);
+        let age = nav(&app.tree.as_ref().unwrap().index, &["age"]);
+        app.start_edit(age, EditField::Key);
+        assert_eq!(app.editing_node.as_ref().unwrap().text, "age");
+        app.editing_node.as_mut().unwrap().text = "years".to_owned();
+        app.commit_edit();
+
+        let t = app.tree.as_ref().unwrap();
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"years": 30}));
+    }
+
+    #[test]
+    fn reediting_a_value_reads_back_the_override() {
+        let mut app = app_with(r#"{"name": "Alice"}"#);
+        let name = nav(&app.tree.as_ref().unwrap().index, &["name"]);
+        app.start_edit(name, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
+        app.commit_edit();
+        // Re-open: the buffer should show the previously committed value, unquoted.
+        app.start_edit(name, EditField::Value);
+        assert_eq!(app.editing_node.as_ref().unwrap().text, "Bob");
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("jsonviewer-test-{tag}-{nanos}.json"));
+        p
+    }
+
+    fn app_with_file(json: &str) -> (App, std::path::PathBuf) {
+        let path = temp_path("doc");
+        std::fs::write(&path, json).unwrap();
+        let mut app = App::default();
+        app.tree = Some(TreeState::new(make_tree(json)));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        app.file_info = Some(FileInfo {
+            name,
+            size_bytes: json.len() as u64,
+            path: Some(path.clone()),
+        });
+        (app, path)
+    }
+
+    #[test]
+    fn overwrite_writes_edits_and_clears_dirty() {
+        let (mut app, path) = app_with_file(r#"{"name": "Alice", "age": 30}"#);
+        assert!(!app.is_dirty());
+        assert!(app.can_overwrite());
+
+        let name = nav(&app.tree.as_ref().unwrap().index, &["name"]);
+        app.start_edit(name, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
+        app.commit_edit();
+        assert!(app.is_dirty());
+
+        app.save_overwrite();
+        assert!(!app.is_dirty(), "overwrite must clear the dirty state");
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, serde_json::json!({"name": "Bob", "age": 30}));
+        // Overlay retained (still displayed) but matches the saved baseline.
+        assert_eq!(app.edit_overlay.get(&name), app.saved_overlay.get(&name));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reedit_after_overwrite_is_dirty_again() {
+        let (mut app, path) = app_with_file(r#"{"name": "Alice", "age": 30}"#);
+        let name = nav(&app.tree.as_ref().unwrap().index, &["name"]);
+        let age  = nav(&app.tree.as_ref().unwrap().index, &["age"]);
+
+        app.start_edit(name, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
+        app.commit_edit();
+        app.save_overwrite();
+        assert!(!app.is_dirty());
+
+        app.start_edit(age, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "31".to_owned();
+        app.commit_edit();
+        assert!(app.is_dirty(), "a new edit after save is dirty again");
+        // The previously-saved node is no longer pending; the new one is.
+        assert_eq!(app.edit_overlay.get(&name), app.saved_overlay.get(&name));
+        assert_ne!(app.edit_overlay.get(&age), app.saved_overlay.get(&age));
+
+        app.save_overwrite();
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, serde_json::json!({"name": "Bob", "age": 31}));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn revert_restores_saved_baseline() {
+        let (mut app, path) = app_with_file(r#"{"name": "Alice"}"#);
+        let name = nav(&app.tree.as_ref().unwrap().index, &["name"]);
+
+        app.start_edit(name, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
+        app.commit_edit();
+        app.save_overwrite(); // baseline = {name: "Bob"}
+
+        app.start_edit(name, EditField::Value);
+        app.editing_node.as_mut().unwrap().text = "Carol".to_owned();
+        app.commit_edit();
+        assert!(app.is_dirty());
+
+        // Revert (as the menu does) discards unsaved changes to the baseline.
+        app.edit_overlay = app.saved_overlay.clone();
+        assert!(!app.is_dirty());
+        assert_eq!(
+            app.edit_overlay.get(&name).unwrap().value_override.as_deref(),
+            Some("\"Bob\"")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pasted_document_cannot_overwrite() {
+        let app = app_with(r#"{"a": 1}"#); // no file path
+        assert!(!app.can_overwrite());
+
+        let (app2, path) = app_with_file(r#"{"a": 1}"#);
+        assert!(app2.can_overwrite());
+        let _ = std::fs::remove_file(&path);
     }
 }

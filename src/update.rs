@@ -35,7 +35,7 @@ pub enum UpdateMsg {
     UpToDate,
     Available(ReleaseInfo),
     /// The brew upgrade completed and this version is now installed.
-    Installed(String),
+    Installed,
     Error(String),
 }
 
@@ -76,7 +76,7 @@ pub fn spawn_install_watcher(expected_version: String) -> mpsc::Receiver<UpdateM
         for _ in 0..MAX_POLLS {
             std::thread::sleep(std::time::Duration::from_secs(POLL_SECS));
             if installed_version().as_deref() == Some(expected_version.as_str()) {
-                let _ = tx.send(UpdateMsg::Installed(expected_version));
+                let _ = tx.send(UpdateMsg::Installed);
                 return;
             }
         }
