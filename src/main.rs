@@ -182,9 +182,11 @@ struct App {
     type_ahead_time: f64,
     mode:           AppMode,
     compare:        CompareState,
-    update_rx:        Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
-    update_available: Option<update::ReleaseInfo>,
+    update_rx:            Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
+    update_available:     Option<update::ReleaseInfo>,
     update_check_started: bool,
+    install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
+    update_installed:     bool,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
 }
@@ -210,9 +212,11 @@ impl Default for App {
             type_ahead_time: 0.0,
             mode:            AppMode::Viewer,
             compare:         CompareState::default(),
-            update_rx:        None,
-            update_available: None,
+            update_rx:            None,
+            update_available:     None,
             update_check_started: false,
+            install_watcher_rx:   None,
+            update_installed:     false,
             #[cfg(target_os = "macos")]
             menu_installed: false,
         }
@@ -843,12 +847,39 @@ impl App {
     /// links to the release page and offers the `brew upgrade` command — it
     /// never downloads or replaces the binary.
     fn update_banner(&mut self, ui: &mut egui::Ui, pal: &theme::Palette) {
+        // Show "Restart now" banner after brew finishes, even if dismissed earlier.
+        if self.update_installed {
+            egui::Panel::top("update_banner")
+                .exact_size(self.settings.font_size + 16.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(52, 168, 83)) // green
+                        .inner_margin(egui::Margin::symmetric(10, 0)),
+                )
+                .show_inside(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("✓  Update installed — restart to apply")
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Restart now").clicked() {
+                                update::restart_app();
+                            }
+                        });
+                    });
+                });
+            return;
+        }
+
         let Some(info) = self.pending_update() else { return };
         let version = info.version.clone();
         let html_url = info.html_url.clone();
         // Show the first few lines of the release notes as a hover hint.
         let notes_hint: String = info.notes.lines().take(12).collect::<Vec<_>>().join("\n");
 
+        let upgrading = self.install_watcher_rx.is_some();
         let mut dismiss = false;
         egui::Panel::top("update_banner")
             .exact_size(self.settings.font_size + 16.0)
@@ -859,33 +890,46 @@ impl App {
             )
             .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
+                    let label = if upgrading {
+                        format!("⬆  Installing v{version}…")
+                    } else {
+                        format!("⬆  Update available — v{version}")
+                    };
                     ui.label(
-                        egui::RichText::new(format!("⬆  Update available — v{version}"))
+                        egui::RichText::new(label)
                             .color(egui::Color32::WHITE)
                             .strong(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("X").on_hover_text("Dismiss").clicked() {
-                            dismiss = true;
+                        if !upgrading {
+                            if ui.button("X").on_hover_text("Dismiss").clicked() {
+                                dismiss = true;
+                            }
                         }
                         if ui
-                        .button("Upgrade now")
-                        .on_hover_text(format!("Opens Terminal and runs:\n{}", update::BREW_UPGRADE_CMD))
-                        .clicked()
+                            .button(if upgrading { "Upgrading…" } else { "Upgrade now" })
+                            .on_hover_text(format!("Opens Terminal and runs:\n{}", update::BREW_UPGRADE_CMD))
+                            .clicked()
+                            && !upgrading
                         {
                             update::launch_brew_upgrade();
+                            self.install_watcher_rx =
+                                Some(update::spawn_install_watcher(version.clone()));
+                            ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
                         }
-                        if ui.button("Copy command").clicked() {
-                            ui.ctx().copy_text(update::BREW_UPGRADE_CMD.to_string());
-                        }
-                        let view = ui.button("View release");
-                        let view = if notes_hint.trim().is_empty() {
-                            view
-                        } else {
-                            view.on_hover_text(&notes_hint)
-                        };
-                        if view.clicked() {
-                            ui.ctx().open_url(egui::OpenUrl::new_tab(&html_url));
+                        if !upgrading {
+                            if ui.button("Copy command").clicked() {
+                                ui.ctx().copy_text(update::BREW_UPGRADE_CMD.to_string());
+                            }
+                            let view = ui.button("View release");
+                            let view = if notes_hint.trim().is_empty() {
+                                view
+                            } else {
+                                view.on_hover_text(&notes_hint)
+                            };
+                            if view.clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(&html_url));
+                            }
                         }
                     });
                 });
@@ -2059,26 +2103,46 @@ impl App {
 
     /// Collect the result of a background update check.
     fn poll_update(&mut self, ctx: &egui::Context) {
-        let msg = match &self.update_rx {
-            Some(rx) => match rx.try_recv() {
-                Ok(msg) => msg,
-                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        // Poll the version-check receiver.
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.update_rx = None;
+                    match msg {
+                        update::UpdateMsg::Available(info) => {
+                            self.update_available = Some(info);
+                            ctx.request_repaint();
+                        }
+                        update::UpdateMsg::UpToDate => {}
+                        update::UpdateMsg::Error(e) => {
+                            eprintln!("update check failed: {e}");
+                        }
+                        update::UpdateMsg::Installed(_) => {}
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.update_rx = None;
-                    return;
                 }
-            },
-            None => return,
-        };
-        self.update_rx = None;
-        match msg {
-            update::UpdateMsg::Available(info) => {
-                self.update_available = Some(info);
-                ctx.request_repaint();
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            update::UpdateMsg::UpToDate => {}
-            update::UpdateMsg::Error(e) => {
-                eprintln!("update check failed: {e}");
+        }
+
+        // Poll the install watcher receiver.
+        if let Some(rx) = &self.install_watcher_rx {
+            match rx.try_recv() {
+                Ok(update::UpdateMsg::Installed(_)) => {
+                    self.install_watcher_rx = None;
+                    self.update_installed = true;
+                    ctx.request_repaint();
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.install_watcher_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Keep polling; repaint so we check again next frame.
+                    ctx.request_repaint_after(std::time::Duration::from_secs(5));
+                }
             }
         }
     }

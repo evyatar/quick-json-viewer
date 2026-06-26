@@ -34,6 +34,8 @@ pub struct ReleaseInfo {
 pub enum UpdateMsg {
     UpToDate,
     Available(ReleaseInfo),
+    /// The brew upgrade completed and this version is now installed.
+    Installed(String),
     Error(String),
 }
 
@@ -62,6 +64,47 @@ pub fn launch_brew_upgrade() {
             .arg(script)
             .spawn();
     }
+}
+
+/// Spawn a watcher that polls `brew list --versions` until `expected_version`
+/// shows up (or times out after ~10 minutes). Yields `Installed` on success.
+pub fn spawn_install_watcher(expected_version: String) -> mpsc::Receiver<UpdateMsg> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        const POLL_SECS: u64 = 5;
+        const MAX_POLLS: u32 = 120; // 10 minutes
+        for _ in 0..MAX_POLLS {
+            std::thread::sleep(std::time::Duration::from_secs(POLL_SECS));
+            if installed_version().as_deref() == Some(expected_version.as_str()) {
+                let _ = tx.send(UpdateMsg::Installed(expected_version));
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Returns the currently-installed brew version string, e.g. `"1.1.0"`.
+fn installed_version() -> Option<String> {
+    let out = std::process::Command::new("brew")
+        .args(["list", "--versions", "quick-json-viewer"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Output looks like: "quick-json-viewer 1.1.0\n"
+    let version = stdout.split_whitespace().nth(1)?.to_string();
+    Some(version)
+}
+
+/// Relaunch the app and exit the current process.
+pub fn restart_app() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .args(["-a", "Quick JSON Viewer"])
+            .spawn();
+    }
+    std::process::exit(0);
 }
 
 /// Spawn a background check. The returned receiver yields exactly one message.
