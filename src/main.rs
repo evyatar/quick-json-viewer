@@ -449,6 +449,37 @@ impl eframe::App for App {
             }
         }
 
+        // ── 3c. ⌘C — copy selected node value when no text field is focused ──
+        // egui-winit converts Cmd+C into Event::Copy (early-return, no Key event),
+        // so we must intercept Event::Copy rather than using key_pressed(Key::C).
+        if no_text_focus {
+            let copy_event = ui.input_mut(|i| {
+                let mut found = false;
+                i.events.retain(|e| {
+                    if !found && matches!(e, egui::Event::Copy) {
+                        found = true;
+                        return false;
+                    }
+                    true
+                });
+                found
+            });
+            if copy_event {
+                match self.mode {
+                    AppMode::Viewer => {
+                        if let Some(t) = &self.tree {
+                            if let Some(sel) = t.selected {
+                                let n = &t.index.nodes[sel as usize];
+                                let raw = t.index.value_bytes(n);
+                                ui.ctx().copy_text(String::from_utf8_lossy(raw).into_owned());
+                            }
+                        }
+                    }
+                    AppMode::Compare => {}
+                }
+            }
+        }
+
         // ── 4. Keyboard shortcuts ──
         let (cmd_o, cmd_f, cmd_comma, arrow_up, arrow_down, arrow_left, arrow_right,
              cmd_g, cmd_shift_g, opt_c, opt_x,
