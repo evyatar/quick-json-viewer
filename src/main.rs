@@ -1,3 +1,4 @@
+mod codegen;
 mod diff;
 mod export;
 mod index;
@@ -1950,6 +1951,23 @@ fn render_row(
             let raw = index.value_bytes(n);
             ui.ctx().copy_text(String::from_utf8_lossy(raw).into_owned());
             ui.close();
+        }
+
+        if is_container {
+            ui.menu_button("Copy as Code", |ui| {
+                let root_name = if n.key_len > 0 {
+                    codegen::to_pascal_case(index.key_of(n))
+                } else {
+                    "RootObject".to_owned()
+                };
+                let raw = index.value_bytes(n);
+                for &lang in codegen::LANGUAGES {
+                    if ui.button(lang.label()).clicked() {
+                        ui.ctx().copy_text(codegen::generate(raw, lang, &root_name));
+                        ui.close();
+                    }
+                }
+            });
         }
 
         if is_container && has_children {
