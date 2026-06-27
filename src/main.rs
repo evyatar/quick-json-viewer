@@ -11,6 +11,7 @@ mod settings;
 mod theme;
 mod tree;
 mod update;
+mod url_parse;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -198,6 +199,9 @@ struct App {
     help_open:      bool,
     search_help_open: bool,
     about_open:     bool,
+    url_dialog_open:  bool,
+    url_dialog_input: String,
+    url_dialog_focus: bool,
     type_ahead:     String,
     type_ahead_time: f64,
     mode:           AppMode,
@@ -233,6 +237,9 @@ impl Default for App {
             help_open:       false,
             search_help_open: false,
             about_open:      false,
+            url_dialog_open:  false,
+            url_dialog_input: String::new(),
+            url_dialog_focus: false,
             type_ahead:      String::new(),
             type_ahead_time: 0.0,
             mode:            AppMode::Viewer,
@@ -352,6 +359,7 @@ impl eframe::App for App {
         self.show_help_window(ui.ctx());
         self.show_search_help_window(ui.ctx());
         self.show_about_window(ui.ctx());
+        self.show_url_dialog(ui.ctx());
         self.show_edit_dialog(ui.ctx());
 
         // ── macOS native menu bar (installed once, actions polled every frame) ──
@@ -363,6 +371,7 @@ impl eframe::App for App {
             }
             let acts = macos_menu::take_actions();
             if acts & macos_menu::ACT_OPEN_FILE    != 0 { self.open_active_dialog(); }
+            if acts & macos_menu::ACT_OPEN_URL     != 0 { self.open_url_dialog(); }
             if acts & macos_menu::ACT_PASTE        != 0 { self.request_paste(ui.ctx()); }
             if acts & macos_menu::ACT_SETTINGS     != 0 { self.settings_open = true; }
             if acts & macos_menu::ACT_FOCUS_SEARCH != 0 { self.focus_search = true; }
@@ -516,7 +525,7 @@ impl eframe::App for App {
         }
 
         // ── 4. Keyboard shortcuts ──
-        let (cmd_o, cmd_f, cmd_comma, arrow_up, arrow_down, arrow_left, arrow_right,
+        let (cmd_o, cmd_f, cmd_comma, cmd_l, arrow_up, arrow_down, arrow_left, arrow_right,
              cmd_g, cmd_shift_g, opt_c, opt_x,
              page_up, page_down, home, end, f2, cmd_s, delete_key) =
             ui.input(|i| {
@@ -528,6 +537,7 @@ impl eframe::App for App {
                     cmd && i.key_pressed(egui::Key::O),
                     cmd && i.key_pressed(egui::Key::F),
                     cmd && i.key_pressed(egui::Key::Comma),
+                    cmd && !shift && !alt && i.key_pressed(egui::Key::L),
                     none && i.key_pressed(egui::Key::ArrowUp),
                     none && i.key_pressed(egui::Key::ArrowDown),
                     none && i.key_pressed(egui::Key::ArrowLeft),
@@ -547,6 +557,7 @@ impl eframe::App for App {
             });
 
         if cmd_o      { self.open_active_dialog(); }
+        if cmd_l      { self.open_url_dialog(); }
         if cmd_f      { self.focus_search = true; }
         if cmd_comma  { self.settings_open = true; }
         if opt_c      { self.collapse_all_active(); }
@@ -845,7 +856,8 @@ impl App {
                     .show(ui, |ui| {
                         section(ui, "File");
                         row(ui, "⌘ O",       "Open file");
-                        row(ui, "⌘ V",       "Paste JSON / JWT from clipboard");
+                        row(ui, "⌘ L",       "Open URL…");
+                        row(ui, "⌘ V",       "Paste JSON / JWT / curl from clipboard");
                         row(ui, "⌘ ,",       "Settings");
 
                         section(ui, "Navigation");
@@ -1085,6 +1097,96 @@ impl App {
                     ui.add_space(12.0);
                 });
             });
+    }
+
+    fn show_url_dialog(&mut self, ctx: &egui::Context) {
+        if !self.url_dialog_open { return; }
+
+        let mut window_open   = true;
+        let mut do_open       = false;
+        let mut do_cancel     = false;
+        let focus_this_frame  = self.url_dialog_focus;
+
+        egui::Window::new("Open URL")
+            .open(&mut window_open)
+            .resizable(false)
+            .collapsible(false)
+            .min_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label("Paste a URL, curl command, or fetch() call:");
+                ui.add_space(6.0);
+
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut self.url_dialog_input)
+                        .hint_text(
+                            "https://api.example.com/data\n\
+                             — or —\n\
+                             curl -H \"Authorization: Bearer …\" https://api.example.com/data",
+                        )
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4),
+                );
+                if focus_this_frame {
+                    resp.request_focus();
+                }
+
+                ui.add_space(6.0);
+
+                let parsed = url_parse::parse_request(&self.url_dialog_input);
+                if let Some(ref req) = parsed {
+                    let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("→").color(pal.text_muted).small());
+                        ui.label(
+                            egui::RichText::new(&req.url)
+                                .small()
+                                .color(pal.accent),
+                        );
+                    });
+                    if !req.headers.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{} header(s) detected", req.headers.len()))
+                                .small()
+                                .color(pal.text_muted),
+                        );
+                    }
+                    ui.add_space(4.0);
+                }
+
+                let can_open = parsed.is_some();
+                // ⌘↵ submits without inserting a newline into the multiline field
+                let enter_submitted = ui.input(|i| {
+                    i.key_pressed(egui::Key::Enter) && i.modifiers.command
+                }) && can_open;
+
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(can_open, egui::Button::new("Open")).clicked()
+                        || enter_submitted
+                    {
+                        do_open = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+
+        if !window_open || do_cancel {
+            self.url_dialog_open = false;
+        }
+        if focus_this_frame {
+            self.url_dialog_focus = false;
+        }
+        if do_open {
+            if let Some(req) = url_parse::parse_request(&self.url_dialog_input) {
+                self.url_dialog_open  = false;
+                self.url_dialog_input.clear();
+                self.open_url_request(req);
+            }
+        }
     }
 }
 
@@ -1434,7 +1536,7 @@ impl App {
                 } else {
                     let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
                     ui.label(
-                        egui::RichText::new("Open a JSON file to get started\n(⌘O, drag-and-drop, or ⌘V to paste JSON / JWT)")
+                        egui::RichText::new("Open a JSON file to get started\n(⌘O, ⌘L for a URL, drag-and-drop, or ⌘V to paste JSON / JWT / curl)")
                             .color(pal.text_muted),
                     );
                 }
@@ -2158,6 +2260,11 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // Auto-detect URLs, curl commands, and fetch() calls
+        if let Some(req) = url_parse::parse_request(text) {
+            self.open_url_in_viewer(req);
+            return;
+        }
         let (data, name) = match paste::decode_jwt(text) {
             Some(decoded) => (decoded, "Pasted JWT"),
             None          => (text.as_bytes().to_vec(), "Pasted JSON"),
@@ -2172,6 +2279,51 @@ impl App {
         self.saved_overlay.clear();
         self.editing_node = None;
         self.load_rx      = Some(loader::spawn_parse(data));
+    }
+
+    fn open_url_dialog(&mut self) {
+        self.url_dialog_open  = true;
+        self.url_dialog_focus = true;
+    }
+
+    fn open_url_request(&mut self, req: url_parse::HttpRequest) {
+        match self.mode {
+            AppMode::Viewer  => self.open_url_in_viewer(req),
+            AppMode::Compare => {
+                let side = self.compare.active_pane;
+                self.open_url_request_into_pane(side, req);
+            }
+        }
+    }
+
+    fn open_url_in_viewer(&mut self, req: url_parse::HttpRequest) {
+        let name = url_parse::url_display_name(&req.url);
+        self.file_info     = Some(FileInfo { name, size_bytes: 0, path: None });
+        self.tree          = None;
+        self.load_error    = None;
+        self.load_progress = 0.0;
+        self.search_input.clear();
+        self.search_pending = None;
+        self.edit_overlay.clear();
+        self.saved_overlay.clear();
+        self.editing_node  = None;
+        self.load_rx = Some(match req.curl_args {
+            Some(args) => loader::spawn_exec_curl(args),
+            None       => loader::spawn_fetch_url(req.url, req.method, req.headers, req.body),
+        });
+    }
+
+    fn open_url_request_into_pane(&mut self, side: Side, req: url_parse::HttpRequest) {
+        let name = url_parse::url_display_name(&req.url);
+        let pane = self.compare.pane_mut(side);
+        pane.file_info     = Some(FileInfo { name, size_bytes: 0, path: None });
+        pane.index         = None;
+        pane.load_error    = None;
+        pane.load_progress = 0.0;
+        pane.load_rx = Some(match req.curl_args {
+            Some(args) => loader::spawn_exec_curl(args),
+            None       => loader::spawn_fetch_url(req.url, req.method, req.headers, req.body),
+        });
     }
 
     fn kick_search(&mut self) {
@@ -2475,6 +2627,11 @@ impl App {
     fn open_pasted_into_pane(&mut self, side: Side, text: &str) {
         let text = text.trim();
         if text.is_empty() { return; }
+        // Auto-detect URLs, curl commands, and fetch() calls
+        if let Some(req) = url_parse::parse_request(text) {
+            self.open_url_request_into_pane(side, req);
+            return;
+        }
         let (data, name) = match paste::decode_jwt(text) {
             Some(d) => (d, "Pasted JWT"),
             None    => (text.as_bytes().to_vec(), "Pasted JSON"),

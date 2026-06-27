@@ -28,6 +28,7 @@ pub const ACT_EXPORT_JSON:  u32 = 1 << 9;
 pub const ACT_EXPORT_CSV:   u32 = 1 << 10;
 pub const ACT_SAVE:         u32 = 1 << 11;
 pub const ACT_SAVE_COPY:    u32 = 1 << 12;
+pub const ACT_OPEN_URL:     u32 = 1 << 13;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -202,6 +203,11 @@ define_class!(
             PENDING.fetch_or(ACT_ABOUT, Ordering::Relaxed);
             if let Some(c) = CTX.get() { c.request_repaint(); }
         }
+        #[unsafe(method(handleOpenUrl:))]
+        fn handle_open_url(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_OPEN_URL, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
     }
 );
 
@@ -250,6 +256,7 @@ pub fn install(ctx: &egui::Context) {
         // ── File ─────────────────────────────────────────────────────────────
         let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
         add_item(&file_menu, "Open…",    "o", cmd,  objc2::sel!(handleOpenFile:),   handler_ref);
+        add_item(&file_menu, "Open URL…", "l", cmd, objc2::sel!(handleOpenUrl:),   handler_ref);
         // ⇧⌘V — a plain ⌘V key equivalent here would be swallowed by the menu
         // and never reach the search box; bare ⌘V is handled in the egui layer.
         add_item(&file_menu, "Paste JSON / JWT", "v", cmd | NSEventModifierFlags::Shift,

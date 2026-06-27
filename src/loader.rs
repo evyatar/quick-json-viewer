@@ -27,6 +27,73 @@ pub fn spawn_parse(data: Vec<u8>) -> mpsc::Receiver<LoadMsg> {
     spawn_build(move || Ok(JsonData::Memory(data)))
 }
 
+/// Spawns a background thread that runs the `curl` binary with the given
+/// shell-split args and parses its stdout as JSON.
+/// `-o -` (stdout) and `--no-progress-meter` are appended automatically.
+pub fn spawn_exec_curl(curl_args: Vec<String>) -> mpsc::Receiver<LoadMsg> {
+    spawn_build(move || {
+        let output = std::process::Command::new("curl")
+            .args(&curl_args)
+            .arg("--no-progress-meter")
+            .arg("-o")
+            .arg("-") // write body to stdout
+            .output()
+            .map_err(|e| format!("failed to run curl: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(if stderr.is_empty() {
+                format!("curl exited with code {}", output.status)
+            } else {
+                format!("curl: {stderr}")
+            });
+        }
+
+        Ok(JsonData::Memory(output.stdout))
+    })
+}
+
+/// Spawns a background thread that fetches a URL and parses the response as JSON.
+pub fn spawn_fetch_url(
+    url: String,
+    method: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+) -> mpsc::Receiver<LoadMsg> {
+    spawn_build(move || {
+        use std::io::Read;
+
+        let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+        let mut req = match method.as_str() {
+            "POST"   => ureq::post(&url),
+            "PUT"    => ureq::put(&url),
+            "DELETE" => ureq::delete(&url),
+            "PATCH"  => ureq::patch(&url),
+            _        => ureq::get(&url),
+        }
+        .timeout(std::time::Duration::from_secs(30))
+        .set("User-Agent", "quick-json-viewer")
+        .set("Accept", "application/json, text/plain, */*");
+        for (k, v) in &headers {
+            req = req.set(k.as_str(), v.as_str());
+        }
+
+        let resp = if let Some(body) = body {
+            req.send_string(&body).map_err(|e| format!("HTTP error: {e}"))?
+        } else {
+            req.call().map_err(|e| format!("HTTP error: {e}"))?
+        };
+
+        let mut data = Vec::new();
+        resp.into_reader()
+            .take(50 * 1024 * 1024) // 50 MB limit
+            .read_to_end(&mut data)
+            .map_err(|e| format!("reading response: {e}"))?;
+
+        Ok(JsonData::Memory(data))
+    })
+}
+
 fn spawn_build<F>(make_data: F) -> mpsc::Receiver<LoadMsg>
 where
     F: FnOnce() -> Result<JsonData, String> + Send + 'static,
