@@ -216,7 +216,6 @@ struct App {
     /// are considered persisted (no dirty marker). Empty = nothing saved yet.
     saved_overlay: std::collections::HashMap<u32, export::NodeEdit>,
     install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
-    update_installed:     bool,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
 }
@@ -252,7 +251,6 @@ impl Default for App {
             edit_overlay:  std::collections::HashMap::new(),
             saved_overlay: std::collections::HashMap::new(),
             install_watcher_rx:   None,
-            update_installed:     false,
             #[cfg(target_os = "macos")]
             menu_installed: false,
         }
@@ -958,32 +956,6 @@ impl App {
     /// links to the release page and offers the `brew upgrade` command — it
     /// never downloads or replaces the binary.
     fn update_banner(&mut self, ui: &mut egui::Ui, pal: &theme::Palette) {
-        // Show "Restart now" banner after brew finishes, even if dismissed earlier.
-        if self.update_installed {
-            egui::Panel::top("update_banner")
-                .exact_size(self.settings.font_size + 16.0)
-                .frame(
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(52, 168, 83)) // green
-                        .inner_margin(egui::Margin::symmetric(10, 0)),
-                )
-                .show_inside(ui, |ui| {
-                    ui.horizontal_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("✓  Update installed — restart to apply")
-                                .color(egui::Color32::WHITE)
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Restart now").clicked() {
-                                update::restart_app();
-                            }
-                        });
-                    });
-                });
-            return;
-        }
-
         let Some(info) = self.pending_update() else { return };
         let version = info.version.clone();
         let html_url = info.html_url.clone();
@@ -1019,13 +991,11 @@ impl App {
                         }
                         if ui
                             .button(if upgrading { "Upgrading…" } else { "Upgrade now" })
-                            .on_hover_text(format!("Opens Terminal and runs:\n{}", update::BREW_UPGRADE_CMD))
+                            .on_hover_text(format!("Runs in the background:\n{}", update::BREW_UPGRADE_CMD))
                             .clicked()
                             && !upgrading
                         {
-                            update::launch_brew_upgrade();
-                            self.install_watcher_rx =
-                                Some(update::spawn_install_watcher(version.clone()));
+                            self.install_watcher_rx = Some(update::launch_brew_upgrade());
                             ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
                         }
                         if !upgrading {
@@ -2757,9 +2727,7 @@ impl App {
         if let Some(rx) = &self.install_watcher_rx {
             match rx.try_recv() {
                 Ok(update::UpdateMsg::Installed) => {
-                    self.install_watcher_rx = None;
-                    self.update_installed = true;
-                    ctx.request_repaint();
+                    update::restart_app();
                 }
                 Ok(_) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {

@@ -49,51 +49,35 @@ struct GhRelease {
     body:     Option<String>,
 }
 
-/// Launch the Homebrew upgrade in Terminal.app. Running it there (rather than
-/// silently via `Command`) means the user sees brew's progress, it executes in
-/// the login shell where `brew` is on `PATH`, and any password prompt works.
-pub fn launch_brew_upgrade() {
-    #[cfg(target_os = "macos")]
-    {
-        // `do script` runs the command in a new/active Terminal window.
-        let script = format!(
-            "tell application \"Terminal\"\nactivate\ndo script \"{BREW_UPGRADE_CMD}\"\nend tell",
-        );
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .spawn();
-    }
-}
-
-/// Spawn a watcher that polls `brew list --versions` until `expected_version`
-/// shows up (or times out after ~10 minutes). Yields `Installed` on success.
-pub fn spawn_install_watcher(expected_version: String) -> mpsc::Receiver<UpdateMsg> {
+/// Run the Homebrew upgrade in a background thread and return a receiver that
+/// yields `Installed` on success or `Error` on failure. No Terminal window is
+/// opened; the thread exits naturally when brew finishes.
+pub fn launch_brew_upgrade() -> mpsc::Receiver<UpdateMsg> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        const POLL_SECS: u64 = 5;
-        const MAX_POLLS: u32 = 120; // 10 minutes
-        for _ in 0..MAX_POLLS {
-            std::thread::sleep(std::time::Duration::from_secs(POLL_SECS));
-            if installed_version().as_deref() == Some(expected_version.as_str()) {
-                let _ = tx.send(UpdateMsg::Installed);
-                return;
-            }
-        }
+        let result = std::process::Command::new(brew_bin())
+            .args(["upgrade", "--cask", "evyatar/tap/quick-json-viewer"])
+            .status();
+        let msg = match result {
+            Ok(s) if s.success() => UpdateMsg::Installed,
+            Ok(s) => UpdateMsg::Error(format!("brew exited with {s}")),
+            Err(e) => UpdateMsg::Error(format!("failed to run brew: {e}")),
+        };
+        let _ = tx.send(msg);
     });
     rx
 }
 
-/// Returns the currently-installed brew version string, e.g. `"1.1.0"`.
-fn installed_version() -> Option<String> {
-    let out = std::process::Command::new("brew")
-        .args(["list", "--versions", "quick-json-viewer"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // Output looks like: "quick-json-viewer 1.1.0\n"
-    let version = stdout.split_whitespace().nth(1)?.to_string();
-    Some(version)
+/// Resolve the brew binary path. macOS .app bundles don't inherit the user's
+/// shell PATH, so `/opt/homebrew/bin` (Apple Silicon) is often missing.
+fn brew_bin() -> &'static str {
+    if std::path::Path::new("/opt/homebrew/bin/brew").exists() {
+        "/opt/homebrew/bin/brew"
+    } else if std::path::Path::new("/usr/local/bin/brew").exists() {
+        "/usr/local/bin/brew"
+    } else {
+        "brew"
+    }
 }
 
 /// Relaunch the app and exit the current process.
