@@ -176,6 +176,12 @@ impl Default for Side {
     fn default() -> Self { Side::Left }
 }
 
+impl Side {
+    fn other(self) -> Self {
+        match self { Side::Left => Side::Right, Side::Right => Side::Left }
+    }
+}
+
 impl CompareState {
     fn pane(&self, side: Side) -> &ComparePane {
         match side { Side::Left => &self.left, Side::Right => &self.right }
@@ -2353,6 +2359,7 @@ impl App {
             Some(args) => loader::spawn_exec_curl(args),
             None       => loader::spawn_fetch_url(req.url, req.method, req.headers, req.body),
         });
+        self.compare.active_pane = side.other();
     }
 
     fn kick_search(&mut self) {
@@ -2651,6 +2658,7 @@ impl App {
         pane.load_error    = None;
         pane.load_progress = 0.0;
         pane.load_rx       = Some(loader::spawn_load(path));
+        self.compare.active_pane = side.other();
     }
 
     fn open_pasted_into_pane(&mut self, side: Side, text: &str) {
@@ -2671,6 +2679,7 @@ impl App {
         pane.load_error    = None;
         pane.load_progress = 0.0;
         pane.load_rx       = Some(loader::spawn_parse(data));
+        self.compare.active_pane = side.other();
     }
 
     fn poll_pane_loader(&mut self, side: Side, ctx: &egui::Context) {
