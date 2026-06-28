@@ -189,6 +189,8 @@ struct App {
     load_rx:        Option<std::sync::mpsc::Receiver<LoadMsg>>,
     load_progress:  f32,
     load_error:     Option<String>,
+    load_error_ctx: Option<loader::ErrorContext>,
+    error_ctx_open: bool,
     tree:           Option<TreeState>,
     search_input:   String,
     search_pending: Option<std::thread::JoinHandle<Vec<u32>>>,
@@ -226,6 +228,8 @@ impl Default for App {
             load_rx:        None,
             load_progress:  0.0,
             load_error:     None,
+            load_error_ctx: None,
+            error_ctx_open: false,
             tree:           None,
             search_input:   String::new(),
             search_pending: None,
@@ -360,6 +364,7 @@ impl eframe::App for App {
         self.show_about_window(ui.ctx());
         self.show_url_dialog(ui.ctx());
         self.show_edit_dialog(ui.ctx());
+        self.show_error_context_window(ui.ctx());
 
         // ── macOS native menu bar (installed once, actions polled every frame) ──
         #[cfg(target_os = "macos")]
@@ -411,8 +416,10 @@ impl eframe::App for App {
                     self.tree = Some(TreeState::new(idx));
                     self.load_rx = None;
                 }
-                Ok(LoadMsg::Error(e)) => {
+                Ok(LoadMsg::Error(e, ctx)) => {
                     self.load_error = Some(e);
+                    self.load_error_ctx = ctx;
+                    self.error_ctx_open = false;
                     self.load_rx = None;
                 }
                 Err(_) => {}
@@ -1067,6 +1074,35 @@ impl App {
                     ui.label(egui::RichText::new("Evyatar Shalom").strong());
                     ui.add_space(12.0);
                 });
+            });
+    }
+
+    fn show_error_context_window(&mut self, ctx: &egui::Context) {
+        let Some(ec) = &self.load_error_ctx else { return };
+        let before = ec.before.clone();
+        let at     = ec.at.clone();
+        let after  = ec.after.clone();
+        egui::Window::new("Parse Error Context")
+            .open(&mut self.error_ctx_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label("Bytes surrounding the error (errored byte highlighted):");
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(egui::RichText::new(&before).monospace());
+                    ui.label(
+                        egui::RichText::new(&at)
+                            .monospace()
+                            .color(egui::Color32::WHITE)
+                            .background_color(egui::Color32::from_rgb(200, 50, 50)),
+                    );
+                    ui.label(egui::RichText::new(&after).monospace());
+                });
+                ui.add_space(6.0);
             });
     }
 
@@ -2022,7 +2058,7 @@ fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) 
 // ─── status bar ──────────────────────────────────────────────────────────────
 
 impl App {
-    fn status_bar(&self, ui: &mut egui::Ui) -> (Option<(ExportScope, ExportFormat)>, Option<SaveAction>) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) -> (Option<(ExportScope, ExportFormat)>, Option<SaveAction>) {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px top border above the bar
         let r = ui.max_rect();
@@ -2067,6 +2103,11 @@ impl App {
             if let Some(e) = &self.load_error {
                 ui.add_space(10.0);
                 ui.colored_label(egui::Color32::RED, format!("Error: {}", e));
+                if self.load_error_ctx.is_some() {
+                    if ui.small_button("Show context").clicked() {
+                        self.error_ctx_open = !self.error_ctx_open;
+                    }
+                }
             }
 
             // Right-aligned: encoding, format badge, root-type badge.
@@ -2644,7 +2685,7 @@ impl App {
             match msg {
                 LoadMsg::Progress(p) => { pane.load_progress = p; }
                 LoadMsg::Done(idx)   => { pane.index = Some(idx); pane.load_rx = None; did_load = true; }
-                LoadMsg::Error(e)    => { pane.load_error = Some(e); pane.load_rx = None; }
+                LoadMsg::Error(e, _) => { pane.load_error = Some(e); pane.load_rx = None; }
             }
         }
         if did_load { self.compare.needs_rediff = true; }

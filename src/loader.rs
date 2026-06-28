@@ -4,10 +4,18 @@ use std::sync::{mpsc, Arc};
 use crate::index::{JsonData, JsonIndex};
 use crate::parser::parse_bytes;
 
+/// Surrounding bytes extracted at the parse-error position, ready for display.
+#[derive(Clone)]
+pub struct ErrorContext {
+    pub before: String,
+    pub at:     String,
+    pub after:  String,
+}
+
 pub enum LoadMsg {
     Progress(f32),
     Done(Arc<JsonIndex>),
-    Error(String),
+    Error(String, Option<ErrorContext>),
 }
 
 /// Spawns a background thread that mmaps + parses the file.
@@ -94,6 +102,31 @@ pub fn spawn_fetch_url(
     })
 }
 
+fn bytes_to_display(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| match b {
+        b'\n' => "↵".to_string(),
+        b'\r' => "\\r".to_string(),
+        b'\t' => "→".to_string(),
+        b if b.is_ascii_graphic() || b == b' ' => (b as char).to_string(),
+        b => format!("\\x{b:02X}"),
+    }).collect()
+}
+
+fn extract_error_context(bytes: &[u8], offset: usize) -> ErrorContext {
+    const WINDOW: usize = 40;
+    let start = offset.saturating_sub(WINDOW);
+    let end = (offset + WINDOW + 1).min(bytes.len());
+    let before = bytes_to_display(&bytes[start..offset]);
+    let at = if offset < bytes.len() {
+        bytes_to_display(&bytes[offset..offset + 1])
+    } else {
+        "‹EOF›".to_string()
+    };
+    let after_start = (offset + 1).min(bytes.len());
+    let after = bytes_to_display(&bytes[after_start..end]);
+    ErrorContext { before, at, after }
+}
+
 fn spawn_build<F>(make_data: F) -> mpsc::Receiver<LoadMsg>
 where
     F: FnOnce() -> Result<JsonData, String> + Send + 'static,
@@ -102,7 +135,7 @@ where
     std::thread::spawn(move || {
         let tx2 = tx.clone();
         if let Err(e) = build_inner(make_data, tx) {
-            let _ = tx2.send(LoadMsg::Error(e));
+            let _ = tx2.send(LoadMsg::Error(e, None));
         }
     });
     rx
@@ -120,9 +153,14 @@ where
         let _ = tx_prog.send(LoadMsg::Progress(p));
     };
 
-    let (nodes, root, is_ndjson) =
-        parse_bytes(data.bytes(), &mut key_arena, &mut progress_cb)
-            .map_err(|e| e.to_string())?;
+    let (nodes, root, is_ndjson) = match parse_bytes(data.bytes(), &mut key_arena, &mut progress_cb) {
+        Ok(r) => r,
+        Err(e) => {
+            let ctx = extract_error_context(data.bytes(), e.offset as usize);
+            let _ = tx.send(LoadMsg::Error(e.to_string(), Some(ctx)));
+            return Ok(());
+        }
+    };
 
     let index = Arc::new(JsonIndex {
         data,
