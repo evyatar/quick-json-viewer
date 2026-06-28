@@ -145,11 +145,13 @@ struct FileInfo {
 /// One side of the Compare view — an independently-loaded document.
 #[derive(Default)]
 struct ComparePane {
-    index:         Option<Arc<index::JsonIndex>>,
-    load_rx:       Option<std::sync::mpsc::Receiver<LoadMsg>>,
-    load_progress: f32,
-    load_error:    Option<String>,
-    file_info:     Option<FileInfo>,
+    index:          Option<Arc<index::JsonIndex>>,
+    load_rx:        Option<std::sync::mpsc::Receiver<LoadMsg>>,
+    load_progress:  f32,
+    load_error:     Option<String>,
+    load_error_ctx: Option<loader::ErrorContext>,
+    error_ctx_open: bool,
+    file_info:      Option<FileInfo>,
 }
 
 /// State for the Compare view: the two panes, the diff options + their raw UI
@@ -371,6 +373,7 @@ impl eframe::App for App {
         self.show_url_dialog(ui.ctx());
         self.show_edit_dialog(ui.ctx());
         self.show_error_context_window(ui.ctx());
+        self.show_compare_error_context_windows(ui.ctx());
 
         // ── macOS native menu bar (installed once, actions polled every frame) ──
         #[cfg(target_os = "macos")]
@@ -1110,6 +1113,42 @@ impl App {
                 });
                 ui.add_space(6.0);
             });
+    }
+
+    fn show_compare_error_context_windows(&mut self, ctx: &egui::Context) {
+        for side in [Side::Left, Side::Right] {
+            let pane = self.compare.pane(side);
+            if !pane.error_ctx_open { continue; }
+            let Some(ec) = &pane.load_error_ctx else { continue };
+            let before = ec.before.clone();
+            let at     = ec.at.clone();
+            let after  = ec.after.clone();
+            let label  = match side { Side::Left => "Left", Side::Right => "Right" };
+            let title  = format!("Parse Error Context — {label}");
+            let open   = &mut self.compare.pane_mut(side).error_ctx_open;
+            egui::Window::new(title)
+                .open(open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.label("Bytes surrounding the error (errored byte highlighted):");
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(egui::RichText::new(&before).monospace());
+                        ui.label(
+                            egui::RichText::new(&at)
+                                .monospace()
+                                .color(egui::Color32::WHITE)
+                                .background_color(egui::Color32::from_rgb(200, 50, 50)),
+                        );
+                        ui.label(egui::RichText::new(&after).monospace());
+                    });
+                    ui.add_space(6.0);
+                });
+        }
     }
 
     fn show_url_dialog(&mut self, ctx: &egui::Context) {
@@ -2351,10 +2390,12 @@ impl App {
     fn open_url_request_into_pane(&mut self, side: Side, req: url_parse::HttpRequest) {
         let name = url_parse::url_display_name(&req.url);
         let pane = self.compare.pane_mut(side);
-        pane.file_info     = Some(FileInfo { name, size_bytes: 0, path: None });
-        pane.index         = None;
-        pane.load_error    = None;
-        pane.load_progress = 0.0;
+        pane.file_info      = Some(FileInfo { name, size_bytes: 0, path: None });
+        pane.index          = None;
+        pane.load_error     = None;
+        pane.load_error_ctx = None;
+        pane.error_ctx_open = false;
+        pane.load_progress  = 0.0;
         pane.load_rx = Some(match req.curl_args {
             Some(args) => loader::spawn_exec_curl(args),
             None       => loader::spawn_fetch_url(req.url, req.method, req.headers, req.body),
@@ -2653,11 +2694,13 @@ impl App {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let pane = self.compare.pane_mut(side);
-        pane.file_info     = Some(FileInfo { name, size_bytes: size, path: None });
-        pane.index         = None;
-        pane.load_error    = None;
-        pane.load_progress = 0.0;
-        pane.load_rx       = Some(loader::spawn_load(path));
+        pane.file_info      = Some(FileInfo { name, size_bytes: size, path: None });
+        pane.index          = None;
+        pane.load_error     = None;
+        pane.load_error_ctx = None;
+        pane.error_ctx_open = false;
+        pane.load_progress  = 0.0;
+        pane.load_rx        = Some(loader::spawn_load(path));
         self.compare.active_pane = side.other();
     }
 
@@ -2674,11 +2717,13 @@ impl App {
             None    => (text.as_bytes().to_vec(), "Pasted JSON"),
         };
         let pane = self.compare.pane_mut(side);
-        pane.file_info     = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64, path: None });
-        pane.index         = None;
-        pane.load_error    = None;
-        pane.load_progress = 0.0;
-        pane.load_rx       = Some(loader::spawn_parse(data));
+        pane.file_info      = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64, path: None });
+        pane.index          = None;
+        pane.load_error     = None;
+        pane.load_error_ctx = None;
+        pane.error_ctx_open = false;
+        pane.load_progress  = 0.0;
+        pane.load_rx        = Some(loader::spawn_parse(data));
         self.compare.active_pane = side.other();
     }
 
@@ -2694,7 +2739,12 @@ impl App {
             match msg {
                 LoadMsg::Progress(p) => { pane.load_progress = p; }
                 LoadMsg::Done(idx)   => { pane.index = Some(idx); pane.load_rx = None; did_load = true; }
-                LoadMsg::Error(e, _) => { pane.load_error = Some(e); pane.load_rx = None; }
+                LoadMsg::Error(e, ctx) => {
+                    pane.load_error     = Some(e);
+                    pane.load_error_ctx = ctx;
+                    pane.error_ctx_open = false;
+                    pane.load_rx        = None;
+                }
             }
         }
         if did_load { self.compare.needs_rediff = true; }
@@ -2935,9 +2985,14 @@ impl App {
     fn pane_header(&mut self, ui: &mut egui::Ui, side: Side) {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         let active = self.compare.active_pane == side;
-        let (name, loading) = {
+        let (name, loading, error, has_ctx) = {
             let pane = self.compare.pane(side);
-            (pane.file_info.as_ref().map(|f| f.name.clone()), pane.load_rx.is_some())
+            (
+                pane.file_info.as_ref().map(|f| f.name.clone()),
+                pane.load_rx.is_some(),
+                pane.load_error.clone(),
+                pane.load_error_ctx.is_some(),
+            )
         };
         let title = name.unwrap_or_else(|| "— no document —".to_string());
 
@@ -2977,6 +3032,19 @@ impl App {
                 if ui.small_button("Open").clicked() {
                     self.compare.active_pane = side;
                     self.open_into_pane_dialog(side);
+                }
+            });
+        }
+
+        // Error row — rendered as a normal widget after the header rect so
+        // buttons inside it are properly interactive.
+        if let Some(e) = error {
+            ui.horizontal(|ui| {
+                ui.add_space(margin.x);
+                ui.colored_label(egui::Color32::RED, format!("Error: {e}"));
+                if has_ctx && ui.small_button("Show context").clicked() {
+                    let pane = self.compare.pane_mut(side);
+                    pane.error_ctx_open = !pane.error_ctx_open;
                 }
             });
         }
