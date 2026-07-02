@@ -274,6 +274,64 @@ fn write_json_edited(
     }
 }
 
+/// Minified (no whitespace) JSON rooted at `root`, applying the `edits` overlay.
+/// Compact counterpart of [`json_with_edits`] — used for the "Copy Modified
+/// Value" context-menu action when compact copying is enabled.
+pub fn json_compact_with_edits(
+    index: &JsonIndex,
+    root:  u32,
+    edits: &std::collections::HashMap<u32, NodeEdit>,
+) -> String {
+    let mut out = String::new();
+    write_json_compact_edited(index, root, edits, &mut out);
+    out
+}
+
+fn write_json_compact_edited(
+    index: &JsonIndex,
+    idx:   u32,
+    edits: &std::collections::HashMap<u32, NodeEdit>,
+    out:   &mut String,
+) {
+    let node = &index.nodes[idx as usize];
+    match node.kind {
+        NodeKind::Object | NodeKind::Array => {
+            let is_obj = node.kind == NodeKind::Object;
+            out.push(if is_obj { '{' } else { '[' });
+            let mut c = node.first_child;
+            let mut first = true;
+            while c != u32::MAX {
+                if !edits.get(&c).map_or(false, |e| e.deleted) {
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    if is_obj {
+                        let child_node = &index.nodes[c as usize];
+                        let key = edits
+                            .get(&c)
+                            .and_then(|e| e.key_override.as_deref())
+                            .unwrap_or_else(|| index.key_of(child_node));
+                        out.push('"');
+                        push_json_escaped(out, key);
+                        out.push_str("\":");
+                    }
+                    write_json_compact_edited(index, c, edits, out);
+                }
+                c = index.nodes[c as usize].next_sibling;
+            }
+            out.push(if is_obj { '}' } else { ']' });
+        }
+        _ => {
+            if let Some(v) = edits.get(&idx).and_then(|e| e.value_override.as_deref()) {
+                out.push_str(v);
+            } else {
+                out.push_str(&String::from_utf8_lossy(index.value_bytes(node)));
+            }
+        }
+    }
+}
+
 fn push_json_escaped(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -705,5 +763,28 @@ mod tests {
         let out = json_with_edits(&idx, idx.root, &edits);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!([{"a": 42}, {"a": 2}]));
+    }
+
+    #[test]
+    fn compact_edits_apply_overrides_and_deletes() {
+        let idx = make(r#"{"name": "Alice", "age": 30, "tags": ["a", "b"]}"#);
+        let name = nav(&idx, &["name"]);
+        let age  = nav(&idx, &["age"]);
+        let mut edits: HashMap<u32, NodeEdit> = HashMap::new();
+        edits.insert(name, NodeEdit { key_override: None, value_override: Some("\"Bob\"".to_owned()), deleted: false });
+        edits.insert(age,  NodeEdit { key_override: None, value_override: None, deleted: true });
+        let out = json_compact_with_edits(&idx, idx.root, &edits);
+        assert_eq!(out, r#"{"name":"Bob","tags":["a","b"]}"#);
+    }
+
+    #[test]
+    fn compact_edits_subtree_root() {
+        let idx = make(r#"{"a": {"x": 1, "y": 2}}"#);
+        let a = nav(&idx, &["a"]);
+        let y = nav(&idx, &["a", "y"]);
+        let mut edits: HashMap<u32, NodeEdit> = HashMap::new();
+        edits.insert(y, NodeEdit { key_override: None, value_override: None, deleted: true });
+        let out = json_compact_with_edits(&idx, a, &edits);
+        assert_eq!(out, r#"{"x":1}"#);
     }
 }

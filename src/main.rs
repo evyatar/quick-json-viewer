@@ -2010,6 +2010,23 @@ fn render_row(
             ui.close();
         }
 
+        // Only while there are unsaved edits (the same condition that shows the
+        // Save button): copy the value with the edit overlay applied — edited
+        // keys/values substituted and deleted items excluded.
+        if !is_deleted && edit_overlay != saved_overlay {
+            if ui.button("Copy Modified Value").clicked() {
+                let text = if copy_compact {
+                    export::json_compact_with_edits(index, node_idx, edit_overlay)
+                } else {
+                    export::json_with_edits(index, node_idx, edit_overlay)
+                        .trim_end()
+                        .to_owned()
+                };
+                ui.ctx().copy_text(text);
+                ui.close();
+            }
+        }
+
         if is_container {
             ui.menu_button("Copy as Code", |ui| {
                 let root_name = if n.key_len > 0 {
