@@ -69,6 +69,7 @@ enum RowAction {
     StartEditValue(u32),
     StartEditKey(u32),
     DeleteNode(u32),
+    AddItem(u32),
 }
 
 /// What an export operates on.
@@ -111,6 +112,14 @@ struct EditingState {
     focus_requested: bool, // auto-focus TextEdit on first render
 }
 
+/// State for the "Add Item" dialog: the target array and the raw JSON text
+/// typed so far.
+struct AddingState {
+    parent:          u32,
+    text:            String,
+    focus_requested: bool,
+}
+
 /// One undoable change to `edit_overlay`: the entry's state for `node_idx`
 /// before and after the edit (`None` = no overlay entry).
 #[derive(Clone)]
@@ -118,6 +127,14 @@ struct UndoEntry {
     node_idx: u32,
     before:   Option<export::NodeEdit>,
     after:    Option<export::NodeEdit>,
+}
+
+/// One entry on the undo/redo stack: either an `edit_overlay` change, or the
+/// addition of a pending array item (see `TreeState::add_item`).
+#[derive(Clone)]
+enum UndoAction {
+    Overlay(UndoEntry),
+    Add { parent: u32, raw_value: String },
 }
 
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
@@ -230,12 +247,13 @@ struct App {
     update_available:     Option<update::ReleaseInfo>,
     update_check_started: bool,
     editing_node:  Option<EditingState>,
+    adding_item:   Option<AddingState>,
     edit_overlay:  std::collections::HashMap<u32, export::NodeEdit>,
     /// Snapshot of `edit_overlay` at the last overwrite-save; edits matching it
     /// are considered persisted (no dirty marker). Empty = nothing saved yet.
     saved_overlay: std::collections::HashMap<u32, export::NodeEdit>,
-    undo_stack:    Vec<UndoEntry>,
-    redo_stack:    Vec<UndoEntry>,
+    undo_stack:    Vec<UndoAction>,
+    redo_stack:    Vec<UndoAction>,
     install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
@@ -271,6 +289,7 @@ impl Default for App {
             update_available:     None,
             update_check_started: false,
             editing_node:  None,
+            adding_item:   None,
             edit_overlay:  std::collections::HashMap::new(),
             saved_overlay: std::collections::HashMap::new(),
             undo_stack:    Vec::new(),
@@ -385,6 +404,7 @@ impl eframe::App for App {
         self.show_about_window(ui.ctx());
         self.show_url_dialog(ui.ctx());
         self.show_edit_dialog(ui.ctx());
+        self.show_add_item_dialog(ui.ctx());
         self.show_error_context_window(ui.ctx());
         self.show_compare_error_context_windows(ui.ctx());
 
@@ -543,9 +563,13 @@ impl eframe::App for App {
                     AppMode::Viewer => {
                         if let Some(t) = &self.tree {
                             if let Some(sel) = t.selected {
-                                let n = &t.index.nodes[sel as usize];
-                                let raw = t.index.value_bytes(n);
-                                ui.ctx().copy_text(String::from_utf8_lossy(raw).into_owned());
+                                if t.is_added(sel) {
+                                    ui.ctx().copy_text(t.added_item(sel).raw_value.clone());
+                                } else {
+                                    let n = &t.index.nodes[sel as usize];
+                                    let raw = t.index.value_bytes(n);
+                                    ui.ctx().copy_text(String::from_utf8_lossy(raw).into_owned());
+                                }
                             }
                         }
                     }
@@ -629,10 +653,12 @@ impl eframe::App for App {
         if f2 && self.mode == AppMode::Viewer {
             if let Some(t) = &self.tree {
                 if let Some(sel) = t.selected {
-                    let node = &t.index.nodes[sel as usize];
-                    if !matches!(node.kind, index::NodeKind::Object | index::NodeKind::Array) {
-                        let n = sel;
-                        self.start_edit(n, EditField::Value);
+                    let editable = t.is_added(sel) || {
+                        let node = &t.index.nodes[sel as usize];
+                        !matches!(node.kind, index::NodeKind::Object | index::NodeKind::Array)
+                    };
+                    if editable {
+                        self.start_edit(sel, EditField::Value);
                     }
                 }
             }
@@ -641,7 +667,7 @@ impl eframe::App for App {
         // Delete → toggle delete on the selected node (skip the root).
         if delete_key && self.mode == AppMode::Viewer && ui.ctx().memory(|m| m.focused().is_none()) {
             let to_delete = self.tree.as_ref().and_then(|t| {
-                t.selected.filter(|&sel| t.index.nodes[sel as usize].parent != u32::MAX)
+                t.selected.filter(|&sel| t.is_added(sel) || t.index.nodes[sel as usize].parent != u32::MAX)
             });
             if let Some(n) = to_delete {
                 self.toggle_delete(n);
@@ -1541,15 +1567,21 @@ impl App {
 
         let font_size = self.settings.font_size - 1.0;
 
-        let (index, sel) = {
+        let (index, sel, added_items) = {
             let Some(tree) = &self.tree else { return };
             let Some(sel) = tree.selected else { return };
-            (Arc::clone(&tree.index), sel)
+            (Arc::clone(&tree.index), sel, tree.added_items.clone())
         };
+        let nodes_len = index.nodes.len();
 
-        // Ancestor chain, root first.
+        // Ancestor chain, root first. A pending (not-yet-saved) added item has
+        // no real node — walk up from its real parent instead.
         let mut chain: Vec<u32> = Vec::new();
         let mut cur = sel;
+        if export::is_added(nodes_len, cur) {
+            chain.push(cur);
+            cur = added_items[cur as usize - nodes_len].parent;
+        }
         loop {
             chain.push(cur);
             let parent = index.nodes[cur as usize].parent;
@@ -1577,22 +1609,27 @@ impl App {
                                     .color(pal.text_faint),
                             );
                         }
-                        let node = &index.nodes[node_idx as usize];
-                        let label: String = if node.parent == u32::MAX {
-                            "root".to_owned()
-                        } else if node.key_len > 0 {
-                            index.key_of(node).to_owned()
-                        } else if node.array_index != u32::MAX {
-                            format!("[{}]", node.array_index)
+                        let is_added_row = export::is_added(nodes_len, node_idx);
+                        let label: String = if is_added_row {
+                            format!("[{}]", export::added_display_index(&index.nodes, &added_items, node_idx))
                         } else {
-                            "\"\"".to_owned()
+                            let node = &index.nodes[node_idx as usize];
+                            if node.parent == u32::MAX {
+                                "root".to_owned()
+                            } else if node.key_len > 0 {
+                                index.key_of(node).to_owned()
+                            } else if node.array_index != u32::MAX {
+                                format!("[{}]", node.array_index)
+                            } else {
+                                "\"\"".to_owned()
+                            }
                         };
                         let display = bidi_reorder(&label).into_owned();
                         let is_last = i + 1 == chain.len();
                         let text = egui::RichText::new(display)
                             .monospace()
                             .size(font_size)
-                            .color(if is_last { pal.key } else { pal.text_muted });
+                            .color(if is_added_row { theme::NEW } else if is_last { pal.key } else { pal.text_muted });
                         let resp = ui
                             .selectable_label(false, text)
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1601,7 +1638,13 @@ impl App {
                         }
                         resp.context_menu(|ui| {
                             if ui.button("Copy Path").clicked() {
-                                ui.ctx().copy_text(build_path(&index.nodes, &index, node_idx));
+                                let path = if is_added_row {
+                                    let parent_path = build_path(&index.nodes, &index, added_items[node_idx as usize - nodes_len].parent);
+                                    format!("{parent_path}[{}]", export::added_display_index(&index.nodes, &added_items, node_idx))
+                                } else {
+                                    build_path(&index.nodes, &index, node_idx)
+                                };
+                                ui.ctx().copy_text(path);
                                 ui.close();
                             }
                         });
@@ -1655,6 +1698,7 @@ impl App {
         // while `actions` is mutably extended outside.
         {
             let index          = &*tree.index;
+            let added_items    = &tree.added_items;
             let expanded       = &tree.expanded;
             let search_res_set = &tree.search_result_set;
             let visible        = &tree.visible;
@@ -1674,7 +1718,7 @@ impl App {
                 for row_idx in row_range {
                     let node_idx = visible[row_idx];
                     let row_actions = render_row(
-                        ui, edit_overlay, saved_overlay, index, expanded, selected, search_res_set, node_idx,
+                        ui, edit_overlay, saved_overlay, index, added_items, expanded, selected, search_res_set, node_idx,
                         row_h, key_font.clone(), val_font.clone(),
                         multi_select, checked.contains(&node_idx), !checked.is_empty(),
                         reveal_row == Some(row_idx), copy_compact,
@@ -1688,6 +1732,7 @@ impl App {
         let mut export_req: Option<(ExportScope, ExportFormat)> = None;
         let mut start_edit_req: Option<(u32, EditField)> = None;
         let mut delete_req: Option<u32> = None;
+        let mut add_item_req: Option<u32> = None;
         for action in actions {
             match action {
                 RowAction::Select(n)           => { tree.selected = Some(n); }
@@ -1699,9 +1744,10 @@ impl App {
                 RowAction::StartEditValue(n)    => { start_edit_req = Some((n, EditField::Value)); }
                 RowAction::StartEditKey(n)      => { start_edit_req = Some((n, EditField::Key)); }
                 RowAction::DeleteNode(n)        => { delete_req = Some(n); }
+                RowAction::AddItem(n)           => { add_item_req = Some(n); }
             }
         }
-        // `tree` borrow ends here; export/edit/delete need &mut self.
+        // `tree` borrow ends here; export/edit/delete/add need &mut self.
         if let Some((scope, fmt)) = export_req {
             self.export(scope, fmt);
         }
@@ -1710,6 +1756,9 @@ impl App {
         }
         if let Some(n) = delete_req {
             self.toggle_delete(n);
+        }
+        if let Some(parent) = add_item_req {
+            self.start_add_item(parent);
         }
     }
 }
@@ -1773,6 +1822,7 @@ fn render_row(
     edit_overlay:     &std::collections::HashMap<u32, export::NodeEdit>,
     saved_overlay:    &std::collections::HashMap<u32, export::NodeEdit>,
     index:            &index::JsonIndex,
+    added_items:      &[export::AddedItem],
     expanded:         &std::collections::HashSet<u32>,
     selected:         Option<u32>,
     search_result_set:&std::collections::HashSet<u32>,
@@ -1788,7 +1838,33 @@ fn render_row(
 ) -> Vec<RowAction> {
     use index::NodeKind;
 
-    let node = &index.nodes[node_idx as usize];
+    // A pending (not-yet-saved) added item has no real node — fabricate one
+    // with just enough fields for the geometry/rendering code below. Its
+    // `value_start`/`value_end`/`key_start` stay zeroed, which makes
+    // `index.value_bytes`/`index.key_of` safely return empty/"" if ever
+    // called on it (they never should be, since key_len == 0 and the value
+    // text is taken from `added_items` directly, not from `value_parts`).
+    let is_new = export::is_added(index.nodes.len(), node_idx);
+    let fallback_node;
+    let node: &index::Node = if is_new {
+        let item = &added_items[node_idx as usize - index.nodes.len()];
+        fallback_node = index::Node {
+            kind:         NodeKind::String,
+            depth:        index.nodes[item.parent as usize].depth + 1,
+            value_start:  0,
+            value_end:    0,
+            key_start:    0,
+            key_len:      0,
+            first_child:  u32::MAX,
+            next_sibling: u32::MAX,
+            child_count:  0,
+            parent:       item.parent,
+            array_index:  export::added_display_index(&index.nodes, added_items, node_idx),
+        };
+        &fallback_node
+    } else {
+        &index.nodes[node_idx as usize]
+    };
     let depth        = node.depth;
     let kind         = node.kind;
     let child_count  = node.child_count;
@@ -1807,7 +1883,11 @@ fn render_row(
     let sep_color = if dark { theme::PUNCT } else { egui::Color32::from_rgb(120, 120, 120) };
 
     // Value text + color
-    let (mut value_text, mut value_color) = value_parts(index, node, dark);
+    let (mut value_text, mut value_color) = if is_new {
+        (added_items[node_idx as usize - index.nodes.len()].raw_value.clone(), theme::NEW)
+    } else {
+        value_parts(index, node, dark)
+    };
 
     // Overlay: edited nodes show their edited text. A node whose edit differs
     // from the last saved baseline is "pending" — rendered in the accent color
@@ -1823,14 +1903,18 @@ fn render_row(
             // `value_override` is stored as raw JSON text (string literals keep
             // their quotes), matching how `value_parts` renders unedited nodes.
             value_text = v.clone();
-            if pending { value_color = theme::ACCENT; }
+            if pending && !is_new { value_color = theme::ACCENT; }
         }
+    }
+    if is_new && !is_deleted {
+        key_color   = theme::NEW;
+        value_color = theme::NEW;
     }
     if is_deleted {
         key_color   = theme::DELETED;
         value_color = theme::DELETED;
     }
-    let has_edit = pending;
+    let has_edit = pending && !is_new;
 
     // In multi-select mode a fixed left gutter holds the per-row checkbox; the
     // whole tree (indent guides included) shifts right by this amount.
@@ -1991,7 +2075,7 @@ fn render_row(
 
     // Context menu (right-click)
     response.context_menu(|ui| {
-        let n = &index.nodes[node_idx as usize];
+        let n = node; // already-resolved (real or fabricated) node from above
         let is_deleted = edit_overlay.get(&node_idx).map_or(false, |e| e.deleted);
         let is_root = n.parent == u32::MAX;
 
@@ -2010,6 +2094,12 @@ fn render_row(
                 }
             }
         }
+        if kind == NodeKind::Array {
+            if ui.button("Add Item").clicked() {
+                actions.push(RowAction::AddItem(node_idx));
+                ui.close();
+            }
+        }
         if !is_root {
             let label = if is_deleted { "Restore" } else { "Delete" };
             if ui.button(label).clicked() {
@@ -2017,12 +2107,18 @@ fn render_row(
                 ui.close();
             }
         }
-        if (!is_container || n.key_len > 0) || !is_root {
+        if (!is_container || n.key_len > 0) || !is_root || kind == NodeKind::Array {
             ui.separator();
         }
 
         if ui.button("Copy Path").clicked() {
-            ui.ctx().copy_text(build_path(&index.nodes, index, node_idx));
+            let path = if is_new {
+                let parent_path = build_path(&index.nodes, index, n.parent);
+                format!("{parent_path}[{}]", n.array_index)
+            } else {
+                build_path(&index.nodes, index, node_idx)
+            };
+            ui.ctx().copy_text(path);
             ui.close();
         }
 
@@ -2042,7 +2138,9 @@ fn render_row(
         }
 
         if ui.button("Copy Value").clicked() {
-            let text = if copy_compact {
+            let text = if is_new {
+                added_items[node_idx as usize - index.nodes.len()].raw_value.clone()
+            } else if copy_compact {
                 export::json_compact(index, node_idx)
             } else {
                 String::from_utf8_lossy(index.value_bytes(n)).into_owned()
@@ -2053,13 +2151,16 @@ fn render_row(
 
         // Only while there are unsaved edits (the same condition that shows the
         // Save button): copy the value with the edit overlay applied — edited
-        // keys/values substituted and deleted items excluded.
-        if !is_deleted && edit_overlay != saved_overlay {
+        // keys/values substituted, deleted items excluded, and pending adds included.
+        // Pending adds don't show up in `edit_overlay`/`saved_overlay` (they live
+        // in `added_items`), so a document whose only unsaved change is a new
+        // item must still be treated as dirty here.
+        if !is_deleted && (edit_overlay != saved_overlay || !added_items.is_empty()) {
             if ui.button("Copy Modified Value").clicked() {
                 let text = if copy_compact {
-                    export::json_compact_with_edits(index, node_idx, edit_overlay)
+                    export::json_compact_with_edits(index, node_idx, edit_overlay, added_items)
                 } else {
-                    export::json_with_edits(index, node_idx, edit_overlay)
+                    export::json_with_edits(index, node_idx, edit_overlay, added_items)
                         .trim_end()
                         .to_owned()
                 };
@@ -2112,15 +2213,19 @@ fn render_row(
                 }
                 ui.separator();
             }
-            if ui.button("This node as JSON…").clicked() {
-                actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Json));
-                ui.close();
+            // Pending added items aren't real tree nodes, so per-node export
+            // doesn't apply to them.
+            if !is_new {
+                if ui.button("This node as JSON…").clicked() {
+                    actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Json));
+                    ui.close();
+                }
+                if ui.button("This node as CSV…").clicked() {
+                    actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Csv));
+                    ui.close();
+                }
+                ui.separator();
             }
-            if ui.button("This node as CSV…").clicked() {
-                actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Csv));
-                ui.close();
-            }
-            ui.separator();
             if ui.button("Whole file as JSON…").clicked() {
                 actions.push(RowAction::Export(ExportScope::File, ExportFormat::Json));
                 ui.close();
@@ -2496,6 +2601,7 @@ impl App {
     /// True when there are edits not yet persisted by an overwrite-save.
     fn is_dirty(&self) -> bool {
         self.edit_overlay != self.saved_overlay
+            || self.tree.as_ref().is_some_and(|t| !t.added_items.is_empty())
     }
 
     /// True when the open document came from a file we can overwrite in place.
@@ -2520,10 +2626,17 @@ impl App {
         self.push_undo(node_idx, before, after);
     }
 
-    /// Record an undoable change and clear the redo stack (a fresh edit
-    /// invalidates any previously undone redo history).
+    /// Record an undoable overlay change and clear the redo stack (a fresh
+    /// edit invalidates any previously undone redo history).
     fn push_undo(&mut self, node_idx: u32, before: Option<export::NodeEdit>, after: Option<export::NodeEdit>) {
-        self.undo_stack.push(UndoEntry { node_idx, before, after });
+        self.undo_stack.push(UndoAction::Overlay(UndoEntry { node_idx, before, after }));
+        self.redo_stack.clear();
+    }
+
+    /// Record an undoable "add item" action. Undo removes the item again;
+    /// this relies on strict LIFO ordering (see `TreeState::remove_last_added_item`).
+    fn push_undo_add(&mut self, parent: u32, raw_value: String) {
+        self.undo_stack.push(UndoAction::Add { parent, raw_value });
         self.redo_stack.clear();
     }
 
@@ -2535,34 +2648,71 @@ impl App {
         !self.redo_stack.is_empty()
     }
 
-    /// Revert the most recent overlay change and move it to the redo stack.
+    /// Revert the most recent action and move it to the redo stack.
     fn undo(&mut self) {
-        let Some(entry) = self.undo_stack.pop() else { return };
-        match &entry.before {
-            Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
-            None       => { self.edit_overlay.remove(&entry.node_idx); }
+        let Some(action) = self.undo_stack.pop() else { return };
+        match &action {
+            UndoAction::Overlay(entry) => {
+                match &entry.before {
+                    Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
+                    None       => { self.edit_overlay.remove(&entry.node_idx); }
+                }
+            }
+            UndoAction::Add { .. } => {
+                if let Some(tree) = &mut self.tree {
+                    tree.remove_last_added_item();
+                }
+            }
         }
         self.editing_node = None;
-        self.redo_stack.push(entry);
+        self.redo_stack.push(action);
     }
 
-    /// Re-apply the most recently undone overlay change.
+    /// Re-apply the most recently undone action.
     fn redo(&mut self) {
-        let Some(entry) = self.redo_stack.pop() else { return };
-        match &entry.after {
-            Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
-            None       => { self.edit_overlay.remove(&entry.node_idx); }
+        let Some(action) = self.redo_stack.pop() else { return };
+        match &action {
+            UndoAction::Overlay(entry) => {
+                match &entry.after {
+                    Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
+                    None       => { self.edit_overlay.remove(&entry.node_idx); }
+                }
+            }
+            UndoAction::Add { parent, raw_value } => {
+                if let Some(tree) = &mut self.tree {
+                    tree.add_item(*parent, raw_value.clone());
+                }
+            }
         }
         self.editing_node = None;
-        self.undo_stack.push(entry);
+        self.undo_stack.push(action);
     }
 
     /// Open the edit dialog for `node_idx`, pre-populating the buffer with the
     /// current display text (unquoted for strings).
     fn start_edit(&mut self, node_idx: u32, field: EditField) {
         let Some(tree) = &self.tree else { return };
-        let node = &tree.index.nodes[node_idx as usize];
         use index::NodeKind;
+
+        if tree.is_added(node_idx) {
+            // Pending array items are always raw JSON text (typed via the Add
+            // dialog), so editing them again is a plain passthrough — no
+            // string quote-stripping, and always the Value field.
+            let text = self
+                .edit_overlay
+                .get(&node_idx)
+                .and_then(|e| e.value_override.clone())
+                .unwrap_or_else(|| tree.added_item(node_idx).raw_value.clone());
+            self.editing_node = Some(EditingState {
+                node_idx,
+                field: EditField::Value,
+                text,
+                focus_requested: true,
+            });
+            return;
+        }
+
+        let node = &tree.index.nodes[node_idx as usize];
 
         let text = match field {
             EditField::Key => self
@@ -2606,8 +2756,21 @@ impl App {
     fn commit_edit(&mut self) {
         let Some(state) = self.editing_node.take() else { return };
         let Some(tree) = &self.tree else { return };
-        let node = &tree.index.nodes[state.node_idx as usize];
         use index::NodeKind;
+
+        if tree.is_added(state.node_idx) {
+            let before = self.edit_overlay.get(&state.node_idx).cloned();
+            let entry = self
+                .edit_overlay
+                .entry(state.node_idx)
+                .or_insert_with(export::NodeEdit::default);
+            entry.value_override = Some(state.text);
+            let after = self.edit_overlay.get(&state.node_idx).cloned();
+            self.push_undo(state.node_idx, before, after);
+            return;
+        }
+
+        let node = &tree.index.nodes[state.node_idx as usize];
 
         let before = self.edit_overlay.get(&state.node_idx).cloned();
         let entry = self
@@ -2641,7 +2804,7 @@ impl App {
     /// Does not change which file is open or clear the dirty state.
     fn save_copy(&mut self) {
         let Some(tree) = &self.tree else { return };
-        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay);
+        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay, &tree.added_items);
         let stem = self
             .file_info
             .as_ref()
@@ -2672,16 +2835,19 @@ impl App {
     fn save_overwrite(&mut self) {
         let Some(path) = self.file_info.as_ref().and_then(|f| f.path.clone()) else { return };
         let Some(tree) = &self.tree else { return };
-        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay);
+        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay, &tree.added_items);
+        // Deletions and pending adds both change the node structure, which
+        // only a reparse (below) can reconcile with `edit_overlay`/`selected`/etc.
+        let has_structural_changes =
+            self.edit_overlay.values().any(|e| e.deleted) || !tree.added_items.is_empty();
         // Atomic write (temp + rename): never truncate the file the current
         // index may still be mmap'd against.
         if let Err(e) = write_atomic(&path, json.as_bytes()) {
             self.load_error = Some(format!("Save failed: {e}"));
             return;
         }
-        let has_deletes = self.edit_overlay.values().any(|e| e.deleted);
-        if has_deletes {
-            // Reload so deleted nodes disappear from the tree.
+        if has_structural_changes {
+            // Reload so deleted nodes disappear and added items become real.
             self.open_file(path);
         } else {
             self.saved_overlay = self.edit_overlay.clone();
@@ -2701,7 +2867,13 @@ impl App {
             EditField::Key   => "Edit Key",
             EditField::Value => "Edit Value",
         };
-        let path = build_path(&tree.index.nodes, &*tree.index, state.node_idx);
+        let path = if tree.is_added(state.node_idx) {
+            let parent_path = build_path(&tree.index.nodes, &*tree.index, tree.added_parent(state.node_idx));
+            let idx = export::added_display_index(&tree.index.nodes, &tree.added_items, state.node_idx);
+            format!("{parent_path}[{idx}]")
+        } else {
+            build_path(&tree.index.nodes, &*tree.index, state.node_idx)
+        };
 
         let mut commit = false;
         let mut cancel = false;
@@ -2747,6 +2919,88 @@ impl App {
             self.commit_edit();
         } else if cancel || !open {
             self.editing_node = None;
+        }
+    }
+
+    /// Open the "Add Item" dialog for appending a new element to `parent`
+    /// (an Array node).
+    fn start_add_item(&mut self, parent: u32) {
+        self.adding_item = Some(AddingState { parent, text: String::new(), focus_requested: true });
+    }
+
+    /// Append the typed value to `added_items`, select it, and record the
+    /// undoable action.
+    fn commit_add_item(&mut self) {
+        let Some(state) = self.adding_item.take() else { return };
+        let raw_value = state.text.clone();
+        {
+            let Some(tree) = &mut self.tree else { return };
+            let new_id = tree.add_item(state.parent, state.text);
+            tree.selected = Some(new_id);
+            tree.ensure_visible(new_id);
+        }
+        self.push_undo_add(state.parent, raw_value);
+    }
+
+    /// Modal dialog for appending a new array item. The typed text must be
+    /// valid JSON (e.g. `"text"`, `42`, `true`, `null`) — the Add button is
+    /// disabled until it parses.
+    fn show_add_item_dialog(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.adding_item else { return };
+        let Some(tree) = &self.tree else { return };
+
+        let path = build_path(&tree.index.nodes, &*tree.index, state.parent);
+        let valid = serde_json::from_str::<serde_json::Value>(&state.text).is_ok();
+
+        let mut commit = false;
+        let mut cancel = false;
+        let mut open   = true;
+
+        egui::Window::new("Add Item")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .min_width(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("{path}[…]")).monospace().small().color(pal.text_muted));
+                ui.add_space(4.0);
+
+                let te = egui::TextEdit::singleline(&mut state.text)
+                    .desired_width(340.0)
+                    .hint_text(r#"e.g. "text", 42, true, null"#)
+                    .font(egui::TextStyle::Monospace);
+                let resp = ui.add(te);
+
+                if state.focus_requested {
+                    resp.request_focus();
+                    state.focus_requested = false;
+                }
+                if !state.text.is_empty() && !valid {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Not valid JSON").small().color(theme::DELETED));
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && valid {
+                    commit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(valid, egui::Button::new("Add")).clicked() { commit = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+            });
+
+        // Borrows on `self.adding_item` / `self.tree` end here.
+        if commit {
+            self.commit_add_item();
+        } else if cancel || !open {
+            self.adding_item = None;
         }
     }
 }
@@ -3545,7 +3799,7 @@ mod edit_tests {
         );
 
         let t = app.tree.as_ref().unwrap();
-        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &[]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!({"name": "Bob", "age": 30}));
     }
@@ -3559,7 +3813,7 @@ mod edit_tests {
         app.commit_edit();
 
         let t = app.tree.as_ref().unwrap();
-        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &[]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!({"s": "a\"b"}));
     }
@@ -3575,7 +3829,7 @@ mod edit_tests {
         app.commit_edit();
 
         let t = app.tree.as_ref().unwrap();
-        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &[]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!({"age": 99}));
     }
@@ -3590,7 +3844,7 @@ mod edit_tests {
         app.commit_edit();
 
         let t = app.tree.as_ref().unwrap();
-        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay);
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &[]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!({"years": 30}));
     }
@@ -3715,5 +3969,81 @@ mod edit_tests {
         let (app2, path) = app_with_file(r#"{"a": 1}"#);
         assert!(app2.can_overwrite());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── add item ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_item_marks_dirty_and_selects_new_row() {
+        let mut app = app_with(r#"[1, 2]"#);
+        assert!(!app.is_dirty());
+        let root = app.tree.as_ref().unwrap().index.root;
+
+        app.start_add_item(root);
+        app.adding_item.as_mut().unwrap().text = "3".to_owned();
+        app.commit_add_item();
+
+        assert!(app.adding_item.is_none());
+        assert!(app.is_dirty());
+        let t = app.tree.as_ref().unwrap();
+        assert_eq!(t.added_items.len(), 1);
+        assert_eq!(t.added_items[0].raw_value, "3");
+        assert!(t.selected.is_some_and(|s| t.is_added(s)));
+    }
+
+    #[test]
+    fn undo_add_item_removes_it_and_redo_restores_it() {
+        let mut app = app_with(r#"[1]"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        app.start_add_item(root);
+        app.adding_item.as_mut().unwrap().text = "2".to_owned();
+        app.commit_add_item();
+        assert!(app.is_dirty());
+
+        app.undo();
+        assert!(app.tree.as_ref().unwrap().added_items.is_empty());
+        assert!(!app.is_dirty());
+
+        app.redo();
+        let t = app.tree.as_ref().unwrap();
+        assert_eq!(t.added_items.len(), 1);
+        assert_eq!(t.added_items[0].raw_value, "2");
+    }
+
+    #[test]
+    fn added_item_appears_in_saved_output() {
+        let (mut app, path) = app_with_file(r#"[1, 2]"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        app.start_add_item(root);
+        app.adding_item.as_mut().unwrap().text = "3".to_owned();
+        app.commit_add_item();
+
+        app.save_overwrite();
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, serde_json::json!([1, 2, 3]));
+        // A structural change (add) triggers `open_file`, which kicks off an
+        // async reload (unpolled here) so the pending item becomes a real,
+        // saved node — no longer "unsaved".
+        assert!(app.tree.is_none());
+        assert!(app.load_rx.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleting_an_added_item_excludes_it_from_export() {
+        let mut app = app_with(r#"[1]"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        app.start_add_item(root);
+        app.adding_item.as_mut().unwrap().text = "2".to_owned();
+        app.commit_add_item();
+        let new_id = app.tree.as_ref().unwrap().selected.unwrap();
+
+        app.toggle_delete(new_id);
+        let t = app.tree.as_ref().unwrap();
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &t.added_items);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!([1]));
     }
 }
