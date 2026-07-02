@@ -1,6 +1,6 @@
 [package]
 name = "quick-json-viewer"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2021"
 description = "A fast, native JSON viewer for macOS"
 authors = ["Evyatar Shalom"]
