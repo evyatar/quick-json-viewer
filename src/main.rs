@@ -1599,6 +1599,7 @@ impl App {
         let row_h    = self.settings.row_height();
         let key_font = self.settings.key_font();
         let val_font = self.settings.val_font();
+        let copy_compact = self.settings.copy_compact_json;
 
         let edit_overlay  = &self.edit_overlay;  // field-disjoint borrow from self.tree
         let saved_overlay = &self.saved_overlay;
@@ -1635,7 +1636,7 @@ impl App {
                         ui, edit_overlay, saved_overlay, index, expanded, selected, search_res_set, node_idx,
                         row_h, key_font.clone(), val_font.clone(),
                         multi_select, checked.contains(&node_idx), !checked.is_empty(),
-                        reveal_row == Some(row_idx),
+                        reveal_row == Some(row_idx), copy_compact,
                     );
                     actions.extend(row_actions);
                 }
@@ -1742,6 +1743,7 @@ fn render_row(
     is_checked:       bool,
     any_checked:      bool,
     reveal:           bool,
+    copy_compact:     bool,
 ) -> Vec<RowAction> {
     use index::NodeKind;
 
@@ -1999,8 +2001,12 @@ fn render_row(
         }
 
         if ui.button("Copy Value").clicked() {
-            let raw = index.value_bytes(n);
-            ui.ctx().copy_text(String::from_utf8_lossy(raw).into_owned());
+            let text = if copy_compact {
+                export::json_compact(index, node_idx)
+            } else {
+                String::from_utf8_lossy(index.value_bytes(n)).into_owned()
+            };
+            ui.ctx().copy_text(text);
             ui.close();
         }
 
@@ -3093,6 +3099,7 @@ impl App {
             scroll_area = scroll_area.vertical_scroll_offset(y);
         }
 
+        let copy_compact = self.settings.copy_compact_json;
         let mut actions: Vec<DiffRowAction> = Vec::new();
         {
             let expanded = &tree.expanded;
@@ -3104,7 +3111,7 @@ impl App {
                     let row_actions = render_diff_row(
                         ui, left, right, &result.nodes, expanded, selected, node_idx,
                         row_h, key_font.clone(), val_font.clone(), root,
-                        reveal_row == Some(r),
+                        reveal_row == Some(r), copy_compact,
                     );
                     actions.extend(row_actions);
                 }
@@ -3153,6 +3160,7 @@ fn render_diff_row(
     val_font:  egui::FontId,
     root:      u32,
     reveal:    bool,
+    copy_compact: bool,
 ) -> Vec<DiffRowAction> {
     use diff::DiffStatus;
 
@@ -3234,13 +3242,23 @@ fn render_diff_row(
     response.context_menu(|ui| {
         if let Some(li) = dn.left_idx() {
             if ui.button("Copy Left Value").clicked() {
-                ui.ctx().copy_text(String::from_utf8_lossy(left.value_bytes(&left.nodes[li as usize])).into_owned());
+                let text = if copy_compact {
+                    export::json_compact(left, li)
+                } else {
+                    String::from_utf8_lossy(left.value_bytes(&left.nodes[li as usize])).into_owned()
+                };
+                ui.ctx().copy_text(text);
                 ui.close();
             }
         }
         if let Some(ri) = dn.right_idx() {
             if ui.button("Copy Right Value").clicked() {
-                ui.ctx().copy_text(String::from_utf8_lossy(right.value_bytes(&right.nodes[ri as usize])).into_owned());
+                let text = if copy_compact {
+                    export::json_compact(right, ri)
+                } else {
+                    String::from_utf8_lossy(right.value_bytes(&right.nodes[ri as usize])).into_owned()
+                };
+                ui.ctx().copy_text(text);
                 ui.close();
             }
         }

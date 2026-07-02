@@ -15,6 +15,7 @@ pub enum CodeLanguage {
     CSharp,
     Kotlin,
     Swift,
+    Dart,
 }
 
 impl CodeLanguage {
@@ -27,6 +28,7 @@ impl CodeLanguage {
             CodeLanguage::CSharp     => "C# Class",
             CodeLanguage::Kotlin     => "Kotlin Data Class",
             CodeLanguage::Swift      => "Swift Codable Struct",
+            CodeLanguage::Dart       => "Flutter (Dart) Class",
         }
     }
 }
@@ -39,6 +41,7 @@ pub const LANGUAGES: &[CodeLanguage] = &[
     CodeLanguage::CSharp,
     CodeLanguage::Kotlin,
     CodeLanguage::Swift,
+    CodeLanguage::Dart,
 ];
 
 /// Generate a code snippet from raw JSON bytes for the given language.
@@ -63,6 +66,7 @@ pub fn generate(json_bytes: &[u8], language: CodeLanguage, root_name: &str) -> S
         CodeLanguage::CSharp     => emit_csharp(&collector.schemas),
         CodeLanguage::Kotlin     => emit_kotlin(&collector.schemas),
         CodeLanguage::Swift      => emit_swift(&collector.schemas),
+        CodeLanguage::Dart       => emit_dart(&collector.schemas),
     }
 }
 
@@ -549,6 +553,142 @@ fn emit_swift(schemas: &[ObjectSchema]) -> String {
     out.trim_end().to_owned()
 }
 
+// ─── Dart / Flutter ─────────────────────────────────────────────────────────
+
+fn dart_type(ty: &InferredType, nullable: bool) -> String {
+    let base = match ty {
+        InferredType::Str       => "String".to_owned(),
+        InferredType::Int       => "int".to_owned(),
+        InferredType::Float     => "double".to_owned(),
+        InferredType::Bool      => "bool".to_owned(),
+        InferredType::Object(n) => n.clone(),
+        InferredType::Array(el) => format!("List<{}>", dart_type(el, false)),
+        InferredType::Any       => "dynamic".to_owned(),
+    };
+    if nullable && base != "dynamic" { format!("{base}?") } else { base }
+}
+
+/// Expression that reads a nested list (already known non-null) out of `list_access`.
+fn dart_from_json_list(list_access: &str, el: &InferredType) -> String {
+    match el {
+        InferredType::Str   => format!("({list_access} as List<dynamic>).map((e) => e as String).toList()"),
+        InferredType::Int   => format!("({list_access} as List<dynamic>).map((e) => e as int).toList()"),
+        InferredType::Float => format!("({list_access} as List<dynamic>).map((e) => (e as num).toDouble()).toList()"),
+        InferredType::Bool  => format!("({list_access} as List<dynamic>).map((e) => e as bool).toList()"),
+        InferredType::Any   => format!("({list_access} as List<dynamic>)"),
+        InferredType::Object(n) => format!(
+            "({list_access} as List<dynamic>).map((e) => {n}.fromJson(e as Map<String, dynamic>)).toList()"
+        ),
+        InferredType::Array(inner) => format!(
+            "({list_access} as List<dynamic>).map((e) => {}).toList()",
+            dart_from_json_list("e", inner)
+        ),
+    }
+}
+
+/// `fromJson` expression for one field, reading `json['<key>']`.
+fn dart_from_json_field(key: &str, ty: &InferredType, nullable: bool) -> String {
+    let access = format!("json['{key}']");
+    match ty {
+        InferredType::Str   => if nullable { format!("{access} as String?") } else { format!("{access} as String") },
+        InferredType::Int   => if nullable { format!("{access} as int?") } else { format!("{access} as int") },
+        InferredType::Float => if nullable {
+            format!("({access} as num?)?.toDouble()")
+        } else {
+            format!("({access} as num).toDouble()")
+        },
+        InferredType::Bool  => if nullable { format!("{access} as bool?") } else { format!("{access} as bool") },
+        InferredType::Any   => access,
+        InferredType::Object(n) => if nullable {
+            format!("{access} == null ? null : {n}.fromJson({access} as Map<String, dynamic>)")
+        } else {
+            format!("{n}.fromJson({access} as Map<String, dynamic>)")
+        },
+        InferredType::Array(el) => {
+            let list_expr = dart_from_json_list(&access, el);
+            if nullable { format!("{access} == null ? null : {list_expr}") } else { list_expr }
+        }
+    }
+}
+
+/// `toJson` value expression for a non-null `expr` (recurses into nested lists).
+fn dart_to_json_value(expr: &str, ty: &InferredType) -> String {
+    match ty {
+        InferredType::Object(_) => format!("{expr}.toJson()"),
+        InferredType::Array(el) => match el.as_ref() {
+            InferredType::Object(_) | InferredType::Array(_) => {
+                format!("{expr}.map((e) => {}).toList()", dart_to_json_value("e", el))
+            }
+            _ => expr.to_owned(),
+        },
+        _ => expr.to_owned(),
+    }
+}
+
+/// `toJson` expression for one field, given its Dart field name.
+fn dart_field_to_json(field: &str, ty: &InferredType, nullable: bool) -> String {
+    match ty {
+        InferredType::Object(_) => {
+            if nullable { format!("{field}?.toJson()") } else { format!("{field}.toJson()") }
+        }
+        InferredType::Array(el) if matches!(el.as_ref(), InferredType::Object(_) | InferredType::Array(_)) => {
+            let inner = dart_to_json_value("e", el);
+            if nullable {
+                format!("{field}?.map((e) => {inner}).toList()")
+            } else {
+                format!("{field}.map((e) => {inner}).toList()")
+            }
+        }
+        _ => field.to_owned(),
+    }
+}
+
+fn emit_dart(schemas: &[ObjectSchema]) -> String {
+    let mut out = String::new();
+    for schema in schemas {
+        out.push_str(&format!("class {} {{\n", schema.name));
+        for f in &schema.fields {
+            let name = to_camel_case(&f.original_key);
+            let ty   = dart_type(&f.ty, f.nullable);
+            out.push_str(&format!("  final {ty} {name};\n"));
+        }
+        out.push('\n');
+
+        out.push_str(&format!("  {}({{\n", schema.name));
+        for f in &schema.fields {
+            let name = to_camel_case(&f.original_key);
+            if f.nullable {
+                out.push_str(&format!("    this.{name},\n"));
+            } else {
+                out.push_str(&format!("    required this.{name},\n"));
+            }
+        }
+        out.push_str("  });\n\n");
+
+        out.push_str(&format!("  factory {}.fromJson(Map<String, dynamic> json) {{\n", schema.name));
+        out.push_str(&format!("    return {}(\n", schema.name));
+        for f in &schema.fields {
+            let name = to_camel_case(&f.original_key);
+            let expr = dart_from_json_field(&f.original_key, &f.ty, f.nullable);
+            out.push_str(&format!("      {name}: {expr},\n"));
+        }
+        out.push_str("    );\n");
+        out.push_str("  }\n\n");
+
+        out.push_str("  Map<String, dynamic> toJson() {\n");
+        out.push_str("    return {\n");
+        for f in &schema.fields {
+            let name = to_camel_case(&f.original_key);
+            let val  = dart_field_to_json(&name, &f.ty, f.nullable);
+            out.push_str(&format!("      '{}': {val},\n", f.original_key));
+        }
+        out.push_str("    };\n");
+        out.push_str("  }\n");
+        out.push_str("}\n\n");
+    }
+    out.trim_end().to_owned()
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -589,6 +729,22 @@ mod tests {
         assert!(code.contains("type User struct"));
         assert!(code.contains("UserId int64"));
         assert!(code.contains(r#"json:"user_id""#));
+    }
+
+    #[test]
+    fn dart_compiles() {
+        let code = generate(SAMPLE, CodeLanguage::Dart, "User");
+        assert!(code.contains("class User {"));
+        assert!(code.contains("final int userId;"));
+        assert!(code.contains("final double score;"));
+        assert!(code.contains("final List<String> tags;"));
+        assert!(code.contains("final Address address;"));
+        assert!(code.contains("factory User.fromJson(Map<String, dynamic> json)"));
+        assert!(code.contains("userId: json['user_id'] as int,"));
+        assert!(code.contains("address: Address.fromJson(json['address'] as Map<String, dynamic>),"));
+        assert!(code.contains("Map<String, dynamic> toJson()"));
+        assert!(code.contains("'user_id': userId,"));
+        assert!(code.contains("'address': address.toJson(),"));
     }
 
     #[test]

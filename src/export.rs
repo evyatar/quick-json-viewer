@@ -159,6 +159,42 @@ fn indent(out: &mut String, level: usize) {
     }
 }
 
+/// Minified (no whitespace) JSON for the single value at `idx`, including its
+/// full subtree. Unlike [`json_pretty`] there is no pruning — used for the
+/// "Copy Value" context-menu action when compact copying is enabled.
+pub fn json_compact(index: &JsonIndex, idx: u32) -> String {
+    let mut out = String::new();
+    write_json_compact(index, idx, &mut out);
+    out
+}
+
+fn write_json_compact(index: &JsonIndex, idx: u32, out: &mut String) {
+    let node = &index.nodes[idx as usize];
+    match node.kind {
+        NodeKind::Object | NodeKind::Array => {
+            let is_obj = node.kind == NodeKind::Object;
+            out.push(if is_obj { '{' } else { '[' });
+            let mut c = node.first_child;
+            let mut first = true;
+            while c != u32::MAX {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if is_obj {
+                    out.push('"');
+                    out.push_str(index.key_of(&index.nodes[c as usize]));
+                    out.push_str("\":");
+                }
+                write_json_compact(index, c, out);
+                c = index.nodes[c as usize].next_sibling;
+            }
+            out.push(if is_obj { '}' } else { ']' });
+        }
+        _ => out.push_str(&String::from_utf8_lossy(index.value_bytes(node))),
+    }
+}
+
 // ─── JSON with edits ───────────────────────────────────────────────────────────
 
 /// Pretty-printed (2-space) JSON rooted at `root`, applying the `edits` overlay.

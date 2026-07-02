@@ -73,6 +73,10 @@ pub struct Settings {
     pub show_menu_bar: bool,
     #[serde(default = "default_true")]
     pub show_breadcrumbs: bool,
+    /// When true, "Copy Value" copies minified (whitespace-stripped) JSON
+    /// instead of the value's original on-disk formatting.
+    #[serde(default)]
+    pub copy_compact_json: bool,
     /// Version string of an update the user dismissed; the banner stays hidden
     /// for this version but reappears once a newer one is published.
     #[serde(default)]
@@ -87,6 +91,7 @@ impl Default for Settings {
             font_size:     14.0,
             show_menu_bar: false,
             show_breadcrumbs: true,
+            copy_compact_json: false,
             dismissed_update: None,
         }
     }
@@ -269,6 +274,24 @@ pub fn show_settings_window(
 
                     ui.label("Show breadcrumbs");
                     ui.checkbox(&mut settings.show_breadcrumbs, "");
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(12.0);
+
+            // ── Clipboard ────────────────────────────────────────────────────
+            ui.heading("Clipboard");
+            ui.add_space(8.0);
+
+            egui::Grid::new("clipboard_grid")
+                .num_columns(2)
+                .spacing([24.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label("Copy compressed JSON");
+                    ui.checkbox(&mut settings.copy_compact_json, "")
+                        .on_hover_text("\"Copy Value\" copies minified JSON instead of its original formatting");
                     ui.end_row();
                 });
 
