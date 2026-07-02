@@ -63,10 +63,11 @@ impl TreeState {
         export::build_added_map(self.index.nodes.len(), &self.added_items)
     }
 
-    /// Append a new pending item to `parent` (an Array node), expand it so the
-    /// item is visible, and return the new item's synthetic id.
-    pub fn add_item(&mut self, parent: u32, raw_value: String) -> u32 {
-        self.added_items.push(AddedItem { parent, raw_value });
+    /// Append a new pending item to `parent` (an Array or Object node —
+    /// `key` is `Some` for an object property, `None` for an array element),
+    /// expand it so the item is visible, and return the new item's synthetic id.
+    pub fn add_item(&mut self, parent: u32, key: Option<String>, raw_value: String) -> u32 {
+        self.added_items.push(AddedItem { parent, key, raw_value });
         let new_id = (self.index.nodes.len() + self.added_items.len() - 1) as u32;
         self.expanded.insert(parent);
         self.refresh_visible();
@@ -574,7 +575,7 @@ mod tests {
         let mut state = TreeState::new(idx);
         let root = state.index.root;
         assert_eq!(state.visible.len(), 3); // root + 2 items
-        let new_id = state.add_item(root, "3".to_owned());
+        let new_id = state.add_item(root, None, "3".to_owned());
         assert!(state.is_added(new_id));
         assert_eq!(state.visible, vec![root, state.index.nodes[root as usize].first_child,
             state.index.nodes[state.index.nodes[root as usize].first_child as usize].next_sibling, new_id]);
@@ -589,10 +590,20 @@ mod tests {
         state.expanded.remove(&inner);
         state.refresh_visible();
         assert!(!state.visible.contains(&state.index.nodes[inner as usize].first_child));
-        let new_id = state.add_item(inner, "2".to_owned());
+        let new_id = state.add_item(inner, None, "2".to_owned());
         // Adding auto-expands the parent so the new item is immediately visible.
         assert!(state.expanded.contains(&inner));
         assert!(state.visible.contains(&new_id));
+    }
+
+    #[test]
+    fn add_item_with_key_appends_to_object() {
+        let idx = make_index(r#"{"a": 1}"#);
+        let mut state = TreeState::new(idx);
+        let root = state.index.root;
+        let new_id = state.add_item(root, Some("b".to_owned()), "2".to_owned());
+        assert!(state.is_added(new_id));
+        assert_eq!(state.added_item(new_id).key.as_deref(), Some("b"));
     }
 
     #[test]
@@ -600,7 +611,7 @@ mod tests {
         let idx = make_index(r#"[1]"#);
         let mut state = TreeState::new(idx);
         let root = state.index.root;
-        let new_id = state.add_item(root, "2".to_owned());
+        let new_id = state.add_item(root, None, "2".to_owned());
         state.selected = Some(new_id);
         state.remove_last_added_item();
         assert!(state.added_items.is_empty());
@@ -613,7 +624,7 @@ mod tests {
         let idx = make_index(r#"[1]"#);
         let mut state = TreeState::new(idx);
         let root = state.index.root;
-        let new_id = state.add_item(root, "2".to_owned());
+        let new_id = state.add_item(root, None, "2".to_owned());
         state.selected = Some(new_id);
         state.select_right(); // no-op, must not panic
         assert_eq!(state.selected, Some(new_id));

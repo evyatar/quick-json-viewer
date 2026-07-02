@@ -10,14 +10,15 @@ pub struct NodeEdit {
     pub deleted:        bool,           // true = exclude this node from saved output
 }
 
-/// A pending array element that doesn't exist in the parsed node arena yet —
-/// added interactively and not backed by any byte range in the source data.
-/// Identified by a synthetic id: `real_node_count + index_in_this_vec`, which
-/// is always greater than every real `u32` node index.
+/// A pending array element or object property that doesn't exist in the parsed
+/// node arena yet — added interactively and not backed by any byte range in
+/// the source data. Identified by a synthetic id: `real_node_count +
+/// index_in_this_vec`, which is always greater than every real `u32` node index.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddedItem {
-    pub parent:    u32,    // real Array node this item is appended to
-    pub raw_value: String, // raw JSON text, as typed (validated JSON)
+    pub parent:    u32,            // real Array or Object node this item is appended to
+    pub key:       Option<String>, // Some for an Object property, None for an Array element
+    pub raw_value: String,         // raw JSON text, as typed (validated JSON)
 }
 
 /// True when `node_idx` is a synthetic id from `AddedItem`, not a real node.
@@ -304,12 +305,15 @@ fn write_json_edited(
             for (i, &ch) in children.iter().enumerate() {
                 indent(out, level + 1);
                 if is_obj {
-                    let child_node = &index.nodes[ch as usize];
-                    // Use edited key if present, original otherwise.
-                    let key = edits
-                        .get(&ch)
-                        .and_then(|e| e.key_override.as_deref())
-                        .unwrap_or_else(|| index.key_of(child_node));
+                    // Use edited key if present, original (or the typed key,
+                    // for a pending added property) otherwise.
+                    let key = edits.get(&ch).and_then(|e| e.key_override.as_deref()).unwrap_or_else(|| {
+                        if is_added(index.nodes.len(), ch) {
+                            added[ch as usize - index.nodes.len()].key.as_deref().unwrap_or("")
+                        } else {
+                            index.key_of(&index.nodes[ch as usize])
+                        }
+                    });
                     out.push('"');
                     push_json_escaped(out, key);
                     out.push_str("\": ");
@@ -389,11 +393,13 @@ fn write_json_compact_edited(
                     }
                     first = false;
                     if is_obj {
-                        let child_node = &index.nodes[c as usize];
-                        let key = edits
-                            .get(&c)
-                            .and_then(|e| e.key_override.as_deref())
-                            .unwrap_or_else(|| index.key_of(child_node));
+                        let key = edits.get(&c).and_then(|e| e.key_override.as_deref()).unwrap_or_else(|| {
+                            if is_added(index.nodes.len(), c) {
+                                added[c as usize - index.nodes.len()].key.as_deref().unwrap_or("")
+                            } else {
+                                index.key_of(&index.nodes[c as usize])
+                            }
+                        });
                         out.push('"');
                         push_json_escaped(out, key);
                         out.push_str("\":");
@@ -874,7 +880,7 @@ mod tests {
     #[test]
     fn added_item_appends_to_array() {
         let idx = make(r#"[1, 2]"#);
-        let added = vec![AddedItem { parent: idx.root, raw_value: "3".to_owned() }];
+        let added = vec![AddedItem { parent: idx.root, key: None, raw_value: "3".to_owned() }];
         let out = json_with_edits(&idx, idx.root, &HashMap::new(), &added);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!([1, 2, 3]));
@@ -884,8 +890,8 @@ mod tests {
     fn added_items_preserve_insertion_order() {
         let idx = make(r#"[1]"#);
         let added = vec![
-            AddedItem { parent: idx.root, raw_value: "\"a\"".to_owned() },
-            AddedItem { parent: idx.root, raw_value: "\"b\"".to_owned() },
+            AddedItem { parent: idx.root, key: None, raw_value: "\"a\"".to_owned() },
+            AddedItem { parent: idx.root, key: None, raw_value: "\"b\"".to_owned() },
         ];
         let out = json_compact_with_edits(&idx, idx.root, &HashMap::new(), &added);
         assert_eq!(out, r#"[1,"a","b"]"#);
@@ -894,7 +900,7 @@ mod tests {
     #[test]
     fn added_item_edited_after_add_uses_override() {
         let idx = make(r#"[1]"#);
-        let added = vec![AddedItem { parent: idx.root, raw_value: "2".to_owned() }];
+        let added = vec![AddedItem { parent: idx.root, key: None, raw_value: "2".to_owned() }];
         let synthetic_id = idx.nodes.len() as u32; // first (and only) synthetic id
         let mut edits: HashMap<u32, NodeEdit> = HashMap::new();
         edits.insert(synthetic_id, NodeEdit { key_override: None, value_override: Some("99".to_owned()), deleted: false });
@@ -905,7 +911,7 @@ mod tests {
     #[test]
     fn added_item_marked_deleted_is_excluded() {
         let idx = make(r#"[1]"#);
-        let added = vec![AddedItem { parent: idx.root, raw_value: "2".to_owned() }];
+        let added = vec![AddedItem { parent: idx.root, key: None, raw_value: "2".to_owned() }];
         let synthetic_id = idx.nodes.len() as u32;
         let mut edits: HashMap<u32, NodeEdit> = HashMap::new();
         edits.insert(synthetic_id, NodeEdit { key_override: None, value_override: None, deleted: true });
@@ -914,11 +920,31 @@ mod tests {
     }
 
     #[test]
+    fn added_property_appends_to_object() {
+        let idx = make(r#"{"a": 1}"#);
+        let added = vec![AddedItem { parent: idx.root, key: Some("b".to_owned()), raw_value: "2".to_owned() }];
+        let out = json_with_edits(&idx, idx.root, &HashMap::new(), &added);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn added_property_key_can_be_edited_after_add() {
+        let idx = make(r#"{"a": 1}"#);
+        let added = vec![AddedItem { parent: idx.root, key: Some("b".to_owned()), raw_value: "2".to_owned() }];
+        let synthetic_id = idx.nodes.len() as u32;
+        let mut edits: HashMap<u32, NodeEdit> = HashMap::new();
+        edits.insert(synthetic_id, NodeEdit { key_override: Some("renamed".to_owned()), value_override: None, deleted: false });
+        let out = json_compact_with_edits(&idx, idx.root, &edits, &added);
+        assert_eq!(out, r#"{"a":1,"renamed":2}"#);
+    }
+
+    #[test]
     fn added_display_index_continues_from_child_count() {
         let idx = make(r#"[1, 2]"#);
         let added = vec![
-            AddedItem { parent: idx.root, raw_value: "3".to_owned() },
-            AddedItem { parent: idx.root, raw_value: "4".to_owned() },
+            AddedItem { parent: idx.root, key: None, raw_value: "3".to_owned() },
+            AddedItem { parent: idx.root, key: None, raw_value: "4".to_owned() },
         ];
         let base = idx.nodes.len() as u32;
         assert_eq!(added_display_index(&idx.nodes, &added, base), 2);

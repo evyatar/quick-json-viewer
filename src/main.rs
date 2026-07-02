@@ -112,10 +112,12 @@ struct EditingState {
     focus_requested: bool, // auto-focus TextEdit on first render
 }
 
-/// State for the "Add Item" dialog: the target array and the raw JSON text
-/// typed so far.
+/// State for the "Add Item" / "Add Property" dialog: the target container,
+/// the key typed so far (only used when the target is an Object), and the
+/// raw JSON value text typed so far.
 struct AddingState {
     parent:          u32,
+    key:             String,
     text:            String,
     focus_requested: bool,
 }
@@ -130,11 +132,11 @@ struct UndoEntry {
 }
 
 /// One entry on the undo/redo stack: either an `edit_overlay` change, or the
-/// addition of a pending array item (see `TreeState::add_item`).
+/// addition of a pending array item / object property (see `TreeState::add_item`).
 #[derive(Clone)]
 enum UndoAction {
     Overlay(UndoEntry),
-    Add { parent: u32, raw_value: String },
+    Add { parent: u32, key: Option<String>, raw_value: String },
 }
 
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
@@ -1611,7 +1613,11 @@ impl App {
                         }
                         let is_added_row = export::is_added(nodes_len, node_idx);
                         let label: String = if is_added_row {
-                            format!("[{}]", export::added_display_index(&index.nodes, &added_items, node_idx))
+                            let item = &added_items[node_idx as usize - nodes_len];
+                            match &item.key {
+                                Some(k) => k.clone(),
+                                None => format!("[{}]", export::added_display_index(&index.nodes, &added_items, node_idx)),
+                            }
                         } else {
                             let node = &index.nodes[node_idx as usize];
                             if node.parent == u32::MAX {
@@ -1639,8 +1645,13 @@ impl App {
                         resp.context_menu(|ui| {
                             if ui.button("Copy Path").clicked() {
                                 let path = if is_added_row {
-                                    let parent_path = build_path(&index.nodes, &index, added_items[node_idx as usize - nodes_len].parent);
-                                    format!("{parent_path}[{}]", export::added_display_index(&index.nodes, &added_items, node_idx))
+                                    let item = &added_items[node_idx as usize - nodes_len];
+                                    let parent_path = build_path(&index.nodes, &index, item.parent);
+                                    let segment = match &item.key {
+                                        Some(k) => path_key_segment(k),
+                                        None    => format!("[{}]", export::added_display_index(&index.nodes, &added_items, node_idx)),
+                                    };
+                                    format!("{parent_path}{segment}")
                                 } else {
                                     build_path(&index.nodes, &index, node_idx)
                                 };
@@ -1877,8 +1888,15 @@ fn render_row(
     let can_toggle   = is_container && has_children && node_idx != index.root;
 
     let dark = ui.visuals().dark_mode;
-    // Key text + color (the " : " separator is painted separately, in PUNCT)
+    // Key text + color (the " : " separator is painted separately, in PUNCT).
+    // A pending added item's fabricated node has no real key bytes, so a
+    // property's typed key (`AddedItem::key`) is substituted in directly.
     let (mut key_text, mut key_color) = key_parts(index, node, dark);
+    if is_new {
+        if let Some(k) = &added_items[node_idx as usize - index.nodes.len()].key {
+            key_text = format!("\"{}\"", k);
+        }
+    }
     let sep_text  = " : ";
     let sep_color = if dark { theme::PUNCT } else { egui::Color32::from_rgb(120, 120, 120) };
 
@@ -2079,6 +2097,13 @@ fn render_row(
         let is_deleted = edit_overlay.get(&node_idx).map_or(false, |e| e.deleted);
         let is_root = n.parent == u32::MAX;
 
+        // An added item has a key only when it's a pending Object property.
+        let added_key: Option<&str> = if is_new {
+            added_items[node_idx as usize - index.nodes.len()].key.as_deref()
+        } else {
+            None
+        };
+
         // Edit items — hidden for deleted nodes.
         if !is_deleted {
             if !is_container {
@@ -2087,15 +2112,16 @@ fn render_row(
                     ui.close();
                 }
             }
-            if n.key_len > 0 {
+            if n.key_len > 0 || added_key.is_some() {
                 if ui.button("Edit Key").clicked() {
                     actions.push(RowAction::StartEditKey(node_idx));
                     ui.close();
                 }
             }
         }
-        if kind == NodeKind::Array {
-            if ui.button("Add Item").clicked() {
+        if kind == NodeKind::Array || kind == NodeKind::Object {
+            let label = if kind == NodeKind::Array { "Add Item" } else { "Add Property" };
+            if ui.button(label).clicked() {
                 actions.push(RowAction::AddItem(node_idx));
                 ui.close();
             }
@@ -2107,14 +2133,18 @@ fn render_row(
                 ui.close();
             }
         }
-        if (!is_container || n.key_len > 0) || !is_root || kind == NodeKind::Array {
+        if (!is_container || n.key_len > 0) || !is_root || kind == NodeKind::Array || kind == NodeKind::Object {
             ui.separator();
         }
 
         if ui.button("Copy Path").clicked() {
             let path = if is_new {
                 let parent_path = build_path(&index.nodes, index, n.parent);
-                format!("{parent_path}[{}]", n.array_index)
+                let segment = match added_key {
+                    Some(k) => path_key_segment(k),
+                    None    => format!("[{}]", n.array_index),
+                };
+                format!("{parent_path}{segment}")
             } else {
                 build_path(&index.nodes, index, node_idx)
             };
@@ -2123,7 +2153,9 @@ fn render_row(
         }
 
         // "Copy Key" only when the node actually has a key or array index
-        let key_str: Option<String> = if n.key_len > 0 {
+        let key_str: Option<String> = if let Some(k) = added_key {
+            Some(k.to_owned())
+        } else if n.key_len > 0 {
             Some(index.key_of(n).to_owned())
         } else if n.array_index != u32::MAX {
             Some(n.array_index.to_string())
@@ -2240,6 +2272,20 @@ fn render_row(
     actions
 }
 
+/// JSONPath segment for an object key: dot notation for simple identifiers,
+/// bracket+quote otherwise. Shared by `build_path` and the path built for a
+/// pending added object property (which has no real node to walk).
+fn path_key_segment(key: &str) -> String {
+    if !key.is_empty()
+        && key.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        format!(".{key}")
+    } else {
+        format!(".[\"{key}\"]")
+    }
+}
+
 /// Builds a JSONPath string like `$.store.books[2].title` for `node_idx`.
 fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) -> String {
     let mut segments: Vec<String> = Vec::new();
@@ -2250,16 +2296,7 @@ fn build_path(nodes: &[index::Node], idx_obj: &index::JsonIndex, node_idx: u32) 
             break; // root — no segment for it
         }
         if node.key_len > 0 {
-            let key = idx_obj.key_of(node);
-            // dot notation for simple identifiers, bracket+quote otherwise
-            if !key.is_empty()
-                && key.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                segments.push(format!(".{key}"));
-            } else {
-                segments.push(format!(".[\"{key}\"]"));
-            }
+            segments.push(path_key_segment(idx_obj.key_of(node)));
         } else if node.array_index != u32::MAX {
             segments.push(format!("[{}]", node.array_index));
         }
@@ -2635,8 +2672,8 @@ impl App {
 
     /// Record an undoable "add item" action. Undo removes the item again;
     /// this relies on strict LIFO ordering (see `TreeState::remove_last_added_item`).
-    fn push_undo_add(&mut self, parent: u32, raw_value: String) {
-        self.undo_stack.push(UndoAction::Add { parent, raw_value });
+    fn push_undo_add(&mut self, parent: u32, key: Option<String>, raw_value: String) {
+        self.undo_stack.push(UndoAction::Add { parent, key, raw_value });
         self.redo_stack.clear();
     }
 
@@ -2678,9 +2715,9 @@ impl App {
                     None       => { self.edit_overlay.remove(&entry.node_idx); }
                 }
             }
-            UndoAction::Add { parent, raw_value } => {
+            UndoAction::Add { parent, key, raw_value } => {
                 if let Some(tree) = &mut self.tree {
-                    tree.add_item(*parent, raw_value.clone());
+                    tree.add_item(*parent, key.clone(), raw_value.clone());
                 }
             }
         }
@@ -2695,17 +2732,27 @@ impl App {
         use index::NodeKind;
 
         if tree.is_added(node_idx) {
-            // Pending array items are always raw JSON text (typed via the Add
-            // dialog), so editing them again is a plain passthrough — no
-            // string quote-stripping, and always the Value field.
-            let text = self
-                .edit_overlay
-                .get(&node_idx)
-                .and_then(|e| e.value_override.clone())
-                .unwrap_or_else(|| tree.added_item(node_idx).raw_value.clone());
+            // A pending item's value is always raw JSON text (typed via the
+            // Add dialog), so editing it again is a plain passthrough — no
+            // string quote-stripping. Its key (if it's an Object property) is
+            // plain text, not stored in the byte arena, so it's read straight
+            // from `AddedItem::key`.
+            let text = match field {
+                EditField::Value => self
+                    .edit_overlay
+                    .get(&node_idx)
+                    .and_then(|e| e.value_override.clone())
+                    .unwrap_or_else(|| tree.added_item(node_idx).raw_value.clone()),
+                EditField::Key => self
+                    .edit_overlay
+                    .get(&node_idx)
+                    .and_then(|e| e.key_override.clone())
+                    .or_else(|| tree.added_item(node_idx).key.clone())
+                    .unwrap_or_default(),
+            };
             self.editing_node = Some(EditingState {
                 node_idx,
-                field: EditField::Value,
+                field,
                 text,
                 focus_requested: true,
             });
@@ -2764,7 +2811,10 @@ impl App {
                 .edit_overlay
                 .entry(state.node_idx)
                 .or_insert_with(export::NodeEdit::default);
-            entry.value_override = Some(state.text);
+            match state.field {
+                EditField::Value => entry.value_override = Some(state.text),
+                EditField::Key   => entry.key_override   = Some(state.text),
+            }
             let after = self.edit_overlay.get(&state.node_idx).cloned();
             self.push_undo(state.node_idx, before, after);
             return;
@@ -2868,9 +2918,13 @@ impl App {
             EditField::Value => "Edit Value",
         };
         let path = if tree.is_added(state.node_idx) {
-            let parent_path = build_path(&tree.index.nodes, &*tree.index, tree.added_parent(state.node_idx));
-            let idx = export::added_display_index(&tree.index.nodes, &tree.added_items, state.node_idx);
-            format!("{parent_path}[{idx}]")
+            let item = tree.added_item(state.node_idx);
+            let parent_path = build_path(&tree.index.nodes, &*tree.index, item.parent);
+            let segment = match &item.key {
+                Some(k) => path_key_segment(k),
+                None    => format!("[{}]", export::added_display_index(&tree.index.nodes, &tree.added_items, state.node_idx)),
+            };
+            format!("{parent_path}{segment}")
         } else {
             build_path(&tree.index.nodes, &*tree.index, state.node_idx)
         };
@@ -2922,41 +2976,46 @@ impl App {
         }
     }
 
-    /// Open the "Add Item" dialog for appending a new element to `parent`
-    /// (an Array node).
+    /// Open the "Add Item" / "Add Property" dialog for appending a new child
+    /// to `parent` (an Array or Object node).
     fn start_add_item(&mut self, parent: u32) {
-        self.adding_item = Some(AddingState { parent, text: String::new(), focus_requested: true });
+        self.adding_item = Some(AddingState { parent, key: String::new(), text: String::new(), focus_requested: true });
     }
 
-    /// Append the typed value to `added_items`, select it, and record the
-    /// undoable action.
+    /// Append the typed value (and, for an Object parent, key) to
+    /// `added_items`, select it, and record the undoable action.
     fn commit_add_item(&mut self) {
         let Some(state) = self.adding_item.take() else { return };
-        let raw_value = state.text.clone();
-        {
-            let Some(tree) = &mut self.tree else { return };
-            let new_id = tree.add_item(state.parent, state.text);
-            tree.selected = Some(new_id);
-            tree.ensure_visible(new_id);
-        }
-        self.push_undo_add(state.parent, raw_value);
+        let Some(tree) = &mut self.tree else { return };
+        let is_object = tree.index.nodes[state.parent as usize].kind == index::NodeKind::Object;
+        let key = if is_object { Some(state.key.clone()) } else { None };
+        let new_id = tree.add_item(state.parent, key.clone(), state.text.clone());
+        tree.selected = Some(new_id);
+        tree.ensure_visible(new_id);
+        self.push_undo_add(state.parent, key, state.text);
     }
 
-    /// Modal dialog for appending a new array item. The typed text must be
-    /// valid JSON (e.g. `"text"`, `42`, `true`, `null`) — the Add button is
-    /// disabled until it parses.
+    /// Modal dialog for appending a new array item or object property. The
+    /// typed value must be valid JSON (e.g. `"text"`, `42`, `true`, `null`)
+    /// and, for an object property, the key must be non-empty — the Add
+    /// button is disabled until both hold.
     fn show_add_item_dialog(&mut self, ctx: &egui::Context) {
         let Some(state) = &mut self.adding_item else { return };
         let Some(tree) = &self.tree else { return };
 
+        let is_object = tree.index.nodes[state.parent as usize].kind == index::NodeKind::Object;
         let path = build_path(&tree.index.nodes, &*tree.index, state.parent);
-        let valid = serde_json::from_str::<serde_json::Value>(&state.text).is_ok();
+        let value_valid = serde_json::from_str::<serde_json::Value>(&state.text).is_ok();
+        let key_valid = !is_object || !state.key.trim().is_empty();
+        let valid = value_valid && key_valid;
 
         let mut commit = false;
         let mut cancel = false;
         let mut open   = true;
 
-        egui::Window::new("Add Item")
+        let title = if is_object { "Add Property" } else { "Add Item" };
+
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -2965,8 +3024,25 @@ impl App {
             .show(ctx, |ui| {
                 let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(format!("{path}[…]")).monospace().small().color(pal.text_muted));
+                let hint = if is_object { format!("{path}.…") } else { format!("{path}[…]") };
+                ui.label(egui::RichText::new(hint).monospace().small().color(pal.text_muted));
                 ui.add_space(4.0);
+
+                let mut key_lost_focus = false;
+                if is_object {
+                    ui.label(egui::RichText::new("Key").small().color(pal.text_muted));
+                    let ke = egui::TextEdit::singleline(&mut state.key)
+                        .desired_width(340.0)
+                        .hint_text("property name")
+                        .font(egui::TextStyle::Monospace);
+                    let key_resp = ui.add(ke);
+                    if state.focus_requested {
+                        key_resp.request_focus();
+                    }
+                    key_lost_focus = key_resp.lost_focus();
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Value").small().color(pal.text_muted));
+                }
 
                 let te = egui::TextEdit::singleline(&mut state.text)
                     .desired_width(340.0)
@@ -2974,15 +3050,17 @@ impl App {
                     .font(egui::TextStyle::Monospace);
                 let resp = ui.add(te);
 
-                if state.focus_requested {
+                if state.focus_requested && !is_object {
                     resp.request_focus();
-                    state.focus_requested = false;
                 }
-                if !state.text.is_empty() && !valid {
+                state.focus_requested = false;
+
+                if !state.text.is_empty() && !value_valid {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Not valid JSON").small().color(theme::DELETED));
                 }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && valid {
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (resp.lost_focus() || key_lost_focus) && enter_pressed && valid {
                     commit = true;
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -4029,6 +4107,51 @@ mod edit_tests {
         assert!(app.load_rx.is_some());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_property_appends_keyed_item_to_object() {
+        let mut app = app_with(r#"{"a": 1}"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+
+        app.start_add_item(root);
+        {
+            let state = app.adding_item.as_mut().unwrap();
+            state.key = "b".to_owned();
+            state.text = "2".to_owned();
+        }
+        app.commit_add_item();
+
+        assert!(app.adding_item.is_none());
+        let t = app.tree.as_ref().unwrap();
+        assert_eq!(t.added_items.len(), 1);
+        assert_eq!(t.added_items[0].key.as_deref(), Some("b"));
+        assert_eq!(t.added_items[0].raw_value, "2");
+
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &t.added_items);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn undo_add_property_removes_it_and_redo_restores_key() {
+        let mut app = app_with(r#"{"a": 1}"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        app.start_add_item(root);
+        {
+            let state = app.adding_item.as_mut().unwrap();
+            state.key = "b".to_owned();
+            state.text = "2".to_owned();
+        }
+        app.commit_add_item();
+
+        app.undo();
+        assert!(app.tree.as_ref().unwrap().added_items.is_empty());
+
+        app.redo();
+        let t = app.tree.as_ref().unwrap();
+        assert_eq!(t.added_items[0].key.as_deref(), Some("b"));
+        assert_eq!(t.added_items[0].raw_value, "2");
     }
 
     #[test]
