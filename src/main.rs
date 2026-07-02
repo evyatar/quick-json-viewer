@@ -111,6 +111,15 @@ struct EditingState {
     focus_requested: bool, // auto-focus TextEdit on first render
 }
 
+/// One undoable change to `edit_overlay`: the entry's state for `node_idx`
+/// before and after the edit (`None` = no overlay entry).
+#[derive(Clone)]
+struct UndoEntry {
+    node_idx: u32,
+    before:   Option<export::NodeEdit>,
+    after:    Option<export::NodeEdit>,
+}
+
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
 enum DiffRowAction {
     Select(u32),
@@ -225,6 +234,8 @@ struct App {
     /// Snapshot of `edit_overlay` at the last overwrite-save; edits matching it
     /// are considered persisted (no dirty marker). Empty = nothing saved yet.
     saved_overlay: std::collections::HashMap<u32, export::NodeEdit>,
+    undo_stack:    Vec<UndoEntry>,
+    redo_stack:    Vec<UndoEntry>,
     install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
@@ -262,6 +273,8 @@ impl Default for App {
             editing_node:  None,
             edit_overlay:  std::collections::HashMap::new(),
             saved_overlay: std::collections::HashMap::new(),
+            undo_stack:    Vec::new(),
+            redo_stack:    Vec::new(),
             install_watcher_rx:   None,
             #[cfg(target_os = "macos")]
             menu_installed: false,
@@ -397,6 +410,8 @@ impl eframe::App for App {
             if acts & macos_menu::ACT_EXPORT_CSV   != 0 { self.export(ExportScope::File, ExportFormat::Csv); }
             if acts & macos_menu::ACT_SAVE         != 0 { self.save_overwrite(); }
             if acts & macos_menu::ACT_SAVE_COPY    != 0 { self.save_copy(); }
+            if acts & macos_menu::ACT_UNDO         != 0 { self.undo(); }
+            if acts & macos_menu::ACT_REDO         != 0 { self.redo(); }
             if let Some(path) = macos_menu::take_open_file() { self.open_file(path); }
         }
 
@@ -542,7 +557,7 @@ impl eframe::App for App {
         // ── 4. Keyboard shortcuts ──
         let (cmd_o, cmd_f, cmd_comma, cmd_l, arrow_up, arrow_down, arrow_left, arrow_right,
              cmd_g, cmd_shift_g, opt_c, opt_x,
-             page_up, page_down, home, end, f2, cmd_s, delete_key) =
+             page_up, page_down, home, end, f2, cmd_s, delete_key, cmd_z, cmd_shift_z) =
             ui.input(|i| {
                 let cmd   = i.modifiers.command;
                 let shift = i.modifiers.shift;
@@ -568,6 +583,8 @@ impl eframe::App for App {
                     none && i.key_pressed(egui::Key::F2),
                     cmd && !shift && i.key_pressed(egui::Key::S),
                     none && i.key_pressed(egui::Key::Delete),
+                    cmd && !shift && i.key_pressed(egui::Key::Z),
+                    cmd &&  shift && i.key_pressed(egui::Key::Z),
                 )
             });
 
@@ -629,6 +646,16 @@ impl eframe::App for App {
             if let Some(n) = to_delete {
                 self.toggle_delete(n);
             }
+        }
+
+        // Cmd+Z / Cmd+Shift+Z → undo / redo the last overlay edit (rename,
+        // value change, delete/restore). Gated on no text field having focus
+        // so a text box's own undo (e.g. the search box, edit dialog) wins.
+        if cmd_z && self.mode == AppMode::Viewer && no_text_focus {
+            self.undo();
+        }
+        if cmd_shift_z && self.mode == AppMode::Viewer && no_text_focus {
+            self.redo();
         }
 
         // Cmd+S → save: overwrite the original file, or save a copy when the
@@ -792,12 +819,24 @@ impl App {
                         ui.close();
                         self.edit_overlay = self.saved_overlay.clone();
                         self.editing_node = None;
+                        self.undo_stack.clear();
+                        self.redo_stack.clear();
                     }
                 });
                 ui.separator();
                 if ui.add(egui::Button::new("Settings").shortcut_text("⌘,")).clicked() {
                     ui.close();
                     self.settings_open = true;
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.can_undo(), egui::Button::new("Undo").shortcut_text("⌘Z")).clicked() {
+                    ui.close();
+                    self.undo();
+                }
+                if ui.add_enabled(self.can_redo(), egui::Button::new("Redo").shortcut_text("⇧⌘Z")).clicked() {
+                    ui.close();
+                    self.redo();
                 }
             });
             ui.menu_button("View", |ui| {
@@ -894,6 +933,8 @@ impl App {
                         section(ui, "Editing");
                         row(ui, "Double-click",  "Edit leaf value");
                         row(ui, "F2",            "Edit selected value");
+                        row(ui, "⌘ Z",           "Undo");
+                        row(ui, "⇧ ⌘ Z",         "Redo");
                         row(ui, "⌘ S",           "Save (overwrite original)");
                         row(ui, "⇧ ⌘ S",         "Save a Copy…");
                     });
@@ -2341,6 +2382,8 @@ impl App {
         self.edit_overlay.clear();
         self.saved_overlay.clear();
         self.editing_node = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.load_rx      = Some(loader::spawn_load(path));
     }
 
@@ -2375,6 +2418,8 @@ impl App {
         self.edit_overlay.clear();
         self.saved_overlay.clear();
         self.editing_node = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.load_rx      = Some(loader::spawn_parse(data));
     }
 
@@ -2404,6 +2449,8 @@ impl App {
         self.edit_overlay.clear();
         self.saved_overlay.clear();
         self.editing_node  = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.load_rx = Some(match req.curl_args {
             Some(args) => loader::spawn_exec_curl(args),
             None       => loader::spawn_fetch_url(req.url, req.method, req.headers, req.body),
@@ -2459,6 +2506,7 @@ impl App {
     /// Toggle the deleted flag on `node_idx`. Removes the overlay entry when it
     /// becomes fully default (no key/value override, not deleted).
     fn toggle_delete(&mut self, node_idx: u32) {
+        let before = self.edit_overlay.get(&node_idx).cloned();
         {
             let entry = self.edit_overlay.entry(node_idx).or_default();
             entry.deleted = !entry.deleted;
@@ -2468,6 +2516,45 @@ impl App {
                 self.edit_overlay.remove(&node_idx);
             }
         }
+        let after = self.edit_overlay.get(&node_idx).cloned();
+        self.push_undo(node_idx, before, after);
+    }
+
+    /// Record an undoable change and clear the redo stack (a fresh edit
+    /// invalidates any previously undone redo history).
+    fn push_undo(&mut self, node_idx: u32, before: Option<export::NodeEdit>, after: Option<export::NodeEdit>) {
+        self.undo_stack.push(UndoEntry { node_idx, before, after });
+        self.redo_stack.clear();
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Revert the most recent overlay change and move it to the redo stack.
+    fn undo(&mut self) {
+        let Some(entry) = self.undo_stack.pop() else { return };
+        match &entry.before {
+            Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
+            None       => { self.edit_overlay.remove(&entry.node_idx); }
+        }
+        self.editing_node = None;
+        self.redo_stack.push(entry);
+    }
+
+    /// Re-apply the most recently undone overlay change.
+    fn redo(&mut self) {
+        let Some(entry) = self.redo_stack.pop() else { return };
+        match &entry.after {
+            Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
+            None       => { self.edit_overlay.remove(&entry.node_idx); }
+        }
+        self.editing_node = None;
+        self.undo_stack.push(entry);
     }
 
     /// Open the edit dialog for `node_idx`, pre-populating the buffer with the
@@ -2522,6 +2609,7 @@ impl App {
         let node = &tree.index.nodes[state.node_idx as usize];
         use index::NodeKind;
 
+        let before = self.edit_overlay.get(&state.node_idx).cloned();
         let entry = self
             .edit_overlay
             .entry(state.node_idx)
@@ -2545,6 +2633,8 @@ impl App {
                 entry.key_override = Some(state.text);
             }
         }
+        let after = self.edit_overlay.get(&state.node_idx).cloned();
+        self.push_undo(state.node_idx, before, after);
     }
 
     /// Save the edited document to a new file chosen via the platform dialog.

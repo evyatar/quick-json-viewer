@@ -29,6 +29,8 @@ pub const ACT_EXPORT_CSV:   u32 = 1 << 10;
 pub const ACT_SAVE:         u32 = 1 << 11;
 pub const ACT_SAVE_COPY:    u32 = 1 << 12;
 pub const ACT_OPEN_URL:     u32 = 1 << 13;
+pub const ACT_UNDO:         u32 = 1 << 14;
+pub const ACT_REDO:         u32 = 1 << 15;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -208,6 +210,16 @@ define_class!(
             PENDING.fetch_or(ACT_OPEN_URL, Ordering::Relaxed);
             if let Some(c) = CTX.get() { c.request_repaint(); }
         }
+        #[unsafe(method(handleUndo:))]
+        fn handle_undo(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_UNDO, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
+        #[unsafe(method(handleRedo:))]
+        fn handle_redo(&self, _sender: &AnyObject) {
+            PENDING.fetch_or(ACT_REDO, Ordering::Relaxed);
+            if let Some(c) = CTX.get() { c.request_repaint(); }
+        }
     }
 );
 
@@ -274,6 +286,12 @@ pub fn install(ctx: &egui::Context) {
         file_menu.addItem(&NSMenuItem::separatorItem(mtm));
         add_item(&file_menu, "Settings", ",", cmd,  objc2::sel!(handleSettings:),   handler_ref);
 
+        // ── Edit ─────────────────────────────────────────────────────────────
+        let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+        add_item(&edit_menu, "Undo", "z", cmd, objc2::sel!(handleUndo:), handler_ref);
+        add_item(&edit_menu, "Redo", "z", cmd | NSEventModifierFlags::Shift,
+                 objc2::sel!(handleRedo:), handler_ref);
+
         // ── View ─────────────────────────────────────────────────────────────
         let view_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("View"));
         add_item(&view_menu, "Collapse All", "c", opt, objc2::sel!(handleCollapseAll:),  handler_ref);
@@ -295,6 +313,7 @@ pub fn install(ctx: &egui::Context) {
             }
             for (label, submenu) in [
                 ("File", &*file_menu),
+                ("Edit", &*edit_menu),
                 ("View", &*view_menu),
                 ("Help", &*help_menu),
             ] {
