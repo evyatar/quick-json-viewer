@@ -110,9 +110,24 @@ pub fn parse_bytes(
 }
 
 fn skip_ws(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\r' | b'\n') {
-        *pos += 1;
+    let mut p = *pos;
+    let len = bytes.len();
+    loop {
+        // Pretty-printed JSON is dominated by indentation runs — skip
+        // 8 spaces at a time before falling back to byte-wise.
+        const SPACES: u64 = u64::from_le_bytes(*b"        ");
+        while p + 8 <= len
+            && u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) == SPACES
+        {
+            p += 8;
+        }
+        if p < len && matches!(bytes[p], b' ' | b'\t' | b'\r' | b'\n') {
+            p += 1;
+        } else {
+            break;
+        }
     }
+    *pos = p;
 }
 
 /// Returns `(content_start, content_end)` inside the quotes; `pos` moves past closing `"`.
