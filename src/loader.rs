@@ -26,6 +26,9 @@ pub fn spawn_load(path: PathBuf) -> mpsc::Receiver<LoadMsg> {
             .map_err(|e| format!("open: {e}"))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| format!("mmap: {e}"))?;
+        // The parser reads the file front-to-back once; tell the kernel to
+        // read ahead aggressively. Best-effort — ignore failures.
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         Ok(JsonData::Mapped { _file: file, mmap })
     })
 }
