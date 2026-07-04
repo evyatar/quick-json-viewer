@@ -37,18 +37,45 @@ jobs:
           echo "SHA256=$SHA256"   >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
+      - name: Generate release notes
+        env:
+          VERSION: ${{ env.VERSION }}
+          SHA256: ${{ env.SHA256 }}
+        run: |
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}"^ 2>/dev/null || echo "")
+
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline --pretty=format:"%h %s")
+          else
+            COMMITS=$(git log "${PREV_TAG}..${CURRENT_TAG}" --oneline --pretty=format:"%h %s")
+          fi
+
+          # Filter out chore commits and format as release notes
+          {
+            echo "## Changes"
+            echo ""
+            while IFS= read -r line; do
+              if [[ ! "$line" =~ chore: ]]; then
+                HASH=$(echo "$line" | awk '{print $1}')
+                MESSAGE=$(echo "$line" | cut -d' ' -f2-)
+                echo "- $MESSAGE ($HASH)"
+              fi
+            done <<< "$COMMITS"
+            echo ""
+            echo "## Install via Homebrew"
+            echo ""
+            echo '```sh'
+            echo "brew install --cask evyatar/tap/quick-json-viewer"
+            echo '```'
+            echo ""
+            echo "After installing, update the cask's \`sha256\` and \`version\` in your tap:"
+            echo "- **Version**: \`${VERSION}\`"
+            echo "- **SHA256**: \`${SHA256}\`"
+          } > release_notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ARCHIVE }}
-          generate_release_notes: true
-          body: |
-            ## Install via Homebrew
-
-            ```sh
-            brew install --cask evyatar/tap/quick-json-viewer
-            ```
-
-            After installing, update the cask's `sha256` and `version` in your tap:
-            - **Version**: `${{ env.VERSION }}`
-            - **SHA256**: `${{ env.SHA256 }}`
+          body_path: release_notes.md
