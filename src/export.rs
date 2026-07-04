@@ -112,9 +112,10 @@ fn included(child: u32, include_all: bool, keep: Option<&HashSet<u32>>) -> bool 
 // ─── JSON ──────────────────────────────────────────────────────────────────────
 
 /// Raw byte slice of a node's value — verbatim, preserving original formatting.
-/// Correct for any single node or for a whole non-NDJSON document.
-pub fn json_verbatim(index: &JsonIndex, idx: u32) -> Vec<u8> {
-    index.value_bytes(&index.nodes[idx as usize]).to_vec()
+/// Correct for any single node or for a whole non-NDJSON document. Borrows the
+/// source (possibly the whole mmap'd file) instead of copying it.
+pub fn json_verbatim(index: &JsonIndex, idx: u32) -> &[u8] {
+    index.value_bytes(&index.nodes[idx as usize])
 }
 
 /// Pretty-printed (2-space) JSON rooted at `root`.
@@ -153,7 +154,7 @@ fn write_json(
             let is_obj = node.kind == NodeKind::Object;
 
             let mut children: Vec<u32> = Vec::new();
-            let mut c = node.first_child;
+            let mut c = index.first_child(idx);
             while c != u32::MAX {
                 if included(c, include_all, keep) {
                     children.push(c);
@@ -211,7 +212,7 @@ fn write_json_compact(index: &JsonIndex, idx: u32, out: &mut String) {
         NodeKind::Object | NodeKind::Array => {
             let is_obj = node.kind == NodeKind::Object;
             out.push(if is_obj { '{' } else { '[' });
-            let mut c = node.first_child;
+            let mut c = index.first_child(idx);
             let mut first = true;
             while c != u32::MAX {
                 if !first {
@@ -279,7 +280,7 @@ fn write_json_edited(
 
             // Collect children, skipping any marked deleted.
             let mut children: Vec<u32> = Vec::new();
-            let mut c = node.first_child;
+            let mut c = index.first_child(idx);
             while c != u32::MAX {
                 if !edits.get(&c).map_or(false, |e| e.deleted) {
                     children.push(c);
@@ -377,7 +378,7 @@ fn write_json_compact_edited(
             let is_obj = node.kind == NodeKind::Object;
             out.push(if is_obj { '{' } else { '[' });
             let mut children: Vec<u32> = Vec::new();
-            let mut c = node.first_child;
+            let mut c = index.first_child(idx);
             while c != u32::MAX {
                 children.push(c);
                 c = index.nodes[c as usize].next_sibling;
@@ -451,7 +452,7 @@ pub fn csv(
     // Rows: array elements, or the root itself for objects/scalars.
     let row_roots: Vec<u32> = if root_node.kind == NodeKind::Array {
         let mut v = Vec::new();
-        let mut c = root_node.first_child;
+        let mut c = index.first_child(root);
         while c != u32::MAX {
             if included(c, include_all_root, keep) {
                 v.push(c);
@@ -463,9 +464,11 @@ pub fn csv(
         vec![root]
     };
 
+    // Intern column names to dense ids once; rows hold (id, value) pairs
+    // instead of a per-row HashMap with cloned column-name keys.
     let mut columns: Vec<String> = Vec::new();
-    let mut col_seen: HashMap<String, ()> = HashMap::new();
-    let mut rows: Vec<HashMap<String, String>> = Vec::new();
+    let mut col_ids: HashMap<String, usize> = HashMap::new();
+    let mut rows: Vec<Vec<(usize, String)>> = Vec::new();
 
     let mut prefix = String::new();
     for &rr in &row_roots {
@@ -473,14 +476,20 @@ pub fn csv(
         let row_include = keep.is_none() || sel.contains(&rr);
         prefix.clear();
         flatten(index, rr, sel, keep, row_include, &mut prefix, &mut cells);
-        let mut map = HashMap::new();
+        let mut row: Vec<(usize, String)> = Vec::with_capacity(cells.len());
         for (k, v) in cells {
-            if col_seen.insert(k.clone(), ()).is_none() {
-                columns.push(k.clone());
-            }
-            map.insert(k, v);
+            let id = match col_ids.get(&k) {
+                Some(&id) => id,
+                None => {
+                    let id = columns.len();
+                    col_ids.insert(k.clone(), id);
+                    columns.push(k);
+                    id
+                }
+            };
+            row.push((id, v));
         }
-        rows.push(map);
+        rows.push(row);
     }
 
     let mut out = String::new();
@@ -491,14 +500,23 @@ pub fn csv(
         out.push_str(&csv_escape(c));
     }
     out.push('\n');
+    // Scatter each row's cells into a reusable column-indexed scratch slot
+    // (duplicate columns: last value wins, as the old map insert did).
+    let mut slot: Vec<Option<&String>> = vec![None; columns.len()];
     for row in &rows {
-        for (i, c) in columns.iter().enumerate() {
+        for (id, v) in row {
+            slot[*id] = Some(v);
+        }
+        for (i, s) in slot.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            if let Some(v) = row.get(c) {
+            if let Some(v) = s {
                 out.push_str(&csv_escape(v));
             }
+        }
+        for (id, _) in row {
+            slot[*id] = None;
         }
         out.push('\n');
     }
@@ -526,7 +544,7 @@ fn flatten(
         NodeKind::Object | NodeKind::Array => {
             let is_obj = node.kind == NodeKind::Object;
             let mut any = false;
-            let mut c = node.first_child;
+            let mut c = index.first_child(idx);
             while c != u32::MAX {
                 let cn = &index.nodes[c as usize];
                 let next = cn.next_sibling;
@@ -594,13 +612,11 @@ mod tests {
 
     fn make(json: &str) -> Arc<JsonIndex> {
         let data = json.as_bytes().to_vec();
-        let mut key_arena = Vec::new();
         let (nodes, root, is_ndjson) =
-            crate::parser::parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
+            crate::parser::parse_bytes(&data, &mut |_| {}).unwrap();
         Arc::new(JsonIndex {
             data: JsonData::Memory(data),
             nodes,
-            key_arena,
             root,
             is_ndjson,
         })
@@ -610,8 +626,7 @@ mod tests {
     fn nav(index: &JsonIndex, path: &[&str]) -> u32 {
         let mut cur = index.root;
         for seg in path {
-            let node = &index.nodes[cur as usize];
-            let mut c = node.first_child;
+            let mut c = index.first_child(cur);
             let mut found = None;
             while c != u32::MAX {
                 let cn = &index.nodes[c as usize];
@@ -840,8 +855,8 @@ mod tests {
         let idx = make("{\"a\":1}\n{\"a\":2}\n");
         assert!(idx.is_ndjson);
         // First row is the root array's first child; find its "a" child.
-        let first_row = idx.nodes[idx.root as usize].first_child;
-        let mut a = idx.nodes[first_row as usize].first_child;
+        let first_row = idx.first_child(idx.root);
+        let mut a = idx.first_child(first_row);
         while a != u32::MAX && idx.key_of(&idx.nodes[a as usize]) != "a" {
             a = idx.nodes[a as usize].next_sibling;
         }

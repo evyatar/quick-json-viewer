@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::export::{self, AddedItem};
-use crate::index::{JsonIndex, Node, NodeKind};
+use crate::index::{JsonIndex, Node, NodeKind, NodeSet};
 
 pub struct TreeState {
     pub index:             Arc<JsonIndex>,
-    pub expanded:          HashSet<u32>,
+    pub expanded:          NodeSet,
     pub visible:           Vec<u32>,
     pub selected:          Option<u32>,
     /// When true, rows show a checkbox and `checked` drives multi-node export.
@@ -15,7 +15,7 @@ pub struct TreeState {
     pub search_use_regex:  bool,
     pub search_results:    Vec<u32>,
     pub search_cursor:     usize,
-    pub search_result_set: HashSet<u32>,
+    pub search_result_set: NodeSet,
     pub scroll_to_row:     Option<usize>,
     pub reveal_row:        Option<usize>,
     /// Array items added interactively but not yet saved to disk. Identified
@@ -26,7 +26,7 @@ pub struct TreeState {
 impl TreeState {
     pub fn new(index: Arc<JsonIndex>) -> Self {
         let root = index.root;
-        let mut expanded = HashSet::new();
+        let mut expanded = NodeSet::new();
         expanded.insert(root);
         let visible = rebuild_visible(root, &index.nodes, &expanded, &HashMap::new());
         Self {
@@ -39,7 +39,7 @@ impl TreeState {
             search_use_regex: false,
             search_results: Vec::new(),
             search_cursor: 0,
-            search_result_set: HashSet::new(),
+            search_result_set: NodeSet::new(),
             scroll_to_row: None,
             reveal_row: None,
             added_items: Vec::new(),
@@ -118,9 +118,21 @@ impl TreeState {
         self.visible = rebuild_visible(self.index.root, &self.index.nodes, &self.expanded, &added_map);
     }
 
+    /// Row index of `id` in `visible`. With no pending added items the DFS
+    /// pre-order guarantees ascending node ids, so binary search applies;
+    /// added items break the ordering, so fall back to a linear scan.
+    pub fn pos_of(&self, id: u32) -> Option<usize> {
+        if self.added_items.is_empty() {
+            let p = self.visible.partition_point(|&n| n < id);
+            (self.visible.get(p) == Some(&id)).then_some(p)
+        } else {
+            self.visible.iter().position(|&n| n == id)
+        }
+    }
+
     pub fn select_up(&mut self) {
         if let Some(sel) = self.selected {
-            if let Some(pos) = self.visible.iter().position(|&n| n == sel) {
+            if let Some(pos) = self.pos_of(sel) {
                 if pos > 0 {
                     self.selected = Some(self.visible[pos - 1]);
                     self.reveal_row = Some(pos - 1);
@@ -131,7 +143,7 @@ impl TreeState {
 
     pub fn select_down(&mut self) {
         if let Some(sel) = self.selected {
-            if let Some(pos) = self.visible.iter().position(|&n| n == sel) {
+            if let Some(pos) = self.pos_of(sel) {
                 if pos + 1 < self.visible.len() {
                     self.selected = Some(self.visible[pos + 1]);
                     self.reveal_row = Some(pos + 1);
@@ -142,7 +154,7 @@ impl TreeState {
 
     pub fn select_page_up(&mut self, page: usize) {
         if let Some(sel) = self.selected {
-            if let Some(pos) = self.visible.iter().position(|&n| n == sel) {
+            if let Some(pos) = self.pos_of(sel) {
                 let new_pos = pos.saturating_sub(page);
                 self.selected = Some(self.visible[new_pos]);
                 self.scroll_to_row = Some(new_pos);
@@ -152,7 +164,7 @@ impl TreeState {
 
     pub fn select_page_down(&mut self, page: usize) {
         if let Some(sel) = self.selected {
-            if let Some(pos) = self.visible.iter().position(|&n| n == sel) {
+            if let Some(pos) = self.pos_of(sel) {
                 let new_pos = (pos + page).min(self.visible.len().saturating_sub(1));
                 self.selected = Some(self.visible[new_pos]);
                 self.scroll_to_row = Some(new_pos);
@@ -252,7 +264,7 @@ impl TreeState {
             current = parent;
         }
         self.refresh_visible();
-        self.scroll_to_row = self.visible.iter().position(|&n| n == node_idx);
+        self.scroll_to_row = self.pos_of(node_idx);
     }
 
     pub fn collapse_all(&mut self) {
@@ -275,7 +287,7 @@ impl TreeState {
             let node = &self.index.nodes[idx as usize];
             if matches!(node.kind, NodeKind::Object | NodeKind::Array) && node.child_count > 0 {
                 self.expanded.remove(&idx);
-                let mut child = node.first_child;
+                let mut child = self.index.first_child(idx);
                 while child != u32::MAX {
                     stack.push(child);
                     child = self.index.nodes[child as usize].next_sibling;
@@ -291,7 +303,7 @@ impl TreeState {
             let node = &self.index.nodes[idx as usize];
             if matches!(node.kind, NodeKind::Object | NodeKind::Array) && node.child_count > 0 {
                 self.expanded.insert(idx);
-                let mut child = node.first_child;
+                let mut child = self.index.first_child(idx);
                 while child != u32::MAX {
                     stack.push(child);
                     child = self.index.nodes[child as usize].next_sibling;
@@ -312,8 +324,7 @@ impl TreeState {
             let nodes = &self.index.nodes;
             let parent = nodes[sel as usize].parent;
             if parent == u32::MAX { return; }
-            let pn = &nodes[parent as usize];
-            (pn.kind, pn.first_child)
+            (nodes[parent as usize].kind, self.index.first_child(parent))
         };
         if !matches!(parent_kind, NodeKind::Object) { return; }
 
@@ -345,7 +356,7 @@ impl TreeState {
 
         if let Some(target) = found {
             self.selected = Some(target);
-            if let Some(pos) = self.visible.iter().position(|&n| n == target) {
+            if let Some(pos) = self.pos_of(target) {
                 self.scroll_to_row = Some(pos);
             }
         }
@@ -353,7 +364,10 @@ impl TreeState {
 
     /// Replace search results (called from UI after background search finishes).
     pub fn set_search_results(&mut self, results: Vec<u32>) {
-        self.search_result_set = results.iter().copied().collect();
+        self.search_result_set.clear();
+        for &r in &results {
+            self.search_result_set.insert(r);
+        }
         self.search_results = results;
         self.search_cursor = 0;
         if let Some(&first) = self.search_results.first() {
@@ -373,7 +387,7 @@ impl TreeState {
 pub fn rebuild_visible(
     root: u32,
     nodes: &[Node],
-    expanded: &HashSet<u32>,
+    expanded: &NodeSet,
     added: &HashMap<u32, Vec<u32>>,
 ) -> Vec<u32> {
     let mut visible: Vec<u32> = Vec::with_capacity(nodes.len().min(4096));
@@ -388,19 +402,18 @@ pub fn rebuild_visible(
         let extra = added.get(&node_idx);
         let has_extra = extra.is_some_and(|v| !v.is_empty());
         if expanded.contains(&node_idx) && (node.child_count > 0 || has_extra) {
-            // Collect children in order, push in reverse so first child is popped first
-            let mut children: Vec<u32> = Vec::new();
-            let mut child = node.first_child;
+            // Push children onto the stack, then reverse that range in place
+            // so the first child is popped first — no per-node temp Vec.
+            let mark = stack.len();
+            let mut child = crate::index::first_child(nodes, node_idx);
             while child != u32::MAX {
-                children.push(child);
+                stack.push(child);
                 child = nodes[child as usize].next_sibling;
             }
             if let Some(extra) = extra {
-                children.extend(extra.iter().copied());
+                stack.extend(extra.iter().copied());
             }
-            for &c in children.iter().rev() {
-                stack.push(c);
-            }
+            stack[mark..].reverse();
         }
     }
 
@@ -415,7 +428,6 @@ mod tests {
 
     fn make_node(
         kind: NodeKind,
-        first_child: u32,
         next_sibling: u32,
         child_count: u32,
         parent: u32,
@@ -427,7 +439,6 @@ mod tests {
             value_end: 0,
             key_start: 0,
             key_len: 0,
-            first_child,
             next_sibling,
             child_count,
             parent,
@@ -437,12 +448,11 @@ mod tests {
 
     fn make_index(json: &str) -> Arc<JsonIndex> {
         let data = json.as_bytes().to_vec();
-        let mut key_arena = Vec::new();
         let (nodes, root, is_ndjson) =
-            crate::parser::parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
+            crate::parser::parse_bytes(&data, &mut |_| {}).unwrap();
         Arc::new(JsonIndex {
             data: crate::index::JsonData::Memory(data),
-            nodes, key_arena, root, is_ndjson,
+            nodes, root, is_ndjson,
         })
     }
 
@@ -451,39 +461,39 @@ mod tests {
     #[test]
     fn root_only_when_nothing_expanded() {
         let ns = vec![
-            make_node(NodeKind::Object, 1, u32::MAX, 2, u32::MAX), // 0 root
-            make_node(NodeKind::String, u32::MAX, 2, 0, 0),        // 1 a
-            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 0), // 2 b
+            make_node(NodeKind::Object, u32::MAX, 2, u32::MAX), // 0 root
+            make_node(NodeKind::String, 2, 0, 0),               // 1 a
+            make_node(NodeKind::String, u32::MAX, 0, 0),        // 2 b
         ];
-        let visible = rebuild_visible(0, &ns, &HashSet::new(), &HashMap::new());
+        let visible = rebuild_visible(0, &ns, &NodeSet::new(), &HashMap::new());
         assert_eq!(visible, vec![0]);
     }
 
     #[test]
     fn expanded_root_shows_children() {
         let ns = vec![
-            make_node(NodeKind::Object, 1, u32::MAX, 2, u32::MAX),
-            make_node(NodeKind::String, u32::MAX, 2, 0, 0),
-            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 0),
+            make_node(NodeKind::Object, u32::MAX, 2, u32::MAX),
+            make_node(NodeKind::String, 2, 0, 0),
+            make_node(NodeKind::String, u32::MAX, 0, 0),
         ];
-        let mut expanded = HashSet::new();
+        let mut expanded = NodeSet::new();
         expanded.insert(0u32);
         assert_eq!(rebuild_visible(0, &ns, &expanded, &HashMap::new()), vec![0, 1, 2]);
     }
 
     #[test]
     fn dfs_order_is_preserved() {
-        // root(0) -> a(1) -> c(3); root(0) -> b(2)
+        // Pre-order layout: root(0) -> a(1) -> c(2); root(0) -> b(3)
         let ns = vec![
-            make_node(NodeKind::Object, 1, u32::MAX, 2, u32::MAX), // 0 root
-            make_node(NodeKind::Object, 3, 2, 1, 0),               // 1 a
-            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 0), // 2 b
-            make_node(NodeKind::String, u32::MAX, u32::MAX, 0, 1), // 3 c (child of a)
+            make_node(NodeKind::Object, u32::MAX, 2, u32::MAX), // 0 root
+            make_node(NodeKind::Object, 3, 1, 0),               // 1 a
+            make_node(NodeKind::String, u32::MAX, 0, 1),        // 2 c (child of a)
+            make_node(NodeKind::String, u32::MAX, 0, 0),        // 3 b
         ];
-        let mut expanded = HashSet::new();
+        let mut expanded = NodeSet::new();
         expanded.insert(0u32);
         expanded.insert(1u32);
-        assert_eq!(rebuild_visible(0, &ns, &expanded, &HashMap::new()), vec![0, 1, 3, 2]);
+        assert_eq!(rebuild_visible(0, &ns, &expanded, &HashMap::new()), vec![0, 1, 2, 3]);
     }
 
     // ── TreeState ────────────────────────────────────────────────────────────
@@ -545,8 +555,8 @@ mod tests {
         state.expanded.clear();
         state.refresh_visible();
         let root = state.index.root;
-        let a_node = state.index.nodes[root as usize].first_child;
-        let b_node = state.index.nodes[a_node as usize].first_child;
+        let a_node = state.index.first_child(root);
+        let b_node = state.index.first_child(a_node);
         // b_node is hidden because a_node is not expanded
         assert!(!state.visible.contains(&b_node));
         state.ensure_visible(b_node);
@@ -558,7 +568,7 @@ mod tests {
         let idx = make_index(r#"{"a": {"b": 1}}"#);
         let mut state = TreeState::new(idx);
         let root = state.index.root;
-        let child = state.index.nodes[root as usize].first_child; // "a" node
+        let child = state.index.first_child(root); // "a" node
         // Root starts expanded; "a" is visible but collapsed
         assert_eq!(state.visible.len(), 2); // root + "a"
         state.toggle(child);
@@ -577,8 +587,9 @@ mod tests {
         assert_eq!(state.visible.len(), 3); // root + 2 items
         let new_id = state.add_item(root, None, "3".to_owned());
         assert!(state.is_added(new_id));
-        assert_eq!(state.visible, vec![root, state.index.nodes[root as usize].first_child,
-            state.index.nodes[state.index.nodes[root as usize].first_child as usize].next_sibling, new_id]);
+        let first = state.index.first_child(root);
+        assert_eq!(state.visible, vec![root, first,
+            state.index.nodes[first as usize].next_sibling, new_id]);
     }
 
     #[test]
@@ -586,10 +597,10 @@ mod tests {
         let idx = make_index(r#"[[1]]"#);
         let mut state = TreeState::new(idx);
         let root = state.index.root;
-        let inner = state.index.nodes[root as usize].first_child;
+        let inner = state.index.first_child(root);
         state.expanded.remove(&inner);
         state.refresh_visible();
-        assert!(!state.visible.contains(&state.index.nodes[inner as usize].first_child));
+        assert!(!state.visible.contains(&state.index.first_child(inner)));
         let new_id = state.add_item(inner, None, "2".to_owned());
         // Adding auto-expands the parent so the new item is immediately visible.
         assert!(state.expanded.contains(&inner));

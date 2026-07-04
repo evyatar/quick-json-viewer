@@ -147,13 +147,12 @@ where
 {
     let data = make_data()?;
 
-    let mut key_arena: Vec<u8> = Vec::new();
     let tx_prog = tx.clone();
     let mut progress_cb = |p: f32| {
         let _ = tx_prog.send(LoadMsg::Progress(p));
     };
 
-    let (nodes, root, is_ndjson) = match parse_bytes(data.bytes(), &mut key_arena, &mut progress_cb) {
+    let (nodes, root, is_ndjson) = match parse_bytes(data.bytes(), &mut progress_cb) {
         Ok(r) => r,
         Err(e) => {
             let ctx = extract_error_context(data.bytes(), e.offset as usize);
@@ -165,7 +164,6 @@ where
     let index = Arc::new(JsonIndex {
         data,
         nodes,
-        key_arena,
         root,
         is_ndjson,
     });

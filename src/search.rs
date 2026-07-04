@@ -1,5 +1,6 @@
 use crate::index::{JsonIndex, Node, NodeKind};
-use std::borrow::Cow;
+use memchr::memmem;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ─── query model ─────────────────────────────────────────────────────────────
 
@@ -209,20 +210,29 @@ pub fn parse_query(q: &str) -> Vec<QueryPart> {
 
 // ─── evaluation ──────────────────────────────────────────────────────────────
 
-/// Leaf value as text: strings without their surrounding quotes,
-/// numbers/bools/null as raw bytes. Containers have no value.
-fn leaf_value<'a>(index: &'a JsonIndex, node: &Node) -> Option<Cow<'a, str>> {
+/// Leaf value as raw bytes: strings without their surrounding quotes,
+/// numbers/bools/null verbatim. Containers have no value. Borrowing bytes
+/// instead of building a String keeps the whole scan allocation-free.
+fn leaf_value_bytes<'a>(index: &'a JsonIndex, node: &Node) -> Option<&'a [u8]> {
     match node.kind {
         NodeKind::String => {
             let raw = index.value_bytes(node);
-            let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { raw };
-            Some(String::from_utf8_lossy(inner))
+            Some(if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { raw })
         }
         NodeKind::Number | NodeKind::Bool | NodeKind::Null => {
-            Some(String::from_utf8_lossy(index.value_bytes(node)))
+            Some(index.value_bytes(node))
         }
         NodeKind::Object | NodeKind::Array => None,
     }
+}
+
+/// Raw key bytes (no UTF-8 validation — matching works on bytes).
+fn key_bytes<'a>(index: &'a JsonIndex, n: &Node) -> &'a [u8] {
+    if n.key_len == 0 {
+        return b"";
+    }
+    let s = (n.value_start - n.key_start) as usize;
+    &index.data.bytes()[s..s + n.key_len as usize]
 }
 
 fn ord_matches(op: CmpOp, ord: Option<std::cmp::Ordering>) -> bool {
@@ -238,79 +248,117 @@ fn ord_matches(op: CmpOp, ord: Option<std::cmp::Ordering>) -> bool {
     }
 }
 
-fn cmp_matches(op: CmpOp, val: &str, rhs: &Rhs) -> bool {
+fn cmp_matches(op: CmpOp, val: &[u8], rhs: &Rhs) -> bool {
     match rhs {
         // Numeric rhs: the node value must parse as a number too.
-        Rhs::Num(n) => match val.trim().parse::<f64>() {
-            Ok(v)  => ord_matches(op, v.partial_cmp(n)),
-            Err(_) => false,
+        Rhs::Num(n) => match std::str::from_utf8(val).ok().and_then(|s| s.trim().parse::<f64>().ok()) {
+            Some(v) => ord_matches(op, v.partial_cmp(n)),
+            None    => false,
         },
         // String rhs: lexicographic — also covers ISO dates like 2024-01-01.
-        Rhs::Str(s) => ord_matches(op, Some(val.cmp(s.as_str()))),
+        // Byte order equals char order for UTF-8.
+        Rhs::Str(s) => ord_matches(op, Some(val.cmp(s.as_bytes()))),
     }
 }
 
-fn part_matches(index: &JsonIndex, node: &Node, part: &QueryPart) -> bool {
+/// A query part with its substring searcher prebuilt (SIMD-backed, built once
+/// per part instead of scanning naively per node).
+enum CompiledPart<'q> {
+    Anywhere(memmem::Finder<'q>),
+    KeyPattern(memmem::Finder<'q>),
+    ValuePattern(memmem::Finder<'q>),
+    Compare { key: Option<&'q str>, op: CmpOp, rhs: &'q Rhs },
+}
+
+fn compile_part(part: &QueryPart) -> CompiledPart<'_> {
     match part {
-        QueryPart::Anywhere(p) => {
-            (node.key_len > 0 && index.key_of(node).contains(p.as_str()))
-                || leaf_value(index, node).is_some_and(|v| v.contains(p.as_str()))
-        }
-        QueryPart::KeyPattern(p) => {
-            node.key_len > 0 && index.key_of(node).contains(p.as_str())
-        }
-        QueryPart::ValuePattern(p) => {
-            leaf_value(index, node).is_some_and(|v| v.contains(p.as_str()))
-        }
+        QueryPart::Anywhere(p)     => CompiledPart::Anywhere(memmem::Finder::new(p.as_bytes())),
+        QueryPart::KeyPattern(p)   => CompiledPart::KeyPattern(memmem::Finder::new(p.as_bytes())),
+        QueryPart::ValuePattern(p) => CompiledPart::ValuePattern(memmem::Finder::new(p.as_bytes())),
         QueryPart::Compare { key, op, rhs } => {
+            CompiledPart::Compare { key: key.as_deref(), op: *op, rhs }
+        }
+    }
+}
+
+fn part_matches(index: &JsonIndex, node: &Node, part: &CompiledPart<'_>) -> bool {
+    match part {
+        CompiledPart::Anywhere(f) => {
+            (node.key_len > 0 && f.find(key_bytes(index, node)).is_some())
+                || leaf_value_bytes(index, node).is_some_and(|v| f.find(v).is_some())
+        }
+        CompiledPart::KeyPattern(f) => {
+            node.key_len > 0 && f.find(key_bytes(index, node)).is_some()
+        }
+        CompiledPart::ValuePattern(f) => {
+            leaf_value_bytes(index, node).is_some_and(|v| f.find(v).is_some())
+        }
+        CompiledPart::Compare { key, op, rhs } => {
             if let Some(k) = key {
-                if node.key_len == 0 || index.key_of(node) != k {
+                if node.key_len == 0 || key_bytes(index, node) != k.as_bytes() {
                     return false;
                 }
             }
-            leaf_value(index, node).is_some_and(|v| cmp_matches(*op, &v, rhs))
+            leaf_value_bytes(index, node).is_some_and(|v| cmp_matches(*op, v, rhs))
         }
     }
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
+/// How often the scan loops poll the cancellation flag.
+const CANCEL_STRIDE: usize = 8192;
+
 /// Search node keys and leaf values for `query`.
 /// Regex mode matches the pattern against keys and raw values (no DSL).
 /// Otherwise the query is parsed as smart-search parts AND-ed together.
-/// Returns node indices that match.
-pub fn search(index: &JsonIndex, query: &str, use_regex: bool) -> Vec<u32> {
+/// Returns node indices that match, or `None` if `cancel` was raised
+/// mid-scan (results would be stale — the caller must discard).
+pub fn search(index: &JsonIndex, query: &str, use_regex: bool, cancel: &AtomicBool) -> Option<Vec<u32>> {
     if query.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     if use_regex {
-        let Ok(re) = regex::Regex::new(query) else {
-            return Vec::new();
+        // bytes::Regex matches raw value/key bytes with no per-node String.
+        let Ok(re) = regex::bytes::Regex::new(query) else {
+            return Some(Vec::new());
         };
-        return index.nodes.iter().enumerate()
-            .filter(|(_, node)| {
-                (node.key_len > 0 && re.is_match(index.key_of(node)))
-                    || match node.kind {
-                        NodeKind::String | NodeKind::Number | NodeKind::Bool | NodeKind::Null => {
-                            re.is_match(String::from_utf8_lossy(index.value_bytes(node)).as_ref())
-                        }
-                        NodeKind::Object | NodeKind::Array => false,
+        let mut out = Vec::new();
+        for (i, node) in index.nodes.iter().enumerate() {
+            if i % CANCEL_STRIDE == 0 && cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let hit = (node.key_len > 0 && re.is_match(key_bytes(index, node)))
+                || match node.kind {
+                    NodeKind::String | NodeKind::Number | NodeKind::Bool | NodeKind::Null => {
+                        re.is_match(index.value_bytes(node))
                     }
-            })
-            .map(|(i, _)| i as u32)
-            .collect();
+                    NodeKind::Object | NodeKind::Array => false,
+                };
+            if hit {
+                out.push(i as u32);
+            }
+        }
+        return Some(out);
     }
 
     let parts = parse_query(query);
     if parts.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
+    let compiled: Vec<CompiledPart<'_>> = parts.iter().map(compile_part).collect();
 
-    index.nodes.iter().enumerate()
-        .filter(|(_, node)| parts.iter().all(|p| part_matches(index, node, p)))
-        .map(|(i, _)| i as u32)
-        .collect()
+    let mut out = Vec::new();
+    for (i, node) in index.nodes.iter().enumerate() {
+        if i % CANCEL_STRIDE == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if compiled.iter().all(|p| part_matches(index, node, p)) {
+            out.push(i as u32);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -320,14 +368,18 @@ mod tests {
     use crate::parser::parse_bytes;
     use std::sync::Arc;
 
+    /// Test wrapper: run a search with a never-raised cancel flag.
+    fn search(index: &JsonIndex, query: &str, use_regex: bool) -> Vec<u32> {
+        super::search(index, query, use_regex, &AtomicBool::new(false)).unwrap()
+    }
+
     fn make_index(json: &str) -> Arc<JsonIndex> {
         let data = json.as_bytes().to_vec();
-        let mut key_arena = Vec::new();
         let (nodes, root, is_ndjson) =
-            parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
+            parse_bytes(&data, &mut |_| {}).unwrap();
         Arc::new(JsonIndex {
             data: crate::index::JsonData::Memory(data),
-            nodes, key_arena, root, is_ndjson,
+            nodes, root, is_ndjson,
         })
     }
 

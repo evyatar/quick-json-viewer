@@ -87,8 +87,7 @@ mod tests {
         assert!(s.contains(r#""signature":"SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c""#), "{s}");
 
         // The produced document must itself be parseable.
-        let mut arena = Vec::new();
-        crate::parser::parse_bytes(&out, &mut arena, &mut |_| {}).expect("valid JSON");
+        crate::parser::parse_bytes(&out, &mut |_| {}).expect("valid JSON");
     }
 
     #[test]

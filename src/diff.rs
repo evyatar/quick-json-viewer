@@ -11,7 +11,6 @@
 //! (list + regex), ignore array order, null == missing, type coercion, and
 //! whitespace trimming.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::index::{JsonIndex, NodeKind};
@@ -234,18 +233,13 @@ impl<'a> Builder<'a> {
         let rc: Vec<u32> = collect_children(right, r)
             .into_iter().filter(|&c| !key_ignored(right, c, opts)).collect();
 
+        let pairing = pair_object_children(left, right, &lc, &rc, opts);
         let mut right_used = vec![false; rc.len()];
         let mut out: Vec<u32> = Vec::new();
         let mut any_changed = false;
 
-        for &lchild in &lc {
-            let lkey = left.key_of(&left.nodes[lchild as usize]);
-            let matched = rc.iter().enumerate().find(|&(ri, &rchild)| {
-                !right_used[ri]
-                    && keys_equal(lkey, right.key_of(&right.nodes[rchild as usize]), opts)
-            }).map(|(ri, &rchild)| (ri, rchild));
-
-            match matched {
+        for (li, &lchild) in lc.iter().enumerate() {
+            match pairing[li] {
                 Some((ri, rchild)) => {
                     right_used[ri] = true;
                     let n = self.build_pair(lchild, rchild, depth, parent);
@@ -340,7 +334,7 @@ impl<'a> Builder<'a> {
 
 fn collect_children(idx: &JsonIndex, n: u32) -> Vec<u32> {
     let mut v = Vec::new();
-    let mut c = idx.nodes[n as usize].first_child;
+    let mut c = idx.first_child(n);
     while c != u32::MAX {
         v.push(c);
         c = idx.nodes[c as usize].next_sibling;
@@ -362,6 +356,38 @@ fn key_ignored(idx: &JsonIndex, n: u32, opts: &DiffOptions) -> bool {
         return true;
     }
     matches!(&opts.ignore_key_pattern, Some(re) if re.is_match(key))
+}
+
+/// Pair object children by key in O(L + R): bucket the right side by
+/// (case-folded) key once instead of rescanning all right children per left
+/// child, and lowercase each key once instead of per comparison. Duplicate
+/// keys pair up in document order, matching the previous first-unused scan.
+/// Returns, per left child, the matched `(right position, right node)`.
+fn pair_object_children(
+    left: &JsonIndex,
+    right: &JsonIndex,
+    lc: &[u32],
+    rc: &[u32],
+    opts: &DiffOptions,
+) -> Vec<Option<(usize, u32)>> {
+    use std::borrow::Cow;
+    use std::collections::{HashMap, VecDeque};
+    fn fold<'a>(idx: &'a JsonIndex, c: u32, ignore_case: bool) -> Cow<'a, str> {
+        let k = idx.key_of(&idx.nodes[c as usize]);
+        if ignore_case { Cow::Owned(k.to_lowercase()) } else { Cow::Borrowed(k) }
+    }
+    let mut buckets: HashMap<Cow<'_, str>, VecDeque<usize>> = HashMap::with_capacity(rc.len());
+    for (ri, &rchild) in rc.iter().enumerate() {
+        buckets.entry(fold(right, rchild, opts.ignore_case)).or_default().push_back(ri);
+    }
+    lc.iter()
+        .map(|&lchild| {
+            buckets
+                .get_mut(fold(left, lchild, opts.ignore_case).as_ref())
+                .and_then(|b| b.pop_front())
+                .map(|ri| (ri, rc[ri]))
+        })
+        .collect()
 }
 
 fn keys_equal(a: &str, b: &str, opts: &DiffOptions) -> bool {
@@ -450,13 +476,10 @@ fn objects_equal(ctx: &EqCtx, l: u32, r: u32) -> bool {
     let rc: Vec<u32> = collect_children(right, r)
         .into_iter().filter(|&c| !key_ignored(right, c, opts)).collect();
 
+    let pairing = pair_object_children(left, right, &lc, &rc, opts);
     let mut right_used = vec![false; rc.len()];
-    for &lchild in &lc {
-        let lkey = left.key_of(&left.nodes[lchild as usize]);
-        let matched = rc.iter().enumerate().find(|&(ri, &rchild)| {
-            !right_used[ri] && keys_equal(lkey, right.key_of(&right.nodes[rchild as usize]), opts)
-        }).map(|(ri, &rchild)| (ri, rchild));
-        match matched {
+    for (li, &lchild) in lc.iter().enumerate() {
+        match pairing[li] {
             Some((ri, rchild)) => {
                 right_used[ri] = true;
                 if !values_equal(ctx, lchild, rchild) {
@@ -611,7 +634,7 @@ fn fp_node(idx: &JsonIndex, n: u32, opts: &DiffOptions, memo: &mut [u64], done: 
             // missing) null-valued keys are dropped so they don't affect the
             // hash — matching `objects_equal`.
             let mut acc: u64 = 0;
-            let mut c = idx.nodes[n as usize].first_child;
+            let mut c = idx.first_child(n);
             while c != u32::MAX {
                 let next = idx.nodes[c as usize].next_sibling;
                 let cnull = idx.nodes[c as usize].kind == NodeKind::Null;
@@ -630,7 +653,7 @@ fn fp_node(idx: &JsonIndex, n: u32, opts: &DiffOptions, memo: &mut [u64], done: 
             mix64(TAG_OBJECT ^ acc)
         }
         NodeKind::Array => {
-            let mut c = idx.nodes[n as usize].first_child;
+            let mut c = idx.first_child(n);
             if opts.ignore_array_order {
                 let mut acc: u64 = 0;
                 let mut count: u64 = 0;
@@ -688,7 +711,7 @@ fn fp_scalar(idx: &JsonIndex, n: u32, opts: &DiffOptions) -> u64 {
 pub fn rebuild_visible_diff(
     root: u32,
     nodes: &[DiffNode],
-    expanded: &HashSet<u32>,
+    expanded: &crate::index::NodeSet,
     only_diffs: bool,
 ) -> Vec<u32> {
     let mut visible: Vec<u32> = Vec::new();
@@ -700,15 +723,15 @@ pub fn rebuild_visible_diff(
         }
         visible.push(idx);
         if expanded.contains(&idx) && node.child_count > 0 {
-            let mut children = Vec::new();
+            // Push children then reverse the pushed range in place, so the
+            // first child pops first — no per-node temp Vec.
+            let mark = stack.len();
             let mut c = node.first_child;
             while c != u32::MAX {
-                children.push(c);
+                stack.push(c);
                 c = nodes[c as usize].next_sibling;
             }
-            for &c in children.iter().rev() {
-                stack.push(c);
-            }
+            stack[mark..].reverse();
         }
     }
     visible
@@ -718,7 +741,7 @@ pub fn rebuild_visible_diff(
 /// `tree::TreeState` but methods take the `DiffResult` as an argument so the
 /// state isn't self-referential (it can live next to the result in app state).
 pub struct DiffTreeState {
-    pub expanded:       HashSet<u32>,
+    pub expanded:       crate::index::NodeSet,
     pub visible:        Vec<u32>,
     pub selected:       Option<u32>,
     pub scroll_to_row:  Option<usize>,
@@ -731,7 +754,7 @@ impl DiffTreeState {
     pub fn new(result: &DiffResult) -> Self {
         // Expand every container that contains a difference so all diffs are
         // visible by default; leave clean subtrees collapsed.
-        let mut expanded = HashSet::new();
+        let mut expanded = crate::index::NodeSet::new();
         expanded.insert(result.root);
         for (i, n) in result.nodes.iter().enumerate() {
             if n.child_count > 0 && n.status != DiffStatus::Unchanged {
@@ -887,10 +910,9 @@ mod tests {
 
     fn idx(json: &str) -> Arc<JsonIndex> {
         let data = json.as_bytes().to_vec();
-        let mut key_arena = Vec::new();
         let (nodes, root, is_ndjson) =
-            crate::parser::parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
-        Arc::new(JsonIndex { data: JsonData::Memory(data), nodes, key_arena, root, is_ndjson })
+            crate::parser::parse_bytes(&data, &mut |_| {}).unwrap();
+        Arc::new(JsonIndex { data: JsonData::Memory(data), nodes, root, is_ndjson })
     }
 
     fn run(l: &str, r: &str, opts: DiffOptions) -> DiffResult {
@@ -1040,12 +1062,12 @@ mod tests {
         let res = run(r#"{"a":1,"b":2,"c":3}"#, r#"{"a":1,"b":9,"c":3}"#, DiffOptions::default());
         // Full tree: root + 3 children.
         let full = rebuild_visible_diff(res.root, &res.nodes, &{
-            let mut e = HashSet::new(); e.insert(res.root); e
+            let mut e = crate::index::NodeSet::new(); e.insert(res.root); e
         }, false);
         assert_eq!(full.len(), 4);
         // Only diffs: root + the single changed child "b".
         let only = rebuild_visible_diff(res.root, &res.nodes, &{
-            let mut e = HashSet::new(); e.insert(res.root); e
+            let mut e = crate::index::NodeSet::new(); e.insert(res.root); e
         }, true);
         assert_eq!(only.len(), 2);
     }

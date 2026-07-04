@@ -32,15 +32,18 @@ impl<'a> Progress<'a> {
 
 pub fn parse_bytes(
     bytes:       &[u8],
-    key_arena:   &mut Vec<u8>,
     progress_cb: &mut dyn FnMut(f32),
 ) -> Result<(Vec<Node>, u32, bool), ParseError> {
     let total = bytes.len();
+    // Node offsets are u32 — see `index::Node`.
+    if total > u32::MAX as usize {
+        return Err(ParseError { offset: 0, msg: "file too large (max 4 GiB)" });
+    }
     let mut prog = Progress { last: 0, total, cb: progress_cb };
     // Pre-allocate based on file size to avoid repeated doubling reallocations.
-    // Empirically, dense JSON produces ~1 node per 16 bytes; key bytes ~1/8 of file.
-    let mut nodes: Vec<Node> = Vec::with_capacity((total / 16).max(64));
-    key_arena.reserve((total / 8).max(64));
+    // Empirically, dense JSON produces ~1 node per 24-45 bytes; shrunk to fit
+    // after parsing.
+    let mut nodes: Vec<Node> = Vec::with_capacity((total / 24).max(64));
 
     let mut pos = 0usize;
     skip_ws(bytes, &mut pos);
@@ -49,14 +52,13 @@ pub fn parse_bytes(
     }
 
     // Parse first top-level value
-    let root = scan_value(bytes, &mut pos, 0, u32::MAX, 0, 0, &mut nodes, key_arena, &mut prog, u32::MAX)?;
+    let root = scan_value(bytes, &mut pos, 0, u32::MAX, 0, 0, &mut nodes, &mut prog, u32::MAX)?;
 
     // Detect NDJSON: remaining non-whitespace after the first value
     skip_ws(bytes, &mut pos);
     if pos < bytes.len() {
         // NDJSON mode — re-parse from scratch
         nodes.clear();
-        key_arena.clear();
         pos = 0;
 
         // Synthetic root Array node
@@ -64,10 +66,9 @@ pub fn parse_bytes(
             kind:         NodeKind::Array,
             depth:        0,
             value_start:  0,
-            value_end:    bytes.len() as u64,
+            value_end:    bytes.len() as u32,
             key_start:    0,
             key_len:      0,
-            first_child:  u32::MAX,
             next_sibling: u32::MAX,
             child_count:  0,
             parent:       u32::MAX,
@@ -84,13 +85,11 @@ pub fn parse_bytes(
 
             let child_idx = scan_value(
                 bytes, &mut pos, 1, root_idx, 0, 0,
-                &mut nodes, key_arena, &mut prog,
+                &mut nodes, &mut prog,
                 child_count,
             )?;
 
-            if prev_child == u32::MAX {
-                nodes[root_idx as usize].first_child = child_idx;
-            } else {
+            if prev_child != u32::MAX {
                 nodes[prev_child as usize].next_sibling = child_idx;
             }
             prev_child = child_idx;
@@ -102,9 +101,11 @@ pub fn parse_bytes(
         }
 
         nodes[root_idx as usize].child_count = child_count;
+        nodes.shrink_to_fit();
         return Ok((nodes, root_idx, true));
     }
 
+    nodes.shrink_to_fit();
     Ok((nodes, root, false))
 }
 
@@ -169,10 +170,9 @@ fn scan_value(
     pos:         &mut usize,
     depth:       u16,
     parent:      u32,
-    key_start:   u32,
+    key_abs:     usize, // absolute source offset of key content (ignored when key_len == 0)
     key_len:     u16,
     nodes:       &mut Vec<Node>,
-    key_arena:   &mut Vec<u8>,
     prog:        &mut Progress<'_>,
     array_index: u32,
 ) -> Result<u32, ParseError> {
@@ -188,13 +188,15 @@ fn scan_value(
     prog.check(*pos);
 
     let own_idx = nodes.len() as u32;
-    let value_start = *pos as u64;
+    let value_start = *pos as u32;
+    // Key is stored as a back-offset from value_start into the source bytes.
+    let key_start = if key_len == 0 { 0 } else { value_start - key_abs as u32 };
 
     match bytes[*pos] {
         b'{' => {
             nodes.push(Node {
                 kind: NodeKind::Object, depth, value_start, value_end: 0,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
             *pos += 1; // skip '{'
@@ -216,9 +218,7 @@ fn scan_value(
                 }
                 // Key
                 let (ks, ke) = scan_string(bytes, pos)?;
-                let k_arena_start = key_arena.len() as u32;
                 let k_len = (ke - ks) as u16;
-                key_arena.extend_from_slice(&bytes[ks..ke]);
                 // Colon
                 skip_ws(bytes, pos);
                 if *pos >= bytes.len() || bytes[*pos] != b':' {
@@ -226,22 +226,20 @@ fn scan_value(
                 }
                 *pos += 1;
                 // Value
-                let child = scan_value(bytes, pos, depth + 1, own_idx, k_arena_start, k_len, nodes, key_arena, prog, u32::MAX)?;
-                if prev_child == u32::MAX {
-                    nodes[own_idx as usize].first_child = child;
-                } else {
+                let child = scan_value(bytes, pos, depth + 1, own_idx, ks, k_len, nodes, prog, u32::MAX)?;
+                if prev_child != u32::MAX {
                     nodes[prev_child as usize].next_sibling = child;
                 }
                 prev_child = child;
                 count += 1;
             }
             nodes[own_idx as usize].child_count = count;
-            nodes[own_idx as usize].value_end = *pos as u64;
+            nodes[own_idx as usize].value_end = *pos as u32;
         }
         b'[' => {
             nodes.push(Node {
                 kind: NodeKind::Array, depth, value_start, value_end: 0,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
             *pos += 1; // skip '['
@@ -261,24 +259,22 @@ fn scan_value(
                     skip_ws(bytes, pos);
                     if *pos < bytes.len() && bytes[*pos] == b']' { *pos += 1; break; } // trailing comma
                 }
-                let child = scan_value(bytes, pos, depth + 1, own_idx, 0, 0, nodes, key_arena, prog, count)?;
-                if prev_child == u32::MAX {
-                    nodes[own_idx as usize].first_child = child;
-                } else {
+                let child = scan_value(bytes, pos, depth + 1, own_idx, 0, 0, nodes, prog, count)?;
+                if prev_child != u32::MAX {
                     nodes[prev_child as usize].next_sibling = child;
                 }
                 prev_child = child;
                 count += 1;
             }
             nodes[own_idx as usize].child_count = count;
-            nodes[own_idx as usize].value_end = *pos as u64;
+            nodes[own_idx as usize].value_end = *pos as u32;
         }
         b'"' => {
             let start = *pos;
             scan_string(bytes, pos)?;
             nodes.push(Node {
-                kind: NodeKind::String, depth, value_start: start as u64, value_end: *pos as u64,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                kind: NodeKind::String, depth, value_start: start as u32, value_end: *pos as u32,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
         }
@@ -287,8 +283,8 @@ fn scan_value(
                 return Err(ParseError { offset: *pos as u64, msg: "invalid literal" });
             }
             nodes.push(Node {
-                kind: NodeKind::Bool, depth, value_start, value_end: *pos as u64,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                kind: NodeKind::Bool, depth, value_start, value_end: *pos as u32,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
         }
@@ -297,8 +293,8 @@ fn scan_value(
                 return Err(ParseError { offset: *pos as u64, msg: "invalid literal" });
             }
             nodes.push(Node {
-                kind: NodeKind::Bool, depth, value_start, value_end: *pos as u64,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                kind: NodeKind::Bool, depth, value_start, value_end: *pos as u32,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
         }
@@ -307,16 +303,16 @@ fn scan_value(
                 return Err(ParseError { offset: *pos as u64, msg: "invalid literal" });
             }
             nodes.push(Node {
-                kind: NodeKind::Null, depth, value_start, value_end: *pos as u64,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                kind: NodeKind::Null, depth, value_start, value_end: *pos as u32,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
         }
         b'0'..=b'9' | b'-' => {
             scan_number(bytes, pos);
             nodes.push(Node {
-                kind: NodeKind::Number, depth, value_start, value_end: *pos as u64,
-                key_start, key_len, first_child: u32::MAX, next_sibling: u32::MAX,
+                kind: NodeKind::Number, depth, value_start, value_end: *pos as u32,
+                key_start, key_len, next_sibling: u32::MAX,
                 child_count: 0, parent, array_index,
             });
         }
@@ -331,16 +327,14 @@ fn scan_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::NodeKind;
+    use crate::index::{first_child, NodeKind};
 
     fn parse(s: &str) -> (Vec<Node>, u32, bool) {
-        let mut ka = Vec::new();
-        parse_bytes(s.as_bytes(), &mut ka, &mut |_| {}).unwrap()
+        parse_bytes(s.as_bytes(), &mut |_| {}).unwrap()
     }
 
     fn parse_err(s: &str) -> ParseError {
-        let mut ka = Vec::new();
-        parse_bytes(s.as_bytes(), &mut ka, &mut |_| {}).unwrap_err()
+        parse_bytes(s.as_bytes(), &mut |_| {}).unwrap_err()
     }
 
     #[test]
@@ -366,13 +360,13 @@ mod tests {
 
     #[test]
     fn object_with_string_value() {
-        let mut ka = Vec::new();
-        let (nodes, root, _) =
-            parse_bytes(b"{\"key\": \"value\"}", &mut ka, &mut |_| {}).unwrap();
+        let input: &[u8] = b"{\"key\": \"value\"}";
+        let (nodes, root, _) = parse_bytes(input, &mut |_| {}).unwrap();
         assert_eq!(nodes[root as usize].child_count, 1);
-        let child = nodes[root as usize].first_child as usize;
-        assert_eq!(nodes[child].kind, NodeKind::String);
-        assert_eq!(&ka[..nodes[child].key_len as usize], b"key");
+        let child = &nodes[first_child(&nodes, root) as usize];
+        assert_eq!(child.kind, NodeKind::String);
+        let ks = (child.value_start - child.key_start) as usize;
+        assert_eq!(&input[ks..ks + child.key_len as usize], b"key");
     }
 
     #[test]
@@ -380,14 +374,14 @@ mod tests {
         let (nodes, root, _) = parse("[1, 2, 3]");
         assert_eq!(nodes[root as usize].kind, NodeKind::Array);
         assert_eq!(nodes[root as usize].child_count, 3);
-        let first = nodes[root as usize].first_child as usize;
+        let first = first_child(&nodes, root) as usize;
         assert_eq!(nodes[first].kind, NodeKind::Number);
     }
 
     #[test]
     fn bool_and_null_values() {
         let (nodes, root, _) = parse("[true, false, null]");
-        let first = nodes[root as usize].first_child as usize;
+        let first = first_child(&nodes, root) as usize;
         assert_eq!(nodes[first].kind, NodeKind::Bool);
         let second = nodes[first].next_sibling as usize;
         assert_eq!(nodes[second].kind, NodeKind::Bool);
@@ -399,7 +393,7 @@ mod tests {
     fn nested_object() {
         let (nodes, root, _) = parse(r#"{"a": {"b": 1}}"#);
         assert_eq!(nodes[root as usize].child_count, 1);
-        let a = nodes[root as usize].first_child as usize;
+        let a = first_child(&nodes, root) as usize;
         assert_eq!(nodes[a].kind, NodeKind::Object);
         assert_eq!(nodes[a].child_count, 1);
     }
@@ -427,7 +421,7 @@ mod tests {
     #[test]
     fn parent_links_are_correct() {
         let (nodes, root, _) = parse(r#"{"a": 1}"#);
-        let child = nodes[root as usize].first_child;
+        let child = first_child(&nodes, root);
         assert_eq!(nodes[child as usize].parent, root);
         assert_eq!(nodes[root as usize].parent, u32::MAX);
     }
@@ -435,7 +429,7 @@ mod tests {
     #[test]
     fn sibling_links_are_correct() {
         let (nodes, root, _) = parse("[1, 2]");
-        let first = nodes[root as usize].first_child;
+        let first = first_child(&nodes, root);
         let second = nodes[first as usize].next_sibling;
         assert_ne!(second, u32::MAX);
         assert_eq!(nodes[second as usize].next_sibling, u32::MAX);
@@ -444,7 +438,7 @@ mod tests {
     #[test]
     fn array_indices_are_zero_based() {
         let (nodes, root, _) = parse("[10, 20, 30]");
-        let mut child = nodes[root as usize].first_child;
+        let mut child = first_child(&nodes, root);
         for expected_idx in 0u32..3 {
             assert_eq!(nodes[child as usize].array_index, expected_idx);
             child = nodes[child as usize].next_sibling;
@@ -469,9 +463,8 @@ mod tests {
     #[test]
     fn value_byte_ranges_are_correct() {
         let input = b"[42]";
-        let mut ka = Vec::new();
-        let (nodes, root, _) = parse_bytes(input, &mut ka, &mut |_| {}).unwrap();
-        let child = nodes[root as usize].first_child as usize;
+        let (nodes, root, _) = parse_bytes(input, &mut |_| {}).unwrap();
+        let child = first_child(&nodes, root) as usize;
         let start = nodes[child].value_start as usize;
         let end = nodes[child].value_end as usize;
         assert_eq!(&input[start..end], b"42");

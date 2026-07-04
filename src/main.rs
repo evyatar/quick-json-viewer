@@ -89,6 +89,20 @@ enum ExportFormat {
     Csv,
 }
 
+/// Completion message from a background export/save write.
+enum BgWriteDone {
+    /// Plain export or save-a-copy — nothing to update on success.
+    Written,
+    /// Overwrite-save finished; apply the post-save state transition.
+    SaveOverwrite {
+        path:       PathBuf,
+        json_len:   u64,
+        structural: bool,
+        /// Overlay as it was at save time — becomes the saved baseline.
+        snapshot:   std::collections::HashMap<u32, export::NodeEdit>,
+    },
+}
+
 impl ExportFormat {
     fn ext(self) -> &'static str {
         match self {
@@ -229,7 +243,13 @@ struct App {
     error_ctx_open: bool,
     tree:           Option<TreeState>,
     search_input:   String,
-    search_pending: Option<std::thread::JoinHandle<Vec<u32>>>,
+    search_pending: Option<std::thread::JoinHandle<Option<Vec<u32>>>>,
+    /// Raised to abort the in-flight search thread (results would be stale).
+    search_cancel:  Arc<std::sync::atomic::AtomicBool>,
+    /// Debounce deadline (egui time) — typing reschedules; the search fires
+    /// only after the input has been quiet briefly, instead of one full
+    /// index scan per keystroke.
+    search_debounce_until: Option<f64>,
     file_info:      Option<FileInfo>,
     focus_search:   bool,
     paste_pending:  bool,
@@ -256,6 +276,14 @@ struct App {
     saved_overlay: std::collections::HashMap<u32, export::NodeEdit>,
     undo_stack:    Vec<UndoAction>,
     redo_stack:    Vec<UndoAction>,
+    /// In-flight background export/save; result polled each frame so large
+    /// documents serialize + write without freezing the UI.
+    bg_write_rx:   Option<std::sync::mpsc::Receiver<Result<BgWriteDone, String>>>,
+    /// (theme, family, size, prefer_dark) last installed into the egui ctx.
+    style_applied: Option<(settings::Theme, settings::FontFamily, f32, bool)>,
+    /// Cached widths of the fixed search-bar chrome, keyed by (font size,
+    /// family): (key, sum of the 5 button glyph widths, magnifier width).
+    search_chrome_cache: Option<((f32, settings::FontFamily), f32, f32)>,
     install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
@@ -272,6 +300,8 @@ impl Default for App {
             tree:           None,
             search_input:   String::new(),
             search_pending: None,
+            search_cancel:  Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            search_debounce_until: None,
             file_info:      None,
             focus_search:    false,
             paste_pending:   false,
@@ -296,6 +326,9 @@ impl Default for App {
             saved_overlay: std::collections::HashMap::new(),
             undo_stack:    Vec::new(),
             redo_stack:    Vec::new(),
+            bg_write_rx:   None,
+            style_applied: None,
+            search_chrome_cache: None,
             install_watcher_rx:   None,
             #[cfg(target_os = "macos")]
             menu_installed: false,
@@ -391,10 +424,16 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // ── 0. Apply settings ──
+        // ── 0. Apply settings — only when they actually changed. Rebuilding
+        // and installing the style every frame clones the whole egui style
+        // and dirties downstream caches for nothing.
         let prefer_dark = ui.ctx().global_style().visuals.dark_mode;
-        self.settings.apply_theme(ui.ctx(), prefer_dark);
-        self.settings.apply_fonts(ui.ctx());
+        let style_key = (self.settings.theme, self.settings.font_family, self.settings.font_size, prefer_dark);
+        if self.style_applied != Some(style_key) {
+            self.style_applied = Some(style_key);
+            self.settings.apply_theme(ui.ctx(), prefer_dark);
+            self.settings.apply_fonts(ui.ctx());
+        }
         // Settings dialog (rendered over everything)
         {
             let open = &mut self.settings_open;
@@ -451,8 +490,9 @@ impl eframe::App for App {
         }
         self.poll_update(ui.ctx());
 
-        // ── 1. Poll background loader ──
-        if let Some(rx) = &self.load_rx {
+        // ── 1. Poll background loader — drain everything queued so progress
+        // messages don't lag one frame behind each.
+        while let Some(rx) = &self.load_rx {
             match rx.try_recv() {
                 Ok(LoadMsg::Progress(p)) => {
                     self.load_progress = p;
@@ -468,11 +508,25 @@ impl eframe::App for App {
                     self.error_ctx_open = false;
                     self.load_rx = None;
                 }
-                Err(_) => {}
+                Err(_) => break,
             }
         }
 
-        // ── 1b. Poll the two Compare-pane loaders + (re)compute the diff ──
+        // ── 1b. Poll background export/save writer ──
+        if let Some(rx) = &self.bg_write_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.bg_write_rx = None;
+                    self.finish_bg_write(res);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.bg_write_rx = None,
+            }
+        }
+
+        // ── 1c. Poll the two Compare-pane loaders + (re)compute the diff ──
         self.poll_pane_loader(Side::Left, ui.ctx());
         self.poll_pane_loader(Side::Right, ui.ctx());
         self.recompute_diff_if_needed();
@@ -487,15 +541,25 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
         }
 
-        // ── 2. Poll background search ──
+        // ── 2. Debounced search kick + poll background search ──
+        if let Some(deadline) = self.search_debounce_until {
+            let now = ui.input(|i| i.time);
+            if now >= deadline {
+                self.search_debounce_until = None;
+                self.kick_search();
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(deadline - now));
+            }
+        }
         let search_done = self
             .search_pending
             .as_ref()
             .map(|h| h.is_finished())
             .unwrap_or(false);
         if search_done {
-            let results = self.search_pending.take().unwrap().join().unwrap_or_default();
-            if let Some(t) = &mut self.tree {
+            // None = the scan was cancelled mid-flight; discard.
+            let results = self.search_pending.take().unwrap().join().ok().flatten();
+            if let (Some(t), Some(results)) = (&mut self.tree, results) {
                 t.set_search_results(results);
             }
         }
@@ -1406,12 +1470,21 @@ impl App {
                         text_w(&format!("{}/{}", t.search_cursor + 1, t.search_results.len())) + gap
                     })
                     .unwrap_or(0.0);
-                let buttons: f32 = [".*", "?", "▲", "▼", "⚙"]
-                    .iter()
-                    .map(|s| text_w(s) + pad + gap)
-                    .sum();
+                // The chrome strings are constant — measure them only when the
+                // font changes instead of 6 layouts per frame.
+                let chrome_key = (font.size, self.settings.font_family);
+                let (buttons_raw, magnifier_w) = match self.search_chrome_cache {
+                    Some((key, b, m)) if key == chrome_key => (b, m),
+                    _ => {
+                        let b: f32 = [".*", "?", "▲", "▼", "⚙"].iter().map(|s| text_w(s)).sum();
+                        let m = text_w("🔍");
+                        self.search_chrome_cache = Some((chrome_key, b, m));
+                        (b, m)
+                    }
+                };
+                let buttons = buttons_raw + 5.0 * (pad + gap);
                 // pill chrome: inner margins, icon, clear button, item gaps, stroke
-                let pill = 16.0 + text_w("🔍") + 4.0 + 16.0 + 4.0 + 2.0;
+                let pill = 16.0 + magnifier_w + 4.0 + 16.0 + 4.0 + 2.0;
                 (ui.available_width() - buttons - counter - pill - gap).clamp(80.0, 260.0)
             };
 
@@ -1449,7 +1522,8 @@ impl App {
                             ui.add(te)
                         };
                         if resp.changed() {
-                            self.kick_search();
+                            // Debounce: don't scan the whole index per keystroke.
+                            self.search_debounce_until = Some(ui.input(|i| i.time) + 0.15);
                         }
                         if self.focus_search {
                             resp.request_focus();
@@ -1569,11 +1643,12 @@ impl App {
 
         let font_size = self.settings.font_size - 1.0;
 
-        let (index, sel, added_items) = {
-            let Some(tree) = &self.tree else { return };
-            let Some(sel) = tree.selected else { return };
-            (Arc::clone(&tree.index), sel, tree.added_items.clone())
-        };
+        // Borrow tree state directly — the closures below never touch
+        // `self.tree` mutably, so no per-frame clone of `added_items` needed.
+        let Some(tree) = &self.tree else { return };
+        let Some(sel) = tree.selected else { return };
+        let index: &index::JsonIndex = &tree.index;
+        let added_items: &[export::AddedItem] = &tree.added_items;
         let nodes_len = index.nodes.len();
 
         // Ancestor chain, root first. A pending (not-yet-saved) added item has
@@ -1807,14 +1882,13 @@ fn value_parts(index: &index::JsonIndex, node: &index::Node, dark: bool) -> (Str
         NodeKind::String => {
             let raw = index.value_bytes(node);
             let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { raw };
-            let chars: Vec<char> = String::from_utf8_lossy(inner).chars().take(501).collect();
-            let s: String = if chars.len() > 500 {
-                let t: String = chars[..500].iter().collect();
-                format!("{}…", t)
-            } else {
-                chars.into_iter().collect()
+            let text = String::from_utf8_lossy(inner);
+            // Truncate to 500 chars by byte position — no Vec<char> collect.
+            let s = match text.char_indices().nth(500) {
+                Some((cut, _)) => format!("\"{}…\"", &text[..cut]),
+                None           => format!("\"{}\"", text),
             };
-            (format!("\"{}\"", s), str_color)
+            (s, str_color)
         }
         NodeKind::Number => {
             let raw = index.value_bytes(node);
@@ -1834,9 +1908,9 @@ fn render_row(
     saved_overlay:    &std::collections::HashMap<u32, export::NodeEdit>,
     index:            &index::JsonIndex,
     added_items:      &[export::AddedItem],
-    expanded:         &std::collections::HashSet<u32>,
+    expanded:         &crate::index::NodeSet,
     selected:         Option<u32>,
-    search_result_set:&std::collections::HashSet<u32>,
+    search_result_set:&crate::index::NodeSet,
     node_idx:         u32,
     row_h:            f32,
     key_font:         egui::FontId,
@@ -1866,7 +1940,6 @@ fn render_row(
             value_end:    0,
             key_start:    0,
             key_len:      0,
-            first_child:  u32::MAX,
             next_sibling: u32::MAX,
             child_count:  0,
             parent:       item.parent,
@@ -1945,22 +2018,24 @@ fn render_row(
     // Pre-compute display strings and key width (needed before allocation in both modes).
     let key_display   = bidi_reorder(&key_text);
     let value_display = bidi_reorder(&value_text);
-    let (key_w, sep_w) = if !key_text.is_empty() {
-        let kw = ui.painter()
-            .layout_no_wrap(key_display.as_ref().to_owned(), key_font.clone(), egui::Color32::BLACK)
-            .rect.width();
-        let sw = ui.painter()
-            .layout_no_wrap(sep_text.to_owned(), key_font.clone(), egui::Color32::BLACK)
-            .rect.width();
-        (kw, sw)
+    // Lay out each text once, with its final color, and reuse the galley for
+    // both width measurement and painting (previously each string was laid
+    // out twice: a throwaway measure pass plus painter.text()).
+    let (key_galley, sep_galley) = if !key_text.is_empty() {
+        (
+            Some(ui.painter().layout_no_wrap(key_display.as_ref().to_owned(), key_font.clone(), key_color)),
+            Some(ui.painter().layout_no_wrap(sep_text.to_owned(), key_font.clone(), sep_color)),
+        )
     } else {
-        (0.0, 0.0)
+        (None, None)
     };
+    let key_w = key_galley.as_ref().map_or(0.0, |g| g.rect.width());
+    let sep_w = sep_galley.as_ref().map_or(0.0, |g| g.rect.width());
 
     // Widen the row so ScrollArea::both() can scroll horizontally.
-    let val_w = ui.painter()
-        .layout_no_wrap(value_display.as_ref().to_owned(), val_font.clone(), egui::Color32::BLACK)
-        .rect.width();
+    let val_galley = ui.painter()
+        .layout_no_wrap(value_display.as_ref().to_owned(), val_font.clone(), value_color);
+    let val_w = val_galley.rect.width();
     let content_w = indent + 18.0 + key_w + sep_w + val_w + 8.0;
     let row_w = content_w.max(ui.available_width());
     let (id, rect) = ui.allocate_space(egui::vec2(row_w, row_h));
@@ -2043,15 +2118,17 @@ fn render_row(
     x += 18.0;
 
     // Key + " : " separator (always single-line, vertically centred in the first band).
-    if !key_text.is_empty() {
-        painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, key_display.as_ref(), key_font.clone(), key_color);
+    if let Some(g) = key_galley {
+        painter.galley(egui::pos2(x, y1 - g.size().y * 0.5), g, key_color);
         x += key_w;
-        painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, sep_text, key_font.clone(), sep_color);
+    }
+    if let Some(g) = sep_galley {
+        painter.galley(egui::pos2(x, y1 - g.size().y * 0.5), g, sep_color);
         x += sep_w;
     }
 
     // Value — single line, vertically centred.
-    painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, value_display.as_ref(), val_font, value_color);
+    painter.galley(egui::pos2(x, y1 - val_galley.size().y * 0.5), val_galley, value_color);
     if has_edit {
         let dot_x = rect.right() - 6.0;
         let dot_y = rect.top() + row_h / 2.0;
@@ -2428,50 +2505,22 @@ impl App {
 // ─── export ──────────────────────────────────────────────────────────────────
 
 impl App {
-    /// Generate the export contents for `scope`/`fmt`, prompt for a save
-    /// location, and write the file. Errors surface in `load_error`.
+    /// Prompt for a save location, then serialize and write the export on a
+    /// background thread (large documents would otherwise freeze the UI).
+    /// Errors surface in `load_error` via `bg_write_rx`.
     fn export(&mut self, scope: ExportScope, fmt: ExportFormat) {
         let Some(tree) = &self.tree else { return };
-        let index = &*tree.index;
-        let empty = std::collections::HashSet::new();
+        let checked: Vec<u32> = tree.checked.iter().copied().collect();
+        if matches!(scope, ExportScope::Selection) && checked.is_empty() {
+            return;
+        }
+        let index = Arc::clone(&tree.index);
 
-        // Resolve the export root + pruning, then render bytes.
-        let (bytes, scope_tag): (Vec<u8>, &str) = match scope {
-            ExportScope::File => {
-                let out = match fmt {
-                    // NDJSON has no enclosing array, so reconstruct one.
-                    ExportFormat::Json if index.is_ndjson => {
-                        export::json_pretty(index, index.root, &empty, None).into_bytes()
-                    }
-                    ExportFormat::Json => export::json_verbatim(index, index.root),
-                    ExportFormat::Csv => export::csv(index, index.root, &empty, None).into_bytes(),
-                };
-                (out, "")
-            }
-            ExportScope::Node(idx) => {
-                let out = match fmt {
-                    ExportFormat::Json => export::json_verbatim(index, idx),
-                    ExportFormat::Csv => export::csv(index, idx, &empty, None).into_bytes(),
-                };
-                (out, "-node")
-            }
-            ExportScope::Selection => {
-                let selected: Vec<u32> = tree.checked.iter().copied().collect();
-                if selected.is_empty() {
-                    return;
-                }
-                let (lca, keep) = export::build_keep_set(index, &selected);
-                let sel: std::collections::HashSet<u32> = selected.into_iter().collect();
-                let out = match fmt {
-                    ExportFormat::Json => {
-                        export::json_pretty(index, lca, &sel, Some(&keep)).into_bytes()
-                    }
-                    ExportFormat::Csv => export::csv(index, lca, &sel, Some(&keep)).into_bytes(),
-                };
-                (out, "-selection")
-            }
+        let scope_tag = match scope {
+            ExportScope::File         => "",
+            ExportScope::Node(_)      => "-node",
+            ExportScope::Selection    => "-selection",
         };
-
         let stem = self
             .file_info
             .as_ref()
@@ -2488,15 +2537,50 @@ impl App {
             ExportFormat::Json => ("JSON", &["json"]),
             ExportFormat::Csv => ("CSV", &["csv"]),
         };
-        if let Some(path) = rfd::FileDialog::new()
+        let Some(path) = rfd::FileDialog::new()
             .add_filter(filter_name, exts)
             .set_file_name(default_name)
             .save_file()
-        {
-            if let Err(e) = std::fs::write(&path, &bytes) {
-                self.load_error = Some(format!("Export failed: {e}"));
-            }
-        }
+        else {
+            return;
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bg_write_rx = Some(rx);
+        std::thread::spawn(move || {
+            let index = &*index;
+            let empty = std::collections::HashSet::new();
+            // Cow: the verbatim-JSON path borrows the mmap'd source directly
+            // instead of copying the whole file into memory.
+            let bytes: std::borrow::Cow<'_, [u8]> = match scope {
+                ExportScope::File => match fmt {
+                    // NDJSON has no enclosing array, so reconstruct one.
+                    ExportFormat::Json if index.is_ndjson => {
+                        export::json_pretty(index, index.root, &empty, None).into_bytes().into()
+                    }
+                    ExportFormat::Json => export::json_verbatim(index, index.root).into(),
+                    ExportFormat::Csv => export::csv(index, index.root, &empty, None).into_bytes().into(),
+                },
+                ExportScope::Node(idx) => match fmt {
+                    ExportFormat::Json => export::json_verbatim(index, idx).into(),
+                    ExportFormat::Csv => export::csv(index, idx, &empty, None).into_bytes().into(),
+                },
+                ExportScope::Selection => {
+                    let (lca, keep) = export::build_keep_set(index, &checked);
+                    let sel: std::collections::HashSet<u32> = checked.into_iter().collect();
+                    match fmt {
+                        ExportFormat::Json => {
+                            export::json_pretty(index, lca, &sel, Some(&keep)).into_bytes().into()
+                        }
+                        ExportFormat::Csv => export::csv(index, lca, &sel, Some(&keep)).into_bytes().into(),
+                    }
+                }
+            };
+            let res = std::fs::write(&path, &bytes)
+                .map(|_| BgWriteDone::Written)
+                .map_err(|e| format!("Export failed: {e}"));
+            let _ = tx.send(res);
+        });
     }
 }
 
@@ -2616,6 +2700,11 @@ impl App {
     }
 
     fn kick_search(&mut self) {
+        // Abort any in-flight scan — its results are stale either way.
+        self.search_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.search_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.search_pending = None;
+        self.search_debounce_until = None;
         if self.search_input.is_empty() {
             if let Some(t) = &mut self.tree {
                 t.set_search_results(Vec::new());
@@ -2626,8 +2715,9 @@ impl App {
             let index     = Arc::clone(&t.index);
             let query     = self.search_input.clone();
             let use_regex = t.search_use_regex;
+            let cancel    = Arc::clone(&self.search_cancel);
             self.search_pending =
-                Some(std::thread::spawn(move || search::search(&index, &query, use_regex)));
+                Some(std::thread::spawn(move || search::search(&index, &query, use_regex, &cancel)));
         }
     }
 }
@@ -2667,6 +2757,7 @@ impl App {
     /// edit invalidates any previously undone redo history).
     fn push_undo(&mut self, node_idx: u32, before: Option<export::NodeEdit>, after: Option<export::NodeEdit>) {
         self.undo_stack.push(UndoAction::Overlay(UndoEntry { node_idx, before, after }));
+        cap_undo(&mut self.undo_stack);
         self.redo_stack.clear();
     }
 
@@ -2674,6 +2765,7 @@ impl App {
     /// this relies on strict LIFO ordering (see `TreeState::remove_last_added_item`).
     fn push_undo_add(&mut self, parent: u32, key: Option<String>, raw_value: String) {
         self.undo_stack.push(UndoAction::Add { parent, key, raw_value });
+        cap_undo(&mut self.undo_stack);
         self.redo_stack.clear();
     }
 
@@ -2851,10 +2943,10 @@ impl App {
     }
 
     /// Save the edited document to a new file chosen via the platform dialog.
+    /// Serialization + write happen on a background thread.
     /// Does not change which file is open or clear the dirty state.
     fn save_copy(&mut self) {
         let Some(tree) = &self.tree else { return };
-        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay, &tree.added_items);
         let stem = self
             .file_info
             .as_ref()
@@ -2866,44 +2958,89 @@ impl App {
             })
             .unwrap_or_else(|| "export".to_owned());
         let default_name = format!("{stem}-copy.json");
-        if let Some(path) = rfd::FileDialog::new()
+        let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name(default_name)
             .save_file()
-        {
-            if let Err(e) = std::fs::write(&path, json.as_bytes()) {
-                self.load_error = Some(format!("Save failed: {e}"));
-            }
-        }
+        else {
+            return;
+        };
+        let index       = Arc::clone(&tree.index);
+        let overlay     = self.edit_overlay.clone();
+        let added_items = tree.added_items.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bg_write_rx = Some(rx);
+        std::thread::spawn(move || {
+            let json = export::json_with_edits(&index, index.root, &overlay, &added_items);
+            let res = std::fs::write(&path, json.as_bytes())
+                .map(|_| BgWriteDone::Written)
+                .map_err(|e| format!("Save failed: {e}"));
+            let _ = tx.send(res);
+        });
     }
 
     /// Overwrite the original file with the edited document. When the overlay
     /// contains deletions, reloads from the new file so deleted nodes
     /// disappear from the tree. For pure key/value edits, keeps the tree in
     /// place and just advances the saved baseline. Only valid for file-backed
-    /// documents (those with a known path).
+    /// documents (those with a known path). Serialization + atomic write run
+    /// on a background thread; the post-save transition happens when
+    /// `bg_write_rx` reports completion.
     fn save_overwrite(&mut self) {
         let Some(path) = self.file_info.as_ref().and_then(|f| f.path.clone()) else { return };
         let Some(tree) = &self.tree else { return };
-        let json = export::json_with_edits(&*tree.index, tree.index.root, &self.edit_overlay, &tree.added_items);
         // Deletions and pending adds both change the node structure, which
-        // only a reparse (below) can reconcile with `edit_overlay`/`selected`/etc.
-        let has_structural_changes =
+        // only a reparse (on completion) can reconcile with `edit_overlay`/`selected`/etc.
+        let structural =
             self.edit_overlay.values().any(|e| e.deleted) || !tree.added_items.is_empty();
-        // Atomic write (temp + rename): never truncate the file the current
-        // index may still be mmap'd against.
-        if let Err(e) = write_atomic(&path, json.as_bytes()) {
-            self.load_error = Some(format!("Save failed: {e}"));
-            return;
-        }
-        if has_structural_changes {
-            // Reload so deleted nodes disappear and added items become real.
-            self.open_file(path);
-        } else {
-            self.saved_overlay = self.edit_overlay.clone();
-            if let Some(f) = &mut self.file_info {
-                f.size_bytes = json.len() as u64;
+        let index       = Arc::clone(&tree.index);
+        let overlay     = self.edit_overlay.clone();
+        let added_items = tree.added_items.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bg_write_rx = Some(rx);
+        std::thread::spawn(move || {
+            let json = export::json_with_edits(&index, index.root, &overlay, &added_items);
+            // Atomic write (temp + rename): never truncate the file the current
+            // index may still be mmap'd against.
+            let res = write_atomic(&path, json.as_bytes())
+                .map(|_| BgWriteDone::SaveOverwrite {
+                    path,
+                    json_len: json.len() as u64,
+                    structural,
+                    snapshot: overlay,
+                })
+                .map_err(|e| format!("Save failed: {e}"));
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Apply the state transition for a completed background export/save.
+    fn finish_bg_write(&mut self, res: Result<BgWriteDone, String>) {
+        match res {
+            Ok(BgWriteDone::Written) => {}
+            Ok(BgWriteDone::SaveOverwrite { path, json_len, structural, snapshot }) => {
+                if structural {
+                    // Reload so deleted nodes disappear and added items
+                    // become real.
+                    self.open_file(path);
+                } else {
+                    self.saved_overlay = snapshot;
+                    if let Some(f) = &mut self.file_info {
+                        f.size_bytes = json_len;
+                    }
+                }
             }
+            Err(e) => self.load_error = Some(e),
+        }
+    }
+
+    /// Test-only: block until an in-flight background write finishes and
+    /// apply its result (the UI does this by polling in `update`).
+    #[cfg(test)]
+    fn wait_bg_write(&mut self) {
+        if let Some(rx) = self.bg_write_rx.take() {
+            let res = rx.recv().expect("background write thread died");
+            self.finish_bg_write(res);
         }
     }
 
@@ -3085,6 +3222,16 @@ impl App {
 
 /// Write `bytes` to `path` atomically (sibling temp file + rename) so that an
 /// existing memory map of `path` is never truncated out from under the app.
+/// Bound undo history so marathon editing sessions can't grow memory without
+/// limit. Oldest entries fall off first.
+fn cap_undo(stack: &mut Vec<UndoAction>) {
+    const UNDO_CAP: usize = 1000;
+    if stack.len() > UNDO_CAP {
+        let excess = stack.len() - UNDO_CAP;
+        stack.drain(..excess);
+    }
+}
+
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let file_name = path
@@ -3591,7 +3738,7 @@ fn render_diff_row(
     left:      &index::JsonIndex,
     right:     &index::JsonIndex,
     nodes:     &[diff::DiffNode],
-    expanded:  &std::collections::HashSet<u32>,
+    expanded:  &crate::index::NodeSet,
     selected:  Option<u32>,
     node_idx:  u32,
     row_h:     f32,
@@ -3761,14 +3908,18 @@ fn draw_diff_cell(
     x += 18.0;
 
     if !key_text.is_empty() {
-        let kw = painter.layout_no_wrap(key_display.as_ref().to_owned(), key_font.clone(), egui::Color32::BLACK).rect.width();
-        painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, key_display.as_ref(), key_font.clone(), key_color);
+        // Single layout per text: the galley measures and paints.
+        let kg = painter.layout_no_wrap(key_display.as_ref().to_owned(), key_font.clone(), key_color);
+        let kw = kg.rect.width();
+        painter.galley(egui::pos2(x, y1 - kg.size().y * 0.5), kg, key_color);
         x += kw;
-        let sw = painter.layout_no_wrap(sep_text.to_owned(), key_font.clone(), egui::Color32::BLACK).rect.width();
-        painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, sep_text, key_font.clone(), sep_color);
+        let sg = painter.layout_no_wrap(sep_text.to_owned(), key_font.clone(), sep_color);
+        let sw = sg.rect.width();
+        painter.galley(egui::pos2(x, y1 - sg.size().y * 0.5), sg, sep_color);
         x += sw;
     }
-    painter.text(egui::pos2(x, y1), egui::Align2::LEFT_CENTER, value_display.as_ref(), val_font.clone(), value_color);
+    let vg = painter.layout_no_wrap(value_display.as_ref().to_owned(), val_font.clone(), value_color);
+    painter.galley(egui::pos2(x, y1 - vg.size().y * 0.5), vg, value_color);
 
     caret_rect
 }
@@ -3810,13 +3961,11 @@ mod edit_tests {
 
     fn make_tree(json: &str) -> Arc<JsonIndex> {
         let data = json.as_bytes().to_vec();
-        let mut key_arena = Vec::new();
         let (nodes, root, is_ndjson) =
-            crate::parser::parse_bytes(&data, &mut key_arena, &mut |_| {}).unwrap();
+            crate::parser::parse_bytes(&data, &mut |_| {}).unwrap();
         Arc::new(JsonIndex {
             data: JsonData::Memory(data),
             nodes,
-            key_arena,
             root,
             is_ndjson,
         })
@@ -3826,8 +3975,7 @@ mod edit_tests {
     fn nav(index: &JsonIndex, path: &[&str]) -> u32 {
         let mut cur = index.root;
         for seg in path {
-            let node = &index.nodes[cur as usize];
-            let mut c = node.first_child;
+            let mut c = index.first_child(cur);
             let mut found = None;
             while c != u32::MAX {
                 let cn = &index.nodes[c as usize];
@@ -3976,6 +4124,7 @@ mod edit_tests {
         assert!(app.is_dirty());
 
         app.save_overwrite();
+        app.wait_bg_write();
         assert!(!app.is_dirty(), "overwrite must clear the dirty state");
 
         let on_disk: serde_json::Value =
@@ -3997,6 +4146,7 @@ mod edit_tests {
         app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
         app.commit_edit();
         app.save_overwrite();
+        app.wait_bg_write();
         assert!(!app.is_dirty());
 
         app.start_edit(age, EditField::Value);
@@ -4008,6 +4158,7 @@ mod edit_tests {
         assert_ne!(app.edit_overlay.get(&age), app.saved_overlay.get(&age));
 
         app.save_overwrite();
+        app.wait_bg_write();
         let on_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk, serde_json::json!({"name": "Bob", "age": 31}));
@@ -4023,6 +4174,7 @@ mod edit_tests {
         app.editing_node.as_mut().unwrap().text = "Bob".to_owned();
         app.commit_edit();
         app.save_overwrite(); // baseline = {name: "Bob"}
+        app.wait_bg_write();
 
         app.start_edit(name, EditField::Value);
         app.editing_node.as_mut().unwrap().text = "Carol".to_owned();
@@ -4097,6 +4249,7 @@ mod edit_tests {
         app.commit_add_item();
 
         app.save_overwrite();
+        app.wait_bg_write();
         let on_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk, serde_json::json!([1, 2, 3]));
