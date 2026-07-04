@@ -28,17 +28,7 @@ fn bidi_reorder(s: &str) -> std::borrow::Cow<'_, str> {
     use unicode_bidi::BidiInfo;
 
     // Fast path: skip the allocation when there are no RTL characters at all.
-    if s.chars().all(|c| {
-        let cat = unicode_bidi::bidi_class(c);
-        !matches!(
-            cat,
-            unicode_bidi::BidiClass::R
-                | unicode_bidi::BidiClass::AL
-                | unicode_bidi::BidiClass::RLE
-                | unicode_bidi::BidiClass::RLO
-                | unicode_bidi::BidiClass::RLI
-        )
-    }) {
+    if !contains_rtl(s) {
         return std::borrow::Cow::Borrowed(s);
     }
 
@@ -51,6 +41,21 @@ fn bidi_reorder(s: &str) -> std::borrow::Cow<'_, str> {
     let para = &bidi.paragraphs[0];
     let line = 0..s.len();
     std::borrow::Cow::Owned(bidi.reorder_line(para, line).into_owned())
+}
+
+/// True if the string contains any strongly right-to-left character
+/// (Hebrew, Arabic, or an explicit RTL control).
+fn contains_rtl(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            unicode_bidi::bidi_class(c),
+            unicode_bidi::BidiClass::R
+                | unicode_bidi::BidiClass::AL
+                | unicode_bidi::BidiClass::RLE
+                | unicode_bidi::BidiClass::RLO
+                | unicode_bidi::BidiClass::RLI
+        )
+    })
 }
 
 use loader::LoadMsg;
@@ -3082,9 +3087,28 @@ impl App {
                 ui.label(egui::RichText::new(path.as_str()).monospace().small().color(pal.text_muted));
                 ui.add_space(4.0);
 
-                let te = egui::TextEdit::singleline(&mut state.text)
+                // egui does not reorder bidi text, so Hebrew would render
+                // backwards and left-aligned. When (and only when) the text
+                // contains RTL characters, lay it out in visual order and
+                // right-align it; pure-LTR values take the default path.
+                let has_rtl = contains_rtl(&state.text);
+                let mut rtl_layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+                    let visual = bidi_reorder(buf.as_str()).into_owned();
+                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        visual,
+                        font_id,
+                        ui.visuals().text_color(),
+                    );
+                    job.halign = egui::Align::RIGHT;
+                    ui.fonts_mut(|f| f.layout_job(job))
+                };
+                let mut te = egui::TextEdit::singleline(&mut state.text)
                     .desired_width(340.0)
                     .font(egui::TextStyle::Monospace);
+                if has_rtl {
+                    te = te.horizontal_align(egui::Align::RIGHT).layouter(&mut rtl_layouter);
+                }
                 let resp = ui.add(te);
 
                 if state.focus_requested {
