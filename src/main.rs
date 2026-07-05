@@ -888,11 +888,11 @@ impl App {
                 let has_tree = self.tree.is_some();
                 ui.add_enabled_ui(has_tree, |ui| {
                     ui.menu_button("Export File", |ui| {
-                        if ui.button("As JSON…").clicked() {
+                        if ui.button("As JSON").clicked() {
                             ui.close();
                             self.export(ExportScope::File, ExportFormat::Json);
                         }
-                        if ui.button("As CSV…").clicked() {
+                        if ui.button("As CSV").clicked() {
                             ui.close();
                             self.export(ExportScope::File, ExportFormat::Csv);
                         }
@@ -908,7 +908,7 @@ impl App {
                     }
                 });
                 ui.add_enabled_ui(dirty, |ui| {
-                    if ui.add(egui::Button::new("Save a Copy…").shortcut_text("⇧⌘S")).clicked() {
+                    if ui.add(egui::Button::new("Save a Copy").shortcut_text("⇧⌘S")).clicked() {
                         ui.close();
                         self.save_copy();
                     }
@@ -984,8 +984,17 @@ impl App {
             .show(ctx, |ui| {
                 ui.add_space(6.0);
 
+                let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
+
                 let row = |ui: &mut egui::Ui, key: &str, desc: &str| {
-                    ui.label(egui::RichText::new(key).monospace().strong());
+                    ui.horizontal(|ui| {
+                        for (i, cap) in key.split(" / ").enumerate() {
+                            if i > 0 {
+                                ui.label(egui::RichText::new("/").color(pal.text_muted));
+                            }
+                            Self::keycap(ui, &pal, cap);
+                        }
+                    });
                     ui.label(desc);
                     ui.end_row();
                 };
@@ -1007,7 +1016,7 @@ impl App {
                     .show(ui, |ui| {
                         section(ui, "File");
                         row(ui, "⌘ O",       "Open file");
-                        row(ui, "⌘ L",       "Open URL…");
+                        row(ui, "⌘ L",       "Open URL");
                         row(ui, "⌘ V",       "Paste JSON / JWT / curl from clipboard");
                         row(ui, "⌘ ,",       "Settings");
 
@@ -1033,7 +1042,7 @@ impl App {
                         row(ui, "⌘ Z",           "Undo");
                         row(ui, "⇧ ⌘ Z",         "Redo");
                         row(ui, "⌘ S",           "Save (overwrite original)");
-                        row(ui, "⇧ ⌘ S",         "Save a Copy…");
+                        row(ui, "⇧ ⌘ S",         "Save a Copy");
                     });
 
                 ui.add_space(8.0);
@@ -1440,7 +1449,7 @@ impl App {
 
     fn viewer_toolbar(&mut self, ui: &mut egui::Ui) {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
-        if ui.button("Open File  ⌘O").clicked() {
+        if ui.button("Open File").clicked() {
             self.open_file_dialog();
         }
         if let Some(tree) = &mut self.tree {
@@ -1518,7 +1527,7 @@ impl App {
                                 ui.painter().layout_job(job)
                             };
                             let te = egui::TextEdit::singleline(&mut self.search_input)
-                                .hint_text("Search…  (key:id, age > 30)")
+                                .hint_text("Search… (age > 30)")
                                 .desired_width(search_width)
                                 .frame(egui::Frame::NONE)
                                 .layouter(&mut layouter);
@@ -1752,20 +1761,112 @@ impl App {
 
 // ─── tree panel ──────────────────────────────────────────────────────────────
 
+/// One feature tip is shown per launch, rotating with each start.
+const EMPTY_STATE_TIPS: &[&str] = &[
+    "Search understands filters — try  status = active  or  price > 100  in the search box.",
+    "Paste a curl command with ⌘V and the response opens as a tree.",
+    "Paste a JWT with ⌘V to decode its header and payload instantly.",
+    "Double-click any value to edit it in place, then ⌘S to save.",
+    "Right-click a row to copy its path, key, value — or export it as code.",
+    "⌥C collapses the whole tree, ⌥X expands it back.",
+    "The Compare view diffs two JSON documents side by side.",
+    "Search with ⌘F, then Enter / ⌘G jumps between results.",
+];
+
 impl App {
-    fn tree_panel(&mut self, ui: &mut egui::Ui) {
-        if self.tree.is_none() {
-            ui.centered_and_justified(|ui| {
-                if self.load_rx.is_some() {
-                    ui.spinner();
-                } else {
-                    let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
-                    ui.label(
-                        egui::RichText::new("Open a JSON file to get started\n(⌘O, ⌘L for a URL, drag-and-drop, or ⌘V to paste JSON / JWT / curl)")
-                            .color(pal.text_muted),
+    /// Keycap-styled chip for a keyboard shortcut, so the ⌘ glyph and the
+    /// letter read as one unit instead of mismatched font sizes.
+    fn keycap(ui: &mut egui::Ui, pal: &theme::Palette, text: &str) {
+        egui::Frame::new()
+            .fill(pal.bg_search)
+            .stroke(egui::Stroke::new(1.0, pal.border))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(7, 2))
+            .show(ui, |ui| {
+                // The ⌘/⇧/⌥… glyphs come from the Apple Symbols fallback,
+                // which draws larger than the monospace letters at equal point
+                // size — size the symbol runs down a notch to visually match.
+                let is_symbol = |c: char| !c.is_ascii();
+                let mut job = egui::text::LayoutJob::default();
+                let chars: Vec<char> = text.chars().collect();
+                for chunk in chars.chunk_by(|a, b| is_symbol(*a) == is_symbol(*b)) {
+                    job.append(
+                        &chunk.iter().collect::<String>(),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(if is_symbol(chunk[0]) { 10.5 } else { 12.0 }),
+                            color: pal.text_primary,
+                            valign: egui::Align::Center,
+                            ..Default::default()
+                        },
                     );
                 }
+                ui.label(job);
             });
+    }
+
+    fn empty_state(ui: &mut egui::Ui) {
+        let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
+
+        // Pick a tip once per launch so it doesn't flicker between frames.
+        static TIP_IDX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let tip = EMPTY_STATE_TIPS[*TIP_IDX.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as usize)
+                .unwrap_or(0)
+                % EMPTY_STATE_TIPS.len()
+        })];
+
+        let avail = ui.available_height();
+        ui.add_space((avail / 2.0 - 130.0).max(24.0));
+
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("{ }").monospace().size(34.0).color(pal.text_faint));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Open a JSON file to get started").size(17.0).color(pal.text_primary));
+            ui.add_space(20.0);
+
+            // A Grid always sits at the left edge of its parent, so indent it
+            // by hand to keep the option list visually centered.
+            let grid_w = 400.0;
+            let indent = ((ui.available_width() - grid_w) / 2.0).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+            egui::Grid::new("empty_state_options")
+                .num_columns(2)
+                .spacing([14.0, 10.0])
+                .show(ui, |ui| {
+                    let mut row = |cap: &str, desc: &str| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            Self::keycap(ui, &pal, cap);
+                        });
+                        ui.label(egui::RichText::new(desc).color(pal.text_muted));
+                        ui.end_row();
+                    };
+                    row("⌘ O", "Open a file");
+                    row("⌘ L", "Fetch JSON from a URL");
+                    row("⌘ V", "Paste JSON, a JWT, or a curl command");
+                    row("drop", "Drag a file anywhere in this window");
+                });
+            });
+
+            ui.add_space(26.0);
+            ui.label(
+                egui::RichText::new(format!("Tip:  {tip}"))
+                    .size(12.0)
+                    .color(pal.text_faint),
+            );
+        });
+    }
+
+    fn tree_panel(&mut self, ui: &mut egui::Ui) {
+        if self.tree.is_none() {
+            if self.load_rx.is_some() {
+                ui.centered_and_justified(|ui| { ui.spinner(); });
+            } else {
+                Self::empty_state(ui);
+            }
             return;
         }
 
@@ -2315,11 +2416,11 @@ fn render_row(
             // When the multi-selection is non-empty, offer to export it (pruned
             // to the closest common ancestor); otherwise export this node.
             if any_checked {
-                if ui.button("Selected nodes as JSON…").clicked() {
+                if ui.button("Selected nodes as JSON").clicked() {
                     actions.push(RowAction::Export(ExportScope::Selection, ExportFormat::Json));
                     ui.close();
                 }
-                if ui.button("Selected nodes as CSV…").clicked() {
+                if ui.button("Selected nodes as CSV").clicked() {
                     actions.push(RowAction::Export(ExportScope::Selection, ExportFormat::Csv));
                     ui.close();
                 }
@@ -2328,21 +2429,21 @@ fn render_row(
             // Pending added items aren't real tree nodes, so per-node export
             // doesn't apply to them.
             if !is_new {
-                if ui.button("This node as JSON…").clicked() {
+                if ui.button("This node as JSON").clicked() {
                     actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Json));
                     ui.close();
                 }
-                if ui.button("This node as CSV…").clicked() {
+                if ui.button("This node as CSV").clicked() {
                     actions.push(RowAction::Export(ExportScope::Node(node_idx), ExportFormat::Csv));
                     ui.close();
                 }
                 ui.separator();
             }
-            if ui.button("Whole file as JSON…").clicked() {
+            if ui.button("Whole file as JSON").clicked() {
                 actions.push(RowAction::Export(ExportScope::File, ExportFormat::Json));
                 ui.close();
             }
-            if ui.button("Whole file as CSV…").clicked() {
+            if ui.button("Whole file as CSV").clicked() {
                 actions.push(RowAction::Export(ExportScope::File, ExportFormat::Csv));
                 ui.close();
             }
@@ -2462,7 +2563,7 @@ impl App {
                         if can_over {
                             ui.add_space(6.0);
                             if ui
-                                .button(egui::RichText::new("Save a Copy…").small().color(pal.text_muted))
+                                .button(egui::RichText::new("Save a Copy").small().color(pal.text_muted))
                                 .on_hover_text("Save the edited JSON to a new file")
                                 .clicked()
                             {
@@ -3614,7 +3715,7 @@ impl App {
         // click anywhere on the header (the area not covered by the Open / Paste
         // buttons, which are drawn on top and keep their own clicks) activates
         // the pane. The buttons are laid out inside via a child UI.
-        let margin = egui::vec2(8.0, 4.0);
+        let margin = egui::vec2(12.0, 10.0);
         let height = ui.spacing().interact_size.y + 2.0 * margin.y;
         let (rect, bg) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
@@ -3680,11 +3781,49 @@ impl App {
         let both = self.compare.left.index.is_some() && self.compare.right.index.is_some();
         if !both {
             let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new("Load JSON into both panes to compare.\nClick a pane, then ⌘O to open or ⌘V to paste.")
-                        .color(pal.text_muted),
-                );
+
+            // Clicking the empty area below a header selects that pane, same
+            // as clicking the header itself.
+            let area = ui.available_rect_before_wrap();
+            let (left_rect, right_rect) = area.split_left_right_at_x(area.center().x);
+            for (rect, side) in [(left_rect, Side::Left), (right_rect, Side::Right)] {
+                if ui.interact(rect, ui.id().with(("compare_empty_click", side as u8)), egui::Sense::click()).clicked() {
+                    self.compare.active_pane = side;
+                }
+            }
+
+            let avail = ui.available_height();
+            ui.add_space((avail / 2.0 - 90.0).max(24.0));
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("{ } ⇄ { }").monospace().size(28.0).color(pal.text_faint));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Load JSON into both panes to compare").size(17.0).color(pal.text_primary));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Click a pane, then:").color(pal.text_muted));
+                ui.add_space(14.0);
+
+                // A Grid always sits at the left edge of its parent, so indent
+                // it by hand to keep the option list visually centered.
+                let grid_w = 300.0;
+                let indent = ((ui.available_width() - grid_w) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(indent);
+                    egui::Grid::new("compare_empty_options")
+                        .num_columns(2)
+                        .spacing([14.0, 10.0])
+                        .show(ui, |ui| {
+                            let mut row = |cap: &str, desc: &str| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    Self::keycap(ui, &pal, cap);
+                                });
+                                ui.label(egui::RichText::new(desc).color(pal.text_muted));
+                                ui.end_row();
+                            };
+                            row("⌘ O", "Open a file");
+                            row("⌘ V", "Paste from clipboard");
+                            row("drop", "Drag a file onto the pane");
+                        });
+                });
             });
             return;
         }
