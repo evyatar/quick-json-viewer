@@ -32,8 +32,8 @@ impl ProviderKind {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            ProviderKind::Anthropic => "claude-opus-4-8",
-            ProviderKind::OpenAiCompatible => "gpt-4o",
+            ProviderKind::Anthropic => "claude-sonnet-5",
+            ProviderKind::OpenAiCompatible => "gpt-5.4",
         }
     }
 }
