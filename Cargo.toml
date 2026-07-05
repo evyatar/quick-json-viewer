@@ -15,7 +15,7 @@ regex         = "1"
 rfd           = "0.17"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
-ureq          = { version = "2", features = ["tls"] }
+ureq          = { version = "2", features = ["tls", "json"] }
 unicode-bidi  = "0.3"
 image         = { version = "0.25", default-features = false, features = ["png"] }
 

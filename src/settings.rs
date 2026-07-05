@@ -81,6 +81,19 @@ pub struct Settings {
     /// for this version but reappears once a newer one is published.
     #[serde(default)]
     pub dismissed_update: Option<String>,
+    /// Master switch for the AI assistant (BYOK). Off by default — the AI
+    /// button, panel, and any network calls to LLM providers are disabled
+    /// until the user turns this on in Settings.
+    #[serde(default)]
+    pub ai_enabled: bool,
+    #[serde(default)]
+    pub ai_provider: crate::ai::provider::ProviderKind,
+    /// Model name; empty = the provider's default.
+    #[serde(default)]
+    pub ai_model: String,
+    /// Base URL override; empty = the provider's default endpoint.
+    #[serde(default)]
+    pub ai_base_url: String,
 }
 
 impl Default for Settings {
@@ -93,6 +106,10 @@ impl Default for Settings {
             show_breadcrumbs: true,
             copy_compact_json: false,
             dismissed_update: None,
+            ai_enabled: false,
+            ai_provider: crate::ai::provider::ProviderKind::default(),
+            ai_model: String::new(),
+            ai_base_url: String::new(),
         }
     }
 }
@@ -189,6 +206,7 @@ pub fn show_settings_window(
     settings: &mut Settings,
     ctx: &egui::Context,
     open: &mut bool,
+    ai_ui: &mut crate::ai::panel::AiSettingsUi,
 ) {
     egui::Window::new("⚙  Settings")
         .open(open)
@@ -294,6 +312,13 @@ pub fn show_settings_window(
                         .on_hover_text("\"Copy Value\" copies minified JSON instead of its original formatting");
                     ui.end_row();
                 });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(12.0);
+
+            // ── AI assistant (BYOK) ──────────────────────────────────────────
+            crate::ai::panel::settings_section(ui, settings, ai_ui);
 
             ui.add_space(12.0);
             ui.separator();
