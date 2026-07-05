@@ -1,3 +1,4 @@
+mod ai;
 mod codegen;
 mod diff;
 mod export;
@@ -150,12 +151,15 @@ struct UndoEntry {
     after:    Option<export::NodeEdit>,
 }
 
-/// One entry on the undo/redo stack: either an `edit_overlay` change, or the
-/// addition of a pending array item / object property (see `TreeState::add_item`).
+/// One entry on the undo/redo stack: either an `edit_overlay` change, the
+/// addition of a pending array item / object property (see `TreeState::add_item`),
+/// or a batch of overlay changes applied together (an AI changeset) that
+/// undoes/redoes as one unit.
 #[derive(Clone)]
 enum UndoAction {
     Overlay(UndoEntry),
     Add { parent: u32, key: Option<String>, raw_value: String },
+    Batch(Vec<UndoEntry>),
 }
 
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
@@ -292,6 +296,10 @@ struct App {
     /// family): (key, sum of the 5 button glyph widths, magnifier width).
     search_chrome_cache: Option<((f32, settings::FontFamily), f32, f32)>,
     install_watcher_rx:   Option<std::sync::mpsc::Receiver<update::UpdateMsg>>,
+    /// BYOK AI assistant panel (chat state, in-flight turn, pending changeset).
+    ai:             ai::panel::AiPanelState,
+    /// Transient UI state for the settings window's AI section (key buffer).
+    ai_settings_ui: ai::panel::AiSettingsUi,
     #[cfg(target_os = "macos")]
     menu_installed: bool,
 }
@@ -337,6 +345,8 @@ impl Default for App {
             style_applied: None,
             search_chrome_cache: None,
             install_watcher_rx:   None,
+            ai:             ai::panel::AiPanelState::default(),
+            ai_settings_ui: ai::panel::AiSettingsUi::default(),
             #[cfg(target_os = "macos")]
             menu_installed: false,
         }
@@ -497,7 +507,7 @@ impl eframe::App for App {
         {
             let open = &mut self.settings_open;
             let settings = &mut self.settings;
-            show_settings_window(settings, ui.ctx(), open);
+            show_settings_window(settings, ui.ctx(), open, &mut self.ai_settings_ui);
         }
         self.show_help_window(ui.ctx());
         self.show_search_help_window(ui.ctx());
@@ -584,6 +594,9 @@ impl eframe::App for App {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.bg_write_rx = None,
             }
         }
+
+        // ── 1b². Poll the AI assistant's background turn ──
+        self.ai.poll(ui.ctx());
 
         // ── 1c. Poll the two Compare-pane loaders + (re)compute the diff ──
         self.poll_pane_loader(Side::Left, ui.ctx());
@@ -912,6 +925,33 @@ impl eframe::App for App {
             Some(SaveAction::Overwrite) => self.save_overwrite(),
             Some(SaveAction::Copy)      => self.save_copy(),
             None => {}
+        }
+
+        // ── AI assistant side panel (Viewer mode, opt-in via Settings) ──
+        if self.mode == AppMode::Viewer && self.settings.ai_enabled && self.ai.open {
+            let mut apply_edits = None;
+            egui::Panel::right("ai_panel")
+                .resizable(true)
+                .default_size(360.0)
+                .size_range(260.0..=780.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(pal.bg_panel)
+                        .inner_margin(egui::Margin::symmetric(10, 0)),
+                )
+                .show_inside(ui, |ui| {
+                    let index = self.tree.as_ref().map(|t| &t.index);
+                    let file_name = self
+                        .file_info
+                        .as_ref()
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("document.json");
+                    apply_edits =
+                        ai::panel::show(&mut self.ai, ui, &self.settings, index, file_name);
+                });
+            if let Some(edits) = apply_edits {
+                self.apply_ai_edits(edits);
+            }
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -1487,6 +1527,12 @@ impl App {
                 tree.set_multi_select(on);
             }
             resp.on_hover_text("Multi-select mode — check rows, then right-click → Export");
+        }
+        if self.settings.ai_enabled {
+            let resp = tab_button(ui, &pal, egui::RichText::new("✨ AI").strong(), self.ai.open);
+            if resp.on_hover_text("AI assistant — query and edit with your own API key").clicked() {
+                self.ai.open = !self.ai.open;
+            }
         }
         ui.add_space(8.0);
 
@@ -2968,6 +3014,14 @@ impl App {
                     tree.remove_last_added_item();
                 }
             }
+            UndoAction::Batch(entries) => {
+                for entry in entries.iter().rev() {
+                    match &entry.before {
+                        Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
+                        None       => { self.edit_overlay.remove(&entry.node_idx); }
+                    }
+                }
+            }
         }
         self.editing_node = None;
         self.redo_stack.push(action);
@@ -2986,6 +3040,14 @@ impl App {
             UndoAction::Add { parent, key, raw_value } => {
                 if let Some(tree) = &mut self.tree {
                     tree.add_item(*parent, key.clone(), raw_value.clone());
+                }
+            }
+            UndoAction::Batch(entries) => {
+                for entry in entries {
+                    match &entry.after {
+                        Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
+                        None       => { self.edit_overlay.remove(&entry.node_idx); }
+                    }
                 }
             }
         }
@@ -3116,6 +3178,45 @@ impl App {
         }
         let after = self.edit_overlay.get(&state.node_idx).cloned();
         self.push_undo(state.node_idx, before, after);
+    }
+
+    /// Apply an AI-reviewed changeset through the edit overlay so dirty
+    /// tracking, saving, and undo/redo all work exactly as for manual edits.
+    /// Paths are re-resolved at apply time (the index may have been reloaded
+    /// since the proposal was made); the whole set is one undo unit.
+    fn apply_ai_edits(&mut self, edits: Vec<ai::ProposedEdit>) {
+        let Some(tree) = &self.tree else { return };
+        let index = Arc::clone(&tree.index);
+        let mut entries: Vec<UndoEntry> = Vec::new();
+        let mut failed = 0usize;
+        for edit in &edits {
+            let node_idx = match ai::tools::resolve_path(&index, &edit.path) {
+                Ok(n) => n,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let before = self.edit_overlay.get(&node_idx).cloned();
+            let entry = self.edit_overlay.entry(node_idx).or_default();
+            match &edit.action {
+                ai::EditAction::SetValue(v)  => entry.value_override = Some(v.clone()),
+                ai::EditAction::RenameKey(k) => entry.key_override = Some(k.clone()),
+                ai::EditAction::Delete       => entry.deleted = true,
+            }
+            let after = self.edit_overlay.get(&node_idx).cloned();
+            entries.push(UndoEntry { node_idx, before, after });
+        }
+        if !entries.is_empty() {
+            self.undo_stack.push(UndoAction::Batch(entries));
+            cap_undo(&mut self.undo_stack);
+            self.redo_stack.clear();
+        }
+        if failed > 0 {
+            self.ai.note(format!(
+                "{failed} edit(s) could not be applied — their paths no longer resolve."
+            ));
+        }
     }
 
     /// Save the edited document to a new file chosen via the platform dialog.
