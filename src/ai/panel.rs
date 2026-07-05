@@ -121,7 +121,7 @@ pub fn settings_section(ui: &mut egui::Ui, settings: &mut Settings, state: &mut 
         {
             state.key_status = Some(
                 keystore::set_key(kind.key_account(), state.key_input.trim())
-                    .map(|_| "✓ Saved to Keychain"),
+                    .map(|_| "Saved to Keychain"),
             );
             state.key_input.clear();
             state.invalidate();

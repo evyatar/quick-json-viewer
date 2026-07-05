@@ -334,8 +334,8 @@ pub fn show_settings_window(
                     SET_DEFAULT_STATUS.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
                 }
                 match SET_DEFAULT_STATUS.load(Ordering::Relaxed) {
-                    1 => { ui.colored_label(egui::Color32::from_rgb(52, 199, 89), "✓ Set as default"); }
-                    2 => { ui.colored_label(egui::Color32::from_rgb(255, 69, 58), "✗ Failed — run from .app bundle"); }
+                    1 => { ui.colored_label(egui::Color32::from_rgb(52, 199, 89), "Set as default"); }
+                    2 => { ui.colored_label(egui::Color32::from_rgb(255, 69, 58), "Failed — run from .app bundle"); }
                     _ => {}
                 }
             });
