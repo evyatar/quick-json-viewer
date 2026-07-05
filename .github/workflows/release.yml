@@ -13,6 +13,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,6 +74,10 @@ jobs:
             echo "After installing, update the cask's \`sha256\` and \`version\` in your tap:"
             echo "- **Version**: \`${VERSION}\`"
             echo "- **SHA256**: \`${SHA256}\`"
+            if [ -n "$PREV_TAG" ]; then
+              echo ""
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${CURRENT_TAG}"
+            fi
           } > release_notes.md
 
       - name: Create GitHub Release
