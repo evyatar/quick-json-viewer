@@ -107,23 +107,23 @@ pub fn spawn_fetch_url(
 
 fn bytes_to_display(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| match b {
-        b'\n' => "↵".to_string(),
-        b'\r' => "\\r".to_string(),
-        b'\t' => "→".to_string(),
+        b'\n' => "\n".to_string(),
+        b'\r' => String::new(),
+        b'\t' => "\t".to_string(),
         b if b.is_ascii_graphic() || b == b' ' => (b as char).to_string(),
         b => format!("\\x{b:02X}"),
     }).collect()
 }
 
 fn extract_error_context(bytes: &[u8], offset: usize) -> ErrorContext {
-    const WINDOW: usize = 40;
+    const WINDOW: usize = 200;
     let start = offset.saturating_sub(WINDOW);
     let end = (offset + WINDOW + 1).min(bytes.len());
     let before = bytes_to_display(&bytes[start..offset]);
     let at = if offset < bytes.len() {
         bytes_to_display(&bytes[offset..offset + 1])
     } else {
-        "‹EOF›".to_string()
+        "‹end of stream› ".to_string()
     };
     let after_start = (offset + 1).min(bytes.len());
     let after = bytes_to_display(&bytes[after_start..end]);

@@ -345,6 +345,58 @@ impl Default for App {
 
 // ─── eframe entry point ──────────────────────────────────────────────────────
 
+/// Renders the bytes surrounding a parse error in a code-block-style
+/// container, preserving line breaks and highlighting the errored byte.
+fn error_context_ui(ui: &mut egui::Ui, error: Option<&str>, before: &str, at: &str, after: &str) {
+    ui.add_space(6.0);
+    ui.label("Source surrounding the error (highlighting where parsing failed):");
+    ui.add_space(8.0);
+    if let Some(error) = error {
+        ui.label(
+            egui::RichText::new(error)
+                .color(ui.visuals().error_fg_color)
+                .strong(),
+        );
+        ui.add_space(8.0);
+    }
+
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let text_color = ui.visuals().text_color();
+    // A highlighted bare newline is invisible; show a visible marker before it.
+    let at_display = if at == "\n" { "↵\n".to_string() } else { at.to_string() };
+
+    let mut job = egui::text::LayoutJob::default();
+    job.append(before, 0.0, egui::TextFormat {
+        font_id: mono.clone(),
+        color: text_color,
+        ..Default::default()
+    });
+    job.append(&at_display, 0.0, egui::TextFormat {
+        font_id: mono.clone(),
+        color: egui::Color32::WHITE,
+        background: egui::Color32::from_rgb(200, 50, 50),
+        ..Default::default()
+    });
+    job.append(after, 0.0, egui::TextFormat {
+        font_id: mono,
+        color: text_color,
+        ..Default::default()
+    });
+
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().code_bg_color)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            egui::ScrollArea::both()
+                .max_width(640.0)
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    ui.label(job);
+                });
+        });
+    ui.add_space(6.0);
+}
+
 fn setup_unicode_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -1240,27 +1292,15 @@ impl App {
         let before = ec.before.clone();
         let at     = ec.at.clone();
         let after  = ec.after.clone();
+        let error  = self.load_error.clone();
         egui::Window::new("Parse Error Context")
             .open(&mut self.error_ctx_open)
             .collapsible(false)
             .resizable(false)
+            .min_width(640.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label("Bytes surrounding the error (errored byte highlighted):");
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(egui::RichText::new(&before).monospace());
-                    ui.label(
-                        egui::RichText::new(&at)
-                            .monospace()
-                            .color(egui::Color32::WHITE)
-                            .background_color(egui::Color32::from_rgb(200, 50, 50)),
-                    );
-                    ui.label(egui::RichText::new(&after).monospace());
-                });
-                ui.add_space(6.0);
+                error_context_ui(ui, error.as_deref(), &before, &at, &after);
             });
     }
 
@@ -1272,6 +1312,7 @@ impl App {
             let before = ec.before.clone();
             let at     = ec.at.clone();
             let after  = ec.after.clone();
+            let error  = pane.load_error.clone();
             let label  = match side { Side::Left => "Left", Side::Right => "Right" };
             let title  = format!("Parse Error Context — {label}");
             let open   = &mut self.compare.pane_mut(side).error_ctx_open;
@@ -1279,23 +1320,10 @@ impl App {
                 .open(open)
                 .collapsible(false)
                 .resizable(false)
+                .min_width(640.0)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.add_space(6.0);
-                    ui.label("Bytes surrounding the error (errored byte highlighted):");
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.label(egui::RichText::new(&before).monospace());
-                        ui.label(
-                            egui::RichText::new(&at)
-                                .monospace()
-                                .color(egui::Color32::WHITE)
-                                .background_color(egui::Color32::from_rgb(200, 50, 50)),
-                        );
-                        ui.label(egui::RichText::new(&after).monospace());
-                    });
-                    ui.add_space(6.0);
+                    error_context_ui(ui, error.as_deref(), &before, &at, &after);
                 });
         }
     }
