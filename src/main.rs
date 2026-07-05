@@ -1508,15 +1508,13 @@ impl App {
                         let resp = {
                             let font_id = egui::TextStyle::Body.resolve(ui.style());
                             let color   = ui.visuals().text_color();
-                            let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
                                 let display = bidi_reorder(text.as_str());
-                                let mut job = egui::text::LayoutJob::simple(
+                                let job = egui::text::LayoutJob::simple_singleline(
                                     display.into_owned(),
                                     font_id.clone(),
                                     color,
-                                    wrap_width,
                                 );
-                                job.wrap.max_rows = 1;
                                 ui.painter().layout_job(job)
                             };
                             let te = egui::TextEdit::singleline(&mut self.search_input)
