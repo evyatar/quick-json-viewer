@@ -219,6 +219,8 @@ struct CompareState {
     active_pane:        Side,
     needs_rediff:       bool,
     show_only_diffs:    bool,
+    /// Which diff-status types are shown; toggled by clicking the counters.
+    filter:             diff::StatusFilter,
 }
 
 impl Default for Side {
@@ -1609,14 +1611,27 @@ impl App {
 
     fn compare_toolbar(&mut self, ui: &mut egui::Ui) {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
-        // Summary of the current diff.
+        // Summary of the current diff. Each counter is a toggle: clicking it
+        // shows/hides that type of change; a muted color means it's turned off.
         if let Some(result) = &self.compare.result {
-            let badge = |ui: &mut egui::Ui, n: usize, label: &str, color: egui::Color32| {
-                ui.label(egui::RichText::new(format!("{n} {label}")).color(color));
+            let counts = (result.changed, result.added, result.removed);
+            // All-zero counters mean identical files — that's reported in the
+            // status bar instead of showing a row of "0 …" badges here.
+            if counts == (0, 0, 0) { return; }
+            let mut filter = self.compare.filter;
+            let badge = |ui: &mut egui::Ui, n: usize, label: &str, color: egui::Color32, on: &mut bool| {
+                let text = egui::RichText::new(format!("{n} {label}"))
+                    .color(if *on { color } else { pal.text_faint });
+                let resp = ui.add(egui::Button::new(text).frame(false))
+                    .on_hover_text(if *on { format!("Hide {label} nodes") } else { format!("Show {label} nodes") });
+                if resp.clicked() { *on = !*on; }
             };
-            badge(ui, result.changed, "changed", egui::Color32::from_rgb(0xE3, 0xB3, 0x41));
-            badge(ui, result.added,   "added",   egui::Color32::from_rgb(0x3F, 0xB9, 0x50));
-            badge(ui, result.removed, "removed", egui::Color32::from_rgb(0xE5, 0x53, 0x4B));
+            badge(ui, counts.0, "changed", egui::Color32::from_rgb(0xE3, 0xB3, 0x41), &mut filter.changed);
+            badge(ui, counts.1, "added",   egui::Color32::from_rgb(0x3F, 0xB9, 0x50), &mut filter.added);
+            badge(ui, counts.2, "removed", egui::Color32::from_rgb(0xE5, 0x53, 0x4B), &mut filter.removed);
+            if filter != self.compare.filter {
+                self.set_diff_filter(filter);
+            }
         } else {
             ui.label(egui::RichText::new("Load both panes to compare").color(pal.text_muted));
         }
@@ -3505,6 +3520,7 @@ impl App {
         };
         let mut tree = diff::DiffTreeState::new(&result);
         tree.only_diffs = self.compare.show_only_diffs;
+        tree.filter = self.compare.filter;
         tree.refresh_visible(&result);
         self.compare.result  = Some(result);
         self.compare.tree    = Some(tree);
@@ -3606,6 +3622,13 @@ impl App {
         if let (Some(r), Some(t)) = (&self.compare.result, &mut self.compare.tree) { t.prev_diff(r); }
     }
 
+    fn set_diff_filter(&mut self, filter: diff::StatusFilter) {
+        self.compare.filter = filter;
+        if let (Some(r), Some(t)) = (&self.compare.result, &mut self.compare.tree) {
+            t.set_filter(filter, r);
+        }
+    }
+
     fn set_only_diffs(&mut self, only: bool) {
         self.compare.show_only_diffs = only;
         if let (Some(r), Some(t)) = (&self.compare.result, &mut self.compare.tree) {
@@ -3678,7 +3701,7 @@ impl App {
                     ui.label(egui::RichText::new("Comparing…").small().color(pal.text_faint));
                 } else if let Some(result) = &self.compare.result {
                     let total = result.changed + result.added + result.removed;
-                    let txt = if total == 0 { "identical".to_string() } else { format!("{total} differences") };
+                    let txt = if total == 0 { "identical files".to_string() } else { format!("{total} differences") };
                     ui.label(egui::RichText::new(txt).small().color(pal.text_faint));
                 }
             });

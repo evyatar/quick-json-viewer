@@ -706,19 +706,51 @@ fn fp_scalar(idx: &JsonIndex, n: u32, opts: &DiffOptions) -> u64 {
 
 // ─── merged-tree view state ──────────────────────────────────────────────────
 
+/// Per-status visibility toggles for the diff view (driven by clicking the
+/// changed/added/removed counters in the toolbar).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct StatusFilter {
+    pub changed: bool,
+    pub added:   bool,
+    pub removed: bool,
+}
+
+impl Default for StatusFilter {
+    fn default() -> Self { Self { changed: true, added: true, removed: true } }
+}
+
+impl StatusFilter {
+    /// Whether a countable diff site of this status is shown. Changed only
+    /// applies to leaves — changed containers stay visible so the added /
+    /// removed / changed nodes inside them remain reachable.
+    fn allows(&self, status: DiffStatus, is_leaf: bool) -> bool {
+        match status {
+            DiffStatus::Added   => self.added,
+            DiffStatus::Removed => self.removed,
+            DiffStatus::Changed => self.changed || !is_leaf,
+            DiffStatus::Unchanged => true,
+        }
+    }
+}
+
 /// Iterative DFS over the merged tree producing the visible row list. When
-/// `only_diffs` is set, entire Unchanged subtrees are skipped.
+/// `only_diffs` is set, entire Unchanged subtrees are skipped. Statuses turned
+/// off in `filter` are skipped (whole subtree for added/removed).
 pub fn rebuild_visible_diff(
     root: u32,
     nodes: &[DiffNode],
     expanded: &crate::index::NodeSet,
     only_diffs: bool,
+    filter: StatusFilter,
 ) -> Vec<u32> {
     let mut visible: Vec<u32> = Vec::new();
     let mut stack: Vec<u32> = vec![root];
     while let Some(idx) = stack.pop() {
         let node = &nodes[idx as usize];
         if only_diffs && idx != root && node.status == DiffStatus::Unchanged {
+            continue;
+        }
+        if idx != root && !filter.allows(node.status, node.child_count == 0) {
             continue;
         }
         visible.push(idx);
@@ -748,6 +780,7 @@ pub struct DiffTreeState {
     pub reveal_row:     Option<usize>,
     pub diff_cursor:    usize,
     pub only_diffs:     bool,
+    pub filter:         StatusFilter,
 }
 
 impl DiffTreeState {
@@ -769,6 +802,7 @@ impl DiffTreeState {
             reveal_row: None,
             diff_cursor: 0,
             only_diffs: false,
+            filter: StatusFilter::default(),
         };
         s.refresh_visible(result);
         if let Some(&first) = result.diff_positions.first() {
@@ -779,7 +813,7 @@ impl DiffTreeState {
 
     pub fn refresh_visible(&mut self, result: &DiffResult) {
         self.expanded.insert(result.root);
-        self.visible = rebuild_visible_diff(result.root, &result.nodes, &self.expanded, self.only_diffs);
+        self.visible = rebuild_visible_diff(result.root, &result.nodes, &self.expanded, self.only_diffs, self.filter);
     }
 
     pub fn toggle(&mut self, idx: u32, result: &DiffResult) {
@@ -811,6 +845,22 @@ impl DiffTreeState {
                 self.selected = self.visible.first().copied();
             }
         }
+    }
+
+    pub fn set_filter(&mut self, filter: StatusFilter, result: &DiffResult) {
+        self.filter = filter;
+        self.refresh_visible(result);
+        if let Some(sel) = self.selected {
+            if !self.visible.contains(&sel) {
+                self.selected = self.visible.first().copied();
+            }
+        }
+    }
+
+    /// Whether the diff site at `idx` passes the current status filter.
+    fn diff_site_shown(&self, idx: u32, result: &DiffResult) -> bool {
+        let n = &result.nodes[idx as usize];
+        self.filter.allows(n.status, true)
     }
 
     fn pos(&self) -> Option<usize> {
@@ -882,22 +932,31 @@ impl DiffTreeState {
     }
 
     pub fn next_diff(&mut self, result: &DiffResult) {
-        if result.diff_positions.is_empty() { return; }
-        self.diff_cursor = (self.diff_cursor + 1) % result.diff_positions.len();
-        let target = result.diff_positions[self.diff_cursor];
-        self.selected = Some(target);
-        self.ensure_visible(target, result);
+        let len = result.diff_positions.len();
+        if len == 0 { return; }
+        // Skip diff sites whose status is filtered out; give up after a full lap.
+        for _ in 0..len {
+            self.diff_cursor = (self.diff_cursor + 1) % len;
+            let target = result.diff_positions[self.diff_cursor];
+            if self.diff_site_shown(target, result) {
+                self.selected = Some(target);
+                self.ensure_visible(target, result);
+                return;
+            }
+        }
     }
     pub fn prev_diff(&mut self, result: &DiffResult) {
-        if result.diff_positions.is_empty() { return; }
-        self.diff_cursor = if self.diff_cursor == 0 {
-            result.diff_positions.len() - 1
-        } else {
-            self.diff_cursor - 1
-        };
-        let target = result.diff_positions[self.diff_cursor];
-        self.selected = Some(target);
-        self.ensure_visible(target, result);
+        let len = result.diff_positions.len();
+        if len == 0 { return; }
+        for _ in 0..len {
+            self.diff_cursor = if self.diff_cursor == 0 { len - 1 } else { self.diff_cursor - 1 };
+            let target = result.diff_positions[self.diff_cursor];
+            if self.diff_site_shown(target, result) {
+                self.selected = Some(target);
+                self.ensure_visible(target, result);
+                return;
+            }
+        }
     }
 }
 
@@ -1063,13 +1122,18 @@ mod tests {
         // Full tree: root + 3 children.
         let full = rebuild_visible_diff(res.root, &res.nodes, &{
             let mut e = crate::index::NodeSet::new(); e.insert(res.root); e
-        }, false);
+        }, false, StatusFilter::default());
         assert_eq!(full.len(), 4);
         // Only diffs: root + the single changed child "b".
         let only = rebuild_visible_diff(res.root, &res.nodes, &{
             let mut e = crate::index::NodeSet::new(); e.insert(res.root); e
-        }, true);
+        }, true, StatusFilter::default());
         assert_eq!(only.len(), 2);
+        // Changed toggled off: root + the two unchanged children.
+        let no_changed = rebuild_visible_diff(res.root, &res.nodes, &{
+            let mut e = crate::index::NodeSet::new(); e.insert(res.root); e
+        }, false, StatusFilter { changed: false, ..StatusFilter::default() });
+        assert_eq!(no_changed.len(), 3);
     }
 
     #[test]
