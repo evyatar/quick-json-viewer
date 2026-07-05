@@ -966,12 +966,9 @@ impl App {
                         ui.close();
                         self.save_copy();
                     }
-                    if ui.button("Revert Changes").clicked() {
+                    if ui.button("Discard Changes").clicked() {
                         ui.close();
-                        self.edit_overlay = self.saved_overlay.clone();
-                        self.editing_node = None;
-                        self.undo_stack.clear();
-                        self.redo_stack.clear();
+                        self.discard_changes();
                     }
                 });
                 ui.separator();
@@ -2546,6 +2543,7 @@ impl App {
 
         let mut export_req = None;
         let mut save_req: Option<SaveAction> = None;
+        let mut discard_req = false;
         let dirty    = self.is_dirty();
         let can_over = self.can_overwrite();
         ui.horizontal_centered(|ui| {
@@ -2589,7 +2587,7 @@ impl App {
             if let Some(t) = &self.tree {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if dirty {
-                        let label = if can_over { "● Save  ⌘S" } else { "● Save a Copy…" };
+                        let label = if can_over { " Save Changes " } else { "● Save a Copy…" };
                         let hover = if can_over {
                             "Overwrite the original file and clear changes"
                         } else {
@@ -2606,12 +2604,20 @@ impl App {
                         if can_over {
                             ui.add_space(6.0);
                             if ui
-                                .button(egui::RichText::new("Save a Copy").small().color(pal.text_muted))
+                                .button(" Save a Copy ")
                                 .on_hover_text("Save the edited JSON to a new file")
                                 .clicked()
                             {
                                 save_req = Some(SaveAction::Copy);
                             }
+                        }
+                        ui.add_space(6.0);
+                        if ui
+                            .button(" Discard Changes ")
+                            .on_hover_text("Discard all unsaved changes")
+                            .clicked()
+                        {
+                            discard_req = true;
                         }
                         ui.add_space(8.0);
                     }
@@ -2645,6 +2651,9 @@ impl App {
                 });
             }
         });
+        if discard_req {
+            self.discard_changes();
+        }
         (export_req, save_req)
     }
 }
@@ -2873,6 +2882,26 @@ impl App {
 
 impl App {
     /// True when there are edits not yet persisted by an overwrite-save.
+    /// Discard all unsaved changes: restore the overlay to its last-saved
+    /// state, drop added items, and clear the edit session and undo history.
+    fn discard_changes(&mut self) {
+        self.edit_overlay = self.saved_overlay.clone();
+        self.editing_node = None;
+        if let Some(t) = &mut self.tree {
+            // Dropping pending adds invalidates their synthetic ids: rebuild
+            // the visible-row cache and evict them from selection/checked.
+            let real_len = t.index.nodes.len() as u32;
+            t.added_items.clear();
+            if t.selected.is_some_and(|s| s >= real_len) {
+                t.selected = Some(t.index.root);
+            }
+            t.checked.retain(|&id| id < real_len);
+            t.refresh_visible();
+        }
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
     fn is_dirty(&self) -> bool {
         self.edit_overlay != self.saved_overlay
             || self.tree.as_ref().is_some_and(|t| !t.added_items.is_empty())
@@ -4400,6 +4429,30 @@ mod edit_tests {
             app.edit_overlay.get(&name).unwrap().value_override.as_deref(),
             Some("\"Bob\"")
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn discard_after_add_drops_stale_added_ids() {
+        let (mut app, path) = app_with_file(r#"{"items": [1, 2]}"#);
+        let items = nav(&app.tree.as_ref().unwrap().index, &["items"]);
+
+        let t = app.tree.as_mut().unwrap();
+        let new_id = t.add_item(items, None, "3".to_owned());
+        t.selected = Some(new_id);
+        t.checked.insert(new_id);
+        assert!(app.is_dirty());
+
+        app.discard_changes();
+        assert!(!app.is_dirty());
+
+        let t = app.tree.as_ref().unwrap();
+        let real_len = t.index.nodes.len() as u32;
+        assert!(t.added_items.is_empty());
+        assert!(t.visible.iter().all(|&id| id < real_len),
+                "visible cache must not retain synthetic added ids");
+        assert!(t.selected.is_some_and(|s| s < real_len));
+        assert!(t.checked.iter().all(|&id| id < real_len));
         let _ = std::fs::remove_file(&path);
     }
 
