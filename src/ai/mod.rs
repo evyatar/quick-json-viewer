@@ -8,6 +8,7 @@
 //! API keys live in the macOS Keychain (`keystore`), not in settings.
 
 pub mod keystore;
+pub mod markdown;
 pub mod panel;
 pub mod provider;
 pub mod session;

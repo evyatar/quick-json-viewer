@@ -427,14 +427,7 @@ fn transcript_entry(ui: &mut egui::Ui, pal: &theme::Palette, entry: &ChatEntry) 
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    // Chat text may contain paths etc. — allow selection.
-                    let mut text = t.clone();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .frame(egui::Frame::NONE)
-                            .interactive(false)
-                            .desired_width(f32::INFINITY),
-                    );
+                    super::markdown::render(ui, pal, t);
                 });
         }
         ChatEntry::Note(t) => {
