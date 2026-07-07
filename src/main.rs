@@ -1686,9 +1686,15 @@ impl App {
         // shows/hides that type of change; a muted color means it's turned off.
         if let Some(result) = &self.compare.result {
             let counts = (result.changed, result.added, result.removed);
-            // All-zero counters mean identical files — that's reported in the
-            // status bar instead of showing a row of "0 …" badges here.
-            if counts == (0, 0, 0) { return; }
+            // All-zero counters mean identical files — say so instead of
+            // showing a row of "0 …" badges.
+            if counts == (0, 0, 0) {
+                ui.label(
+                    egui::RichText::new("identical files")
+                        .color(theme::NEW),
+                );
+                return;
+            }
             let mut filter = self.compare.filter;
             let badge = |ui: &mut egui::Ui, n: usize, label: &str, color: egui::Color32, on: &mut bool| {
                 let text = egui::RichText::new(format!("{n} {label}"))
@@ -1697,9 +1703,9 @@ impl App {
                     .on_hover_text(if *on { format!("Hide {label} nodes") } else { format!("Show {label} nodes") });
                 if resp.clicked() { *on = !*on; }
             };
-            badge(ui, counts.0, "changed", egui::Color32::from_rgb(0xE3, 0xB3, 0x41), &mut filter.changed);
-            badge(ui, counts.1, "added",   egui::Color32::from_rgb(0x3F, 0xB9, 0x50), &mut filter.added);
-            badge(ui, counts.2, "removed", egui::Color32::from_rgb(0xE5, 0x53, 0x4B), &mut filter.removed);
+            badge(ui, counts.0, "changed", theme::CHANGED, &mut filter.changed);
+            badge(ui, counts.1, "added",   theme::NEW,     &mut filter.added);
+            badge(ui, counts.2, "removed", theme::DELETED, &mut filter.removed);
             if filter != self.compare.filter {
                 self.set_diff_filter(filter);
             }
@@ -3828,7 +3834,7 @@ impl App {
                     changed = true;
                 }
                 if self.compare.pattern_error {
-                    ui.colored_label(egui::Color32::from_rgb(0xE5, 0x53, 0x4B), "⚠").on_hover_text("Invalid regex");
+                    ui.colored_label(theme::DELETED, "⚠").on_hover_text("Invalid regex");
                 }
             });
         });
@@ -3859,8 +3865,9 @@ impl App {
                     ui.label(egui::RichText::new("Comparing…").small().color(pal.text_faint));
                 } else if let Some(result) = &self.compare.result {
                     let total = result.changed + result.added + result.removed;
-                    let txt = if total == 0 { "identical files".to_string() } else { format!("{total} differences") };
-                    ui.label(egui::RichText::new(txt).small().color(pal.text_faint));
+                    if total > 0 {
+                        ui.label(format!("{total} differences"));
+                    }
                 }
             });
         });

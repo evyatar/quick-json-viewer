@@ -40,6 +40,9 @@ pub const DELETED: Color32 = Color32::from_rgb(0xE5, 0x53, 0x4B);
 /// Color for array items added interactively and not yet saved.
 pub const NEW: Color32 = Color32::from_rgb(0x3F, 0xB9, 0x50);
 
+/// Color for values changed between compared files (amber).
+pub const CHANGED: Color32 = Color32::from_rgb(0xE3, 0xB3, 0x41);
+
 // ── Diff row tints (low-alpha so they layer over the row background) ─────────
 pub const DIFF_ADDED_BG:   Color32 = Color32::from_rgba_unmultiplied_const(0x3F, 0xB9, 0x50, 60); // green
 pub const DIFF_REMOVED_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xE5, 0x53, 0x4B, 60); // red
