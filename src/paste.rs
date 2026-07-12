@@ -3,6 +3,48 @@
 //! Plain JSON passes through unchanged; a JWT token is decoded into
 //! `{"header": …, "payload": …, "signature": "…"}`.
 
+/// Detect text that is a path to an existing file — what Finder puts on the
+/// clipboard when a file is copied with ⌘C (either a plain path or a
+/// `file://` URL). Returns None for anything that should be parsed as JSON.
+pub fn detect_file_path(text: &str) -> Option<std::path::PathBuf> {
+    let text = text.trim();
+    if text.contains('\n') {
+        return None;
+    }
+    let path = if let Some(rest) = text.strip_prefix("file://") {
+        // Strip an optional host part and percent-decode (Finder escapes
+        // spaces and non-ASCII characters in file URLs).
+        let path_start = rest.find('/')?;
+        std::path::PathBuf::from(percent_decode(&rest[path_start..]))
+    } else if text.starts_with('/') {
+        std::path::PathBuf::from(text)
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        std::path::PathBuf::from(std::env::var("HOME").ok()?).join(rest)
+    } else {
+        return None;
+    };
+    path.is_file().then_some(path)
+}
+
+/// Decode percent-escapes (`%20` → space); invalid escapes pass through.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Decode `text` as a JWT — three dot-separated base64url segments whose
 /// header and payload decode to JSON objects. Returns None when the text is
 /// not a JWT (it should then be treated as plain JSON).
@@ -68,6 +110,30 @@ fn base64url_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_existing_file_path() {
+        let dir = std::env::temp_dir().join("qjv-paste-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("with space.json");
+        std::fs::write(&file, b"{}").unwrap();
+
+        let plain = file.to_string_lossy().into_owned();
+        assert_eq!(detect_file_path(&plain), Some(file.clone()));
+
+        let url = format!("file://{}", plain.replace(' ', "%20"));
+        assert_eq!(detect_file_path(&url), Some(file.clone()));
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(detect_file_path(&plain), None);
+    }
+
+    #[test]
+    fn rejects_non_paths() {
+        assert_eq!(detect_file_path("{\"a\": 1}"), None);
+        assert_eq!(detect_file_path("/no/such/file/hopefully.json"), None);
+        assert_eq!(detect_file_path("/etc\n/hosts"), None);
+    }
 
     // Standard HS256 example token (header/payload from jwt.io).
     const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\

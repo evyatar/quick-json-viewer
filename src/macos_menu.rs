@@ -40,6 +40,19 @@ pub fn take_actions() -> u32 {
     PENDING.swap(0, Ordering::AcqRel)
 }
 
+/// Path of the file on the general pasteboard, if the clipboard holds a file
+/// copied in Finder (⌘C). The text representation of such a copy is only the
+/// file's display name, so the path must be read from the `file-url` type.
+pub fn clipboard_file_path() -> Option<PathBuf> {
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::NSURL;
+    let pb = NSPasteboard::generalPasteboard();
+    let url_str = pb.stringForType(&NSString::from_str("public.file-url"))?;
+    let url = NSURL::URLWithString(&url_str)?;
+    let path = url.path()?;
+    Some(PathBuf::from(path.to_string()))
+}
+
 pub fn take_open_file() -> Option<PathBuf> {
     PENDING_OPEN_FILE.lock().ok()?.take()
 }

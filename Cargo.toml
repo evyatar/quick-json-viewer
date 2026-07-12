@@ -21,8 +21,8 @@ image         = { version = "0.25", default-features = false, features = ["png"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2             = "0.6.4"
-objc2-app-kit     = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem"] }
-objc2-foundation  = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit     = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard"] }
+objc2-foundation  = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSEnumerator"] }
 
 [profile.release]
 opt-level     = 3

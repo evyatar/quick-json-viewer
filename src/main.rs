@@ -671,9 +671,21 @@ impl eframe::App for App {
             });
             if let Some(text) = pasted {
                 self.paste_pending = false;
-                match self.mode {
-                    AppMode::Viewer  => self.open_pasted(&text),
-                    AppMode::Compare => {
+                // A file copied in Finder pastes only its display name as
+                // text; the actual path lives in the pasteboard's file-url
+                // type. Check that first and open the file like a drop.
+                #[cfg(target_os = "macos")]
+                let file = macos_menu::clipboard_file_path();
+                #[cfg(not(target_os = "macos"))]
+                let file: Option<PathBuf> = None;
+                match (file, self.mode) {
+                    (Some(path), AppMode::Viewer)  => self.open_file(path),
+                    (Some(path), AppMode::Compare) => {
+                        let side = self.compare.active_pane;
+                        self.open_file_into_pane(side, path);
+                    }
+                    (None, AppMode::Viewer)  => self.open_pasted(&text),
+                    (None, AppMode::Compare) => {
                         let side = self.compare.active_pane;
                         self.open_pasted_into_pane(side, &text);
                     }
@@ -2596,6 +2608,7 @@ impl App {
         let mut export_req = None;
         let mut save_req: Option<SaveAction> = None;
         let mut discard_req = false;
+        let mut clear_req   = false;
         let dirty    = self.is_dirty();
         let can_over = self.can_overwrite();
         ui.horizontal_centered(|ui| {
@@ -2635,9 +2648,19 @@ impl App {
                 }
             }
 
-            // Right-aligned: encoding, format badge, root-type badge.
-            if let Some(t) = &self.tree {
+            // Right-aligned: clear action, encoding, format badge, root-type badge.
+            if self.file_info.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(" Clear ")
+                        .on_hover_text("Unload the current document (discards unsaved changes)")
+                        .clicked()
+                    {
+                        clear_req = true;
+                    }
+                    if self.tree.is_none() { return; }
+                    ui.add_space(8.0);
+                    let t = self.tree.as_ref().unwrap();
                     if dirty {
                         let label = if can_over { " Save Changes " } else { "● Save a Copy…" };
                         let hover = if can_over {
@@ -2705,6 +2728,9 @@ impl App {
         });
         if discard_req {
             self.discard_changes();
+        }
+        if clear_req {
+            self.clear_document();
         }
         (export_req, save_req)
     }
@@ -2821,6 +2847,35 @@ impl App {
         self.load_rx      = Some(loader::spawn_load(path));
     }
 
+    /// Unload the current document and reset the viewer to its empty state.
+    fn clear_document(&mut self) {
+        self.file_info      = None;
+        self.tree           = None;
+        self.load_rx        = None;
+        self.load_error     = None;
+        self.load_error_ctx = None;
+        self.error_ctx_open = false;
+        self.load_progress  = 0.0;
+        self.search_input.clear();
+        self.search_pending = None;
+        self.search_debounce_until = None;
+        self.edit_overlay.clear();
+        self.saved_overlay.clear();
+        self.editing_node = None;
+        self.adding_item  = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// Unload one Compare pane and drop the diff computed against it.
+    fn clear_pane(&mut self, side: Side) {
+        *self.compare.pane_mut(side) = ComparePane::default();
+        self.compare.result       = None;
+        self.compare.tree         = None;
+        self.compare.diff_rx      = None;
+        self.compare.needs_rediff = false;
+    }
+
     /// Ask the windowing backend for the clipboard contents; they arrive as an
     /// `Event::Paste` on a following frame, which `paste_pending` routes to
     /// `open_pasted` even if a text field has focus.
@@ -2832,6 +2887,11 @@ impl App {
     fn open_pasted(&mut self, text: &str) {
         let text = text.trim();
         if text.is_empty() {
+            return;
+        }
+        // A file copied in Finder pastes as its path — open it like a drop.
+        if let Some(path) = paste::detect_file_path(text) {
+            self.open_file(path);
             return;
         }
         // Auto-detect URLs, curl commands, and fetch() calls
@@ -3601,6 +3661,11 @@ impl App {
     fn open_pasted_into_pane(&mut self, side: Side, text: &str) {
         let text = text.trim();
         if text.is_empty() { return; }
+        // A file copied in Finder pastes as its path — open it like a drop.
+        if let Some(path) = paste::detect_file_path(text) {
+            self.open_file_into_pane(side, path);
+            return;
+        }
         // Auto-detect URLs, curl commands, and fetch() calls
         if let Some(req) = url_parse::parse_request(text) {
             self.open_url_request_into_pane(side, req);
@@ -3897,7 +3962,8 @@ impl App {
                 pane.load_error_ctx.is_some(),
             )
         };
-        let title = name.unwrap_or_else(|| "— no document —".to_string());
+        let loaded = name.is_some();
+        let title  = name.unwrap_or_else(|| "— no document —".to_string());
 
         // Reserve the whole header rect up-front and sense clicks on it, so a
         // click anywhere on the header (the area not covered by the Open / Paste
@@ -3927,14 +3993,24 @@ impl App {
             ui.label(egui::RichText::new(format!("📄 {title}")).color(pal.text_primary));
             if loading { ui.spinner(); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Paste").clicked() {
-                    self.compare.active_pane = side;
-                    let ctx = ui.ctx().clone();
-                    self.request_paste(&ctx);
-                }
-                if ui.small_button("Open").clicked() {
-                    self.compare.active_pane = side;
-                    self.open_into_pane_dialog(side);
+                if loaded || loading {
+                    if ui
+                        .small_button("Clear")
+                        .on_hover_text("Unload this pane")
+                        .clicked()
+                    {
+                        self.clear_pane(side);
+                    }
+                } else {
+                    if ui.small_button("Paste").clicked() {
+                        self.compare.active_pane = side;
+                        let ctx = ui.ctx().clone();
+                        self.request_paste(&ctx);
+                    }
+                    if ui.small_button("Open").clicked() {
+                        self.compare.active_pane = side;
+                        self.open_into_pane_dialog(side);
+                    }
                 }
             });
         }
