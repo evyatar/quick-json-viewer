@@ -1483,7 +1483,7 @@ fn tab_button(
 ) -> egui::Response {
     let fg = if active { pal.tab_active_fg } else { pal.tab_inactive_fg };
     let fill = if active { pal.tab_active_bg } else { egui::Color32::TRANSPARENT };
-    let stroke = egui::Stroke::new(1.0, if active { pal.tab_active_fg } else { pal.border });
+    let stroke = egui::Stroke::new(1.0_f32, if active { pal.tab_active_fg } else { pal.border });
     let button = egui::Button::new(label.color(fg))
         .frame(true)
         .fill(fill)
@@ -1513,7 +1513,7 @@ impl App {
 
         // 1 px bottom border under the header
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0_f32, pal.border));
     }
 
     fn mode_tabs(&mut self, ui: &mut egui::Ui) {
@@ -1590,7 +1590,7 @@ impl App {
             // Search pill — rounded container holding the search field
             egui::Frame::new()
                 .fill(pal.bg_search)
-                .stroke(egui::Stroke::new(1.0, pal.border))
+                .stroke(egui::Stroke::new(1.0_f32, pal.border))
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(8, 2))
                 .show(ui, |ui| {
@@ -1644,7 +1644,7 @@ impl App {
                             if clear.hovered() {
                                 ui.painter().circle_filled(rect.center(), 7.0, ui.visuals().widgets.hovered.bg_fill);
                             }
-                            let stroke = egui::Stroke::new(1.5, color);
+                            let stroke = egui::Stroke::new(1.5_f32, color);
                             let d = 3.5;
                             let c = rect.center();
                             ui.painter().line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
@@ -1755,7 +1755,7 @@ impl App {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px bottom border under the strip
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0_f32, pal.border));
 
         let font_size = self.settings.font_size - 1.0;
 
@@ -1883,7 +1883,7 @@ impl App {
     fn keycap(ui: &mut egui::Ui, pal: &theme::Palette, text: &str) {
         egui::Frame::new()
             .fill(pal.bg_search)
-            .stroke(egui::Stroke::new(1.0, pal.border))
+            .stroke(egui::Stroke::new(1.0_f32, pal.border))
             .corner_radius(4.0)
             .inner_margin(egui::Margin::symmetric(7, 2))
             .show(ui, |ui| {
@@ -2288,7 +2288,7 @@ fn render_row(
     if dark {
         for d in 0..depth {
             let gx = rect.left() + indent_at(d) + 8.0;
-            painter.vline(gx, rect.y_range(), egui::Stroke::new(1.0, theme::INDENT_GUIDE));
+            painter.vline(gx, rect.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
         }
     }
 
@@ -2345,7 +2345,7 @@ fn render_row(
     if is_deleted {
         let strike_x0 = rect.left() + indent + 18.0;
         let strike_x1 = strike_x0 + key_w + sep_w + val_w;
-        painter.hline(strike_x0..=strike_x1, y1, egui::Stroke::new(1.5, theme::DELETED));
+        painter.hline(strike_x0..=strike_x1, y1, egui::Stroke::new(1.5_f32, theme::DELETED));
     }
 
     // Collect actions
@@ -2598,7 +2598,7 @@ impl App {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         // 1 px top border above the bar
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0_f32, pal.border));
 
         if self.mode == AppMode::Compare {
             self.compare_status_bar(ui);
@@ -3877,7 +3877,7 @@ impl App {
     fn compare_options_bar(&mut self, ui: &mut egui::Ui) {
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0_f32, pal.border));
 
         let mut changed = false;
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
@@ -3946,7 +3946,7 @@ impl App {
         // 1 px divider beneath the headers.
         let pal = theme::Palette::for_dark(ui.visuals().dark_mode);
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), ui.min_rect().bottom(), egui::Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), ui.min_rect().bottom(), egui::Stroke::new(1.0_f32, pal.border));
         let _ = r;
     }
 
@@ -4146,7 +4146,7 @@ fn diff_option_toggle(ui: &mut egui::Ui, pal: &theme::Palette, label: &str, hove
     let active = *value;
     let fg = if active { pal.tab_active_fg } else { pal.text_muted };
     let fill   = if active { pal.tab_active_bg } else { egui::Color32::TRANSPARENT };
-    let stroke = egui::Stroke::new(1.0, if active { pal.tab_active_fg } else { pal.border });
+    let stroke = egui::Stroke::new(1.0_f32, if active { pal.tab_active_fg } else { pal.border });
     let button = egui::Button::new(egui::RichText::new(label).color(fg))
         .frame(true)
         .fill(fill)
@@ -4222,7 +4222,7 @@ fn render_diff_row(
     }
 
     // Center divider.
-    ui.painter().vline(mid_x, rect.y_range(), egui::Stroke::new(1.0, theme::Palette::for_dark(dark).border));
+    ui.painter().vline(mid_x, rect.y_range(), egui::Stroke::new(1.0_f32, theme::Palette::for_dark(dark).border));
 
     let text_col = if is_selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
 
@@ -4317,7 +4317,7 @@ fn draw_diff_cell(
     if dark {
         for d in 0..depth {
             let gx = cell.left() + 4.0 + d as f32 * 16.0 + 8.0;
-            painter.vline(gx, cell.y_range(), egui::Stroke::new(1.0, theme::INDENT_GUIDE));
+            painter.vline(gx, cell.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
         }
     }
 

@@ -450,7 +450,7 @@ fn proposal_card(
     let mut reject = false;
     ui.add_space(6.0);
     egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0, pal.accent))
+        .stroke(egui::Stroke::new(1.0_f32, pal.accent))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {

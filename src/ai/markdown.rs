@@ -128,7 +128,7 @@ fn list_item(ui: &mut egui::Ui, style: &Style, indent: f32, marker: &str, body: 
 fn code_block(ui: &mut egui::Ui, pal: &theme::Palette, code: &str) {
     egui::Frame::new()
         .fill(pal.bg_search)
-        .stroke(egui::Stroke::new(1.0, pal.border))
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .corner_radius(4.0)
         .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {

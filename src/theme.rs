@@ -130,10 +130,10 @@ pub fn visuals() -> egui::Visuals {
     visuals.faint_bg_color   = HOVER_BG;
 
     visuals.selection.bg_fill = TEXT_SELECT_BG;
-    visuals.selection.stroke  = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.selection.stroke  = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.hyperlink_color   = ACCENT;
 
-    visuals.widgets.noninteractive.bg_stroke       = Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.bg_stroke       = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.fg_stroke.color = TEXT_PRIMARY;
 
     visuals.widgets.inactive.bg_fill         = BG_SEARCH;
