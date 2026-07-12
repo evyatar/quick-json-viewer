@@ -2,7 +2,7 @@
 name = "quick-json-viewer"
 version = "1.1.2"
 edition = "2021"
-description = "A fast, native JSON viewer for macOS"
+description = "A fast, native JSON viewer for macOS and Windows"
 authors = ["Evyatar Shalom"]
 repository = "https://github.com/evyatar/quick-json-viewer"
 
@@ -23,6 +23,12 @@ image         = { version = "0.25", default-features = false, features = ["png"]
 objc2             = "0.6.4"
 objc2-app-kit     = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard"] }
 objc2-foundation  = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSEnumerator"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level     = 3

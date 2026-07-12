@@ -1,16 +1,22 @@
 # Quick JSON Viewer
 
-A fast, native macOS app for viewing and navigating large JSON and NDJSON files.
+A fast, native app for viewing and navigating large JSON and NDJSON files, for macOS and Windows.
 
 Built with Rust + [egui](https://github.com/emilk/egui). Uses memory-mapped file I/O so even multi-GB files open instantly.
 
 ## Installation
+
+### macOS
 
 ```sh
 brew install --cask evyatar/tap/quick-json-viewer
 ```
 
 Installs to `/Applications` — find it in Launchpad or open files with right-click → Open With.
+
+### Windows
+
+Download `quick-json-viewer-<version>-windows-x86_64.zip` from the [latest release](https://github.com/evyatar/quick-json-viewer/releases/latest), unzip, and run `quick-json-viewer.exe`.
 
 ## Features
 
@@ -19,7 +25,7 @@ Installs to `/Applications` — find it in Launchpad or open files with right-cl
 - **Paste to view** — ⌘V pastes JSON straight from the clipboard; JWT tokens are decoded into header / payload / signature
 - **Load from URL** — ⌘L (or just paste) a plain URL, a `curl` command, or a JS `fetch()` call and the response opens as a tree
 - **Editing** — double-click (or F2) to edit values in place, add / delete properties and array items, undo / redo with ⌘Z / ⇧⌘Z, save with ⌘S or Save a Copy with ⇧⌘S, discard all changes with one click
-- **AI assistant (BYOK)** — query and edit your data in natural language with your own API key (Anthropic or any OpenAI-compatible endpoint); proposed edits are shown as a reviewable changeset before anything is applied; keys are stored in the macOS Keychain
+- **AI assistant (BYOK)** — query and edit your data in natural language with your own API key (Anthropic or any OpenAI-compatible endpoint); proposed edits are shown as a reviewable changeset before anything is applied; keys are stored in the macOS Keychain / Windows Credential Manager
 - **Advanced search** — `key:name`, `value:err`, `age > 30`, operators `= != < <= > >=`, space-ANDed clauses, regex mode; all matches highlighted and navigable with ⌘G / ⌘⇧G
 - **Compare two documents** — side-by-side semantic diff; additions, removals, and changes colour-coded; clickable counters filter by change type; configurable ignore options; ▲/▼ or ⌘G / ⌘⇧G to jump between differences
 - **Export** — save as JSON or CSV
@@ -33,7 +39,8 @@ Installs to `/Applications` — find it in Launchpad or open files with right-cl
 
 ## Requirements
 
-- macOS 12.0 or later (Apple Silicon or Intel via Rosetta)
+- macOS 12.0 or later (Apple Silicon or Intel via Rosetta), or
+- Windows 10 or later (x86_64)
 
 ## Building
 
@@ -41,9 +48,12 @@ Installs to `/Applications` — find it in Launchpad or open files with right-cl
 # Development build
 cargo run
 
-# Production .app bundle (Apple Silicon)
+# Production .app bundle (macOS, Apple Silicon)
 ./build-app.sh
 open quick-json-viewer.app
+
+# Production .exe (on Windows)
+cargo build --release   # → target/release/quick-json-viewer.exe
 ```
 
 ## Testing
@@ -53,6 +63,8 @@ cargo test
 ```
 
 ## Keyboard Shortcuts
+
+Shortcuts are shown with macOS glyphs; on Windows use Ctrl for ⌘, Shift for ⇧, and Alt for ⌥ (the in-app menus and help show the Windows form).
 
 | Key | Action |
 |-----|--------|
@@ -92,7 +104,7 @@ Right-click any row to copy its JSON path, key, or value. Right-clicking a conta
 | `src/url_parse.rs` | Parses URLs, curl commands, and fetch() calls into HTTP request specs |
 | `src/export.rs` | Edit overlay (value/key overrides, adds, deletes) and JSON / CSV export |
 | `src/codegen.rs` | Typed code generation (TS, Python, Go, Java, C#, Kotlin, Swift, Dart) |
-| `src/ai/` | BYOK AI assistant: provider client, tool-calling agent loop, review UI, Keychain key storage |
+| `src/ai/` | BYOK AI assistant: provider client, tool-calling agent loop, review UI, Keychain / Credential Manager key storage |
 | `src/update.rs` | Notify-only update checker against GitHub Releases |
 | `src/theme.rs` | Design tokens for the custom dark theme |
 | `src/settings.rs` | Persistent user preferences; set-as-default JSON viewer |

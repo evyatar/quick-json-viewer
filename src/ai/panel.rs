@@ -104,7 +104,7 @@ pub fn settings_section(ui: &mut egui::Ui, settings: &mut Settings, state: &mut 
 
     ui.add_space(8.0);
 
-    // ── API key (stored in the macOS Keychain, never in settings) ──
+    // ── API key (stored in the platform credential store, never in settings) ──
     let kind = settings.ai_provider;
     let present = state.key_present(kind);
     ui.horizontal(|ui| {
@@ -121,7 +121,7 @@ pub fn settings_section(ui: &mut egui::Ui, settings: &mut Settings, state: &mut 
         {
             state.key_status = Some(
                 keystore::set_key(kind.key_account(), state.key_input.trim())
-                    .map(|_| "Saved to Keychain"),
+                    .map(|_| if cfg!(target_os = "macos") { "Saved to Keychain" } else { "Saved to credential store" }),
             );
             state.key_input.clear();
             state.invalidate();
@@ -142,7 +142,7 @@ pub fn settings_section(ui: &mut egui::Ui, settings: &mut Settings, state: &mut 
         None => {}
     }
     ui.label(
-        egui::RichText::new("The key is stored in the macOS Keychain. When you use the assistant, parts of the open file are sent to the provider.")
+        egui::RichText::new(format!("The key is stored in the {}. When you use the assistant, parts of the open file are sent to the provider.", keystore::STORE_NAME))
             .small()
             .weak(),
     );

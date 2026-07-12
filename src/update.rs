@@ -88,6 +88,12 @@ pub fn restart_app() {
             .args(["-a", "Quick JSON Viewer"])
             .spawn();
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+    }
     std::process::exit(0);
 }
 

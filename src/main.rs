@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod ai;
 mod codegen;
 mod diff;
@@ -17,6 +19,24 @@ mod url_parse;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Platform-appropriate shortcut label. Strings are written with macOS
+/// glyphs (⌘ ⇧ ⌥); on other platforms they are rewritten to the Ctrl+/
+/// Shift+/Alt+ convention. Works on full sentences too (e.g. tips).
+fn sc(mac: &str) -> String {
+    if cfg!(target_os = "macos") {
+        return mac.to_owned();
+    }
+    mac.replace("⇧ ⌘ ", "Ctrl+Shift+")
+        .replace("⌘ ⇧ ", "Ctrl+Shift+")
+        .replace("⇧⌘", "Ctrl+Shift+")
+        .replace("⌘ ", "Ctrl+")
+        .replace('⌘', "Ctrl+")
+        .replace("⇧ ", "Shift+")
+        .replace('⇧', "Shift+")
+        .replace("⌥ ", "Alt+")
+        .replace('⌥', "Alt+")
+}
 
 // ─── BiDi / RTL helpers ───────────────────────────────────────────────────────
 
@@ -410,14 +430,22 @@ fn error_context_ui(ui: &mut egui::Ui, error: Option<&str>, before: &str, at: &s
 fn setup_unicode_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // Apple Symbols covers keyboard glyphs (⌥ ⌘ ⇧ …) missing from most fonts.
-    if let Ok(data) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
-        fonts.font_data.insert(
-            "apple_symbols".to_owned(),
-            egui::FontData::from_owned(data).into(),
-        );
-        for list in fonts.families.values_mut() {
-            list.push("apple_symbols".to_owned());
+    // Symbol fallback: Apple Symbols (macOS) / Segoe UI Symbol (Windows)
+    // covers keyboard glyphs (⌥ ⌘ ⇧ ↵ …) missing from most fonts.
+    let symbol_candidates = [
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        r"C:\Windows\Fonts\seguisym.ttf",
+    ];
+    for path in &symbol_candidates {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "symbol_fallback".to_owned(),
+                egui::FontData::from_owned(data).into(),
+            );
+            for list in fonts.families.values_mut() {
+                list.push("symbol_fallback".to_owned());
+            }
+            break;
         }
     }
 
@@ -427,6 +455,8 @@ fn setup_unicode_fonts(ctx: &egui::Context) {
         "/Library/Fonts/Arial Unicode MS.ttf",
         "/System/Library/Fonts/ArialHB.ttc",
         "/System/Library/Fonts/Supplemental/Arial Hebrew.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
     ];
     for path in &hebrew_candidates {
         if let Ok(data) = std::fs::read(path) {
@@ -981,11 +1011,11 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.add(egui::Button::new("Open…").shortcut_text("⌘O")).clicked() {
+                if ui.add(egui::Button::new("Open…").shortcut_text(sc("⌘O"))).clicked() {
                     ui.close();
                     self.open_file_dialog();
                 }
-                if ui.add(egui::Button::new("Paste JSON / JWT").shortcut_text("⌘V")).clicked() {
+                if ui.add(egui::Button::new("Paste JSON / JWT").shortcut_text(sc("⌘V"))).clicked() {
                     ui.close();
                     let ctx = ui.ctx().clone();
                     self.request_paste(&ctx);
@@ -1008,13 +1038,13 @@ impl App {
                 let dirty    = self.is_dirty();
                 let can_over = self.can_overwrite();
                 ui.add_enabled_ui(dirty && can_over, |ui| {
-                    if ui.add(egui::Button::new("Save").shortcut_text("⌘S")).clicked() {
+                    if ui.add(egui::Button::new("Save").shortcut_text(sc("⌘S"))).clicked() {
                         ui.close();
                         self.save_overwrite();
                     }
                 });
                 ui.add_enabled_ui(dirty, |ui| {
-                    if ui.add(egui::Button::new("Save a Copy").shortcut_text("⇧⌘S")).clicked() {
+                    if ui.add(egui::Button::new("Save a Copy").shortcut_text(sc("⇧⌘S"))).clicked() {
                         ui.close();
                         self.save_copy();
                     }
@@ -1024,33 +1054,33 @@ impl App {
                     }
                 });
                 ui.separator();
-                if ui.add(egui::Button::new("Settings").shortcut_text("⌘,")).clicked() {
+                if ui.add(egui::Button::new("Settings").shortcut_text(sc("⌘,"))).clicked() {
                     ui.close();
                     self.settings_open = true;
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(self.can_undo(), egui::Button::new("Undo").shortcut_text("⌘Z")).clicked() {
+                if ui.add_enabled(self.can_undo(), egui::Button::new("Undo").shortcut_text(sc("⌘Z"))).clicked() {
                     ui.close();
                     self.undo();
                 }
-                if ui.add_enabled(self.can_redo(), egui::Button::new("Redo").shortcut_text("⇧⌘Z")).clicked() {
+                if ui.add_enabled(self.can_redo(), egui::Button::new("Redo").shortcut_text(sc("⇧⌘Z"))).clicked() {
                     ui.close();
                     self.redo();
                 }
             });
             ui.menu_button("View", |ui| {
                 let has_tree = self.tree.is_some();
-                if ui.add_enabled(has_tree, egui::Button::new("Collapse All").shortcut_text("⌥C")).clicked() {
+                if ui.add_enabled(has_tree, egui::Button::new("Collapse All").shortcut_text(sc("⌥C"))).clicked() {
                     ui.close();
                     if let Some(t) = &mut self.tree { t.collapse_all(); }
                 }
-                if ui.add_enabled(has_tree, egui::Button::new("Expand All").shortcut_text("⌥X")).clicked() {
+                if ui.add_enabled(has_tree, egui::Button::new("Expand All").shortcut_text(sc("⌥X"))).clicked() {
                     ui.close();
                     if let Some(t) = &mut self.tree { t.expand_all(); }
                 }
                 ui.separator();
-                if ui.add(egui::Button::new("Search").shortcut_text("⌘F")).clicked() {
+                if ui.add(egui::Button::new("Search").shortcut_text(sc("⌘F"))).clicked() {
                     ui.close();
                     self.focus_search = true;
                 }
@@ -1255,17 +1285,20 @@ impl App {
                                 dismiss = true;
                             }
                         }
-                        if ui
-                            .button(if upgrading { "Upgrading…" } else { "Upgrade now" })
-                            .on_hover_text(format!("Runs in the background:\n{}", update::BREW_UPGRADE_CMD))
-                            .clicked()
+                        // The in-place upgrade path is Homebrew, so macOS only;
+                        // elsewhere the banner just links to the release page.
+                        if cfg!(target_os = "macos")
+                            && ui
+                                .button(if upgrading { "Upgrading…" } else { "Upgrade now" })
+                                .on_hover_text(format!("Runs in the background:\n{}", update::BREW_UPGRADE_CMD))
+                                .clicked()
                             && !upgrading
                         {
                             self.install_watcher_rx = Some(update::launch_brew_upgrade());
                             ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
                         }
                         if !upgrading {
-                            if ui.button("Copy command").clicked() {
+                            if cfg!(target_os = "macos") && ui.button("Copy command").clicked() {
                                 ui.ctx().copy_text(update::BREW_UPGRADE_CMD.to_string());
                             }
                             let view = ui.button("View release");
@@ -1881,6 +1914,7 @@ impl App {
     /// Keycap-styled chip for a keyboard shortcut, so the ⌘ glyph and the
     /// letter read as one unit instead of mismatched font sizes.
     fn keycap(ui: &mut egui::Ui, pal: &theme::Palette, text: &str) {
+        let text = sc(text);
         egui::Frame::new()
             .fill(pal.bg_search)
             .stroke(egui::Stroke::new(1.0_f32, pal.border))
@@ -1957,7 +1991,7 @@ impl App {
 
             ui.add_space(26.0);
             ui.label(
-                egui::RichText::new(format!("Tip:  {tip}"))
+                egui::RichText::new(format!("Tip:  {}", sc(tip)))
                     .size(12.0)
                     .color(pal.text_faint),
             );
@@ -4375,6 +4409,36 @@ fn format_size(n: u64) -> String {
         format!("{:.1} KB", n as f64 / KB as f64)
     } else {
         format!("{} B", n)
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_os = "macos"))] // sc() is a passthrough on macOS
+mod sc_tests {
+    use super::sc;
+
+    #[test]
+    fn translates_modifier_glyphs() {
+        assert_eq!(sc("⌘O"), "Ctrl+O");
+        assert_eq!(sc("⌘ ,"), "Ctrl+,");
+        assert_eq!(sc("⇧⌘S"), "Ctrl+Shift+S");
+        assert_eq!(sc("⌘ ⇧ G"), "Ctrl+Shift+G");
+        assert_eq!(sc("⇧ ⌘ Z"), "Ctrl+Shift+Z");
+        assert_eq!(sc("⌥C"), "Alt+C");
+    }
+
+    #[test]
+    fn leaves_plain_labels_alone() {
+        assert_eq!(sc("Page Up/Dn"), "Page Up/Dn");
+        assert_eq!(sc("drop"), "drop");
+    }
+
+    #[test]
+    fn translates_inside_sentences() {
+        assert_eq!(
+            sc("Search with ⌘F, then Enter / ⌘G jumps between results."),
+            "Search with Ctrl+F, then Enter / Ctrl+G jumps between results."
+        );
     }
 }
 

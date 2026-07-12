@@ -27,7 +27,9 @@ pub fn spawn_load(path: PathBuf) -> mpsc::Receiver<LoadMsg> {
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| format!("mmap: {e}"))?;
         // The parser reads the file front-to-back once; tell the kernel to
-        // read ahead aggressively. Best-effort — ignore failures.
+        // read ahead aggressively. Best-effort — ignore failures. madvise
+        // is Unix-only; Windows has no equivalent in memmap2.
+        #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         Ok(JsonData::Mapped { _file: file, mmap })
     })
@@ -43,7 +45,14 @@ pub fn spawn_parse(data: Vec<u8>) -> mpsc::Receiver<LoadMsg> {
 /// `-o -` (stdout) and `--no-progress-meter` are appended automatically.
 pub fn spawn_exec_curl(curl_args: Vec<String>) -> mpsc::Receiver<LoadMsg> {
     spawn_build(move || {
-        let output = std::process::Command::new("curl")
+        let mut cmd = std::process::Command::new("curl");
+        // Without this a console window flashes open for the child process.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let output = cmd
             .args(&curl_args)
             .arg("--no-progress-meter")
             .arg("-o")
