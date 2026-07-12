@@ -40,7 +40,36 @@ fn set_as_default_json_viewer() -> bool {
             ) == 0
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows won't let an app set itself as default (the user choice is
+    // hash-protected), so register a ProgID under HKCU so the app shows up
+    // in "Open with", then send the user to the Default Apps settings page.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(exe) = std::env::current_exe() else { return false };
+        let exe = exe.display().to_string();
+        let reg = |args: &[&str]| {
+            std::process::Command::new("reg")
+                .args(args)
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let progid = r"HKCU\Software\Classes\QuickJSONViewer.json";
+        let ok = reg(&["add", progid, "/ve", "/d", "Quick JSON Viewer", "/f"])
+            && reg(&["add", &format!(r"{progid}\shell\open\command"), "/ve", "/d", &format!("\"{exe}\" \"%1\""), "/f"])
+            && reg(&["add", r"HKCU\Software\Classes\.json\OpenWithProgids", "/v", "QuickJSONViewer.json", "/t", "REG_SZ", "/d", "", "/f"]);
+        if ok {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "ms-settings:defaultapps"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+        ok
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         false
     }
@@ -334,8 +363,22 @@ pub fn show_settings_window(
                     SET_DEFAULT_STATUS.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
                 }
                 match SET_DEFAULT_STATUS.load(Ordering::Relaxed) {
-                    1 => { ui.colored_label(egui::Color32::from_rgb(52, 199, 89), "Set as default"); }
-                    2 => { ui.colored_label(egui::Color32::from_rgb(255, 69, 58), "Failed — run from .app bundle"); }
+                    1 => {
+                        let msg = if cfg!(target_os = "windows") {
+                            "Registered — pick Quick JSON Viewer for .json in Settings"
+                        } else {
+                            "Set as default"
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(52, 199, 89), msg);
+                    }
+                    2 => {
+                        let msg = if cfg!(target_os = "macos") {
+                            "Failed — run from .app bundle"
+                        } else {
+                            "Failed to register"
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(255, 69, 58), msg);
+                    }
                     _ => {}
                 }
             });

@@ -6,7 +6,33 @@ on:
       - 'v*'
 
 jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package .exe as zip
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE="quick-json-viewer-${VERSION}-windows-x86_64.zip"
+          7z a "$ARCHIVE" ./target/release/quick-json-viewer.exe
+          echo "Archive : $ARCHIVE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: quick-json-viewer-*-windows-x86_64.zip
+
   release:
+    needs: build-windows
     runs-on: macos-latest
     permissions:
       contents: write
@@ -80,8 +106,14 @@ jobs:
             fi
           } > release_notes.md
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ARCHIVE }}
+          files: |
+            ${{ env.ARCHIVE }}
+            quick-json-viewer-*-windows-x86_64.zip
           body_path: release_notes.md
