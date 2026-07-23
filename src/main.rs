@@ -2372,7 +2372,18 @@ fn render_row(
             // Double-click anywhere on a container toggles it.
             actions.push(RowAction::Toggle(node_idx));
         } else if !is_container {
-            actions.push(RowAction::StartEditValue(node_idx));
+            // Double-click on the key text edits the key; anywhere else
+            // (value, separator, padding) edits the value.
+            let key_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + indent + 18.0, rect.top()),
+                egui::vec2(key_w, row_h),
+            );
+            let click_pos = response.interact_pointer_pos();
+            if key_w > 0.0 && click_pos.is_some_and(|p| key_rect.contains(p)) {
+                actions.push(RowAction::StartEditKey(node_idx));
+            } else {
+                actions.push(RowAction::StartEditValue(node_idx));
+            }
         }
     }
 
