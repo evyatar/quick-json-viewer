@@ -2000,6 +2000,7 @@ impl App {
             let multi_select   = tree.multi_select;
             let checked        = &tree.checked;
 
+            ui.spacing_mut().item_spacing.y = 0.0;
             let avail_h   = ui.available_height();
             let row_pitch = row_h + ui.spacing().item_spacing.y;
 
@@ -2009,15 +2010,38 @@ impl App {
                 scroll_area = scroll_area.vertical_scroll_offset(y);
             }
             scroll_area.show_rows(ui, row_h, num_rows, |ui, row_range| {
+                let mut selected_row_rect: Option<egui::Rect> = None;
+                let mut prev_bg_rank: u8 = 0;
                 for row_idx in row_range {
                     let node_idx = visible[row_idx];
-                    let row_actions = render_row(
+                    let (row_actions, row_selected_rect, row_bg_rank) = render_row(
                         ui, edit_overlay, saved_overlay, index, added_items, expanded, selected, search_res_set, node_idx,
                         row_h, key_font.clone(), val_font.clone(),
                         multi_select, checked.contains(&node_idx), !checked.is_empty(),
-                        reveal_row == Some(row_idx), copy_compact,
+                        reveal_row == Some(row_idx), copy_compact, prev_bg_rank,
                     );
                     actions.extend(row_actions);
+                    if row_selected_rect.is_some() { selected_row_rect = row_selected_rect; }
+                    prev_bg_rank = row_bg_rank;
+                }
+                // Selection ring/bar, painted once after every visible row so it
+                // composites on top of all of them — otherwise a neighboring
+                // row's hover/match tint (hairline-expanded to avoid seams
+                // between adjacent tinted rows) could paint over its edge.
+                // Stays on the tree's own Middle layer rather than Foreground
+                // so it never fights with `Order::Foreground` popups such as
+                // this row's own right-click context menu.
+                if let Some(rect) = selected_row_rect {
+                    ui.painter().rect_stroke(
+                        rect, 0.0,
+                        egui::Stroke::new(1.5, theme::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                    let bar = egui::Rect::from_min_max(
+                        rect.left_top(),
+                        egui::pos2(rect.left() + 3.0, rect.bottom()),
+                    );
+                    ui.painter().rect_filled(bar, 0.0, theme::ACCENT);
                 }
             });
         }
@@ -2110,6 +2134,7 @@ fn value_parts(index: &index::JsonIndex, node: &index::Node, dark: bool) -> (Str
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     ui:               &mut egui::Ui,
     edit_overlay:     &std::collections::HashMap<u32, export::NodeEdit>,
@@ -2128,7 +2153,8 @@ fn render_row(
     any_checked:      bool,
     reveal:           bool,
     copy_compact:     bool,
-) -> Vec<RowAction> {
+    prev_bg_rank:     u8,
+) -> (Vec<RowAction>, Option<egui::Rect>, u8) {
     use index::NodeKind;
 
     // A pending (not-yet-saved) added item has no real node — fabricate one
@@ -2257,40 +2283,55 @@ fn render_row(
         );
     }
 
-    // Background
-    if is_match {
-        ui.painter().rect_filled(
-            rect, 0.0,
-            if dark { theme::MATCH_BG } else { egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140) },
-        );
+    // Priority rank of this row's own background — used both to decide
+    // whether the indent guides underneath are visible (skipped whenever a
+    // background tint would be painted over them) and, just below, to
+    // resolve the hairline overlap between adjacent rows' backgrounds.
+    // Front-to-back stacking order is: selection ring, search-match
+    // highlight, selection fill, hover fill — so rank goes highlight (3) >
+    // selection (2) > hover (1) > none (0).
+    let bg_rank: u8 = if is_match { 3 } else if is_selected { 2 } else if response.hovered() { 1 } else { 0 };
+    if dark && bg_rank == 0 {
+        for d in 0..depth {
+            let gx = rect.left() + indent_at(d) + 8.0;
+            ui.painter().vline(gx, rect.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
+        }
     }
+
+    // Background — selection/hover base first, then the search-match tint
+    // painted on top as a translucent overlay so a selected+matched row
+    // shows both cues instead of the opaque selection fill hiding the
+    // match highlight entirely. Fills are expanded a hairline vertically so
+    // adjacent rows' anti-aliased edges overlap instead of leaving a 1px
+    // seam of the panel background between them. The top edge only expands
+    // into the row above when this row's rank is at least as high: a lower
+    // rank must never paint over a higher-priority neighbor that already
+    // claimed that hairline via its own downward expansion. The bottom edge
+    // always expands — the row below resolves the same way against this
+    // row's rank when it paints.
+    let top_expand = if bg_rank >= prev_bg_rank { 0.75 } else { 0.0 };
+    let bg_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(),  rect.top() - top_expand),
+        egui::pos2(rect.right(), rect.bottom() + 0.75),
+    );
     if is_selected {
         if dark {
-            ui.painter().rect_filled(rect, 0.0, theme::SELECTION_BG);
-            // 2 px accent bar flush against the left edge of the row.
-            let bar = egui::Rect::from_min_max(
-                rect.left_top(),
-                egui::pos2(rect.left() + 2.0, rect.bottom()),
-            );
-            ui.painter().rect_filled(bar, 0.0, theme::ACCENT);
+            ui.painter().rect_filled(bg_rect, 0.0, theme::SELECTION_BG);
         } else {
-            ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
+            ui.painter().rect_filled(bg_rect, 0.0, ui.visuals().selection.bg_fill);
         }
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
+        ui.painter().rect_filled(bg_rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
+    }
+    if is_match {
+        ui.painter().rect_filled(
+            bg_rect, 0.0,
+            if dark { theme::MATCH_BG } else { egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140) },
+        );
     }
 
     let painter  = ui.painter();
     let text_col = if is_selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
-
-    // Indent guides — one 1 px vertical line per ancestor level, aligned under
-    // the parent chevrons.
-    if dark {
-        for d in 0..depth {
-            let gx = rect.left() + indent_at(d) + 8.0;
-            painter.vline(gx, rect.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
-        }
-    }
 
     // y position for single-line elements: centred in the first row_h band.
     let y1 = rect.top() + row_h / 2.0;
@@ -2565,7 +2606,7 @@ fn render_row(
         });
     });
 
-    actions
+    (actions, if is_selected { Some(rect) } else { None }, bg_rank)
 }
 
 /// JSONPath segment for an object key: dot notation for simple identifiers,
@@ -4113,6 +4154,7 @@ impl App {
         let scroll_to_row = tree.scroll_to_row.take();
         let reveal_row = tree.reveal_row.take();
 
+        ui.spacing_mut().item_spacing.y = 0.0;
         let avail_h   = ui.available_height();
         let row_pitch = row_h + ui.spacing().item_spacing.y;
         let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
@@ -4209,11 +4251,6 @@ fn render_diff_row(
     let left_cell  = egui::Rect::from_min_max(rect.left_top(), egui::pos2(mid_x, rect.bottom()));
     let right_cell = egui::Rect::from_min_max(egui::pos2(mid_x, rect.top()), rect.right_bottom());
 
-    // Hover first, so status tints layer over it.
-    if !is_selected && response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
-    }
-
     // Per-cell status tints — skip on expanded containers (diffs are visible inside).
     let tint_status = if is_expanded && dn.child_count > 0 { DiffStatus::Unchanged } else { status };
     let (lt, rt) = match tint_status {
@@ -4222,6 +4259,34 @@ fn render_diff_row(
         DiffStatus::Changed   => (Some(theme::DIFF_CHANGED_BG), Some(theme::DIFF_CHANGED_BG)),
         DiffStatus::Unchanged => (None, None),
     };
+
+    // Indent guides — one 1 px vertical line per ancestor level, aligned
+    // under the parent chevrons. Skipped per-cell when that cell will paint
+    // any background tint (hover/status/selection): hover is opaque and
+    // would just cover the guide anyway, but the status/selection tints are
+    // translucent and let the guide show through as a stray stripe, so it's
+    // simplest to never draw it under a highlighted cell at all.
+    let hovered = response.hovered();
+    let has_left_bg  = is_selected || hovered || lt.is_some();
+    let has_right_bg = is_selected || hovered || rt.is_some();
+    if dark {
+        for d in 0..depth {
+            if !has_left_bg {
+                let lx = left_cell.left() + 4.0 + d as f32 * 16.0 + 8.0;
+                ui.painter().vline(lx, left_cell.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
+            }
+            if !has_right_bg {
+                let rx = right_cell.left() + 4.0 + d as f32 * 16.0 + 8.0;
+                ui.painter().vline(rx, right_cell.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
+            }
+        }
+    }
+
+    // Hover first, so status tints layer over it.
+    if !is_selected && hovered {
+        ui.painter().rect_filled(rect, 0.0, theme::Palette::for_dark(dark).hover_bg);
+    }
+
     if let Some(c) = lt { ui.painter().rect_filled(left_cell,  0.0, c); }
     if let Some(c) = rt { ui.painter().rect_filled(right_cell, 0.0, c); }
 
@@ -4324,14 +4389,6 @@ fn draw_diff_cell(
 
     let indent = 4.0 + depth as f32 * 16.0;
     let y1 = cell.top() + row_h / 2.0;
-
-    if dark {
-        for d in 0..depth {
-            let gx = cell.left() + 4.0 + d as f32 * 16.0 + 8.0;
-            painter.vline(gx, cell.y_range(), egui::Stroke::new(1.0_f32, theme::INDENT_GUIDE));
-        }
-    }
-
     let mut x = cell.left() + indent;
     let mut caret_rect = None;
     if show_caret {
