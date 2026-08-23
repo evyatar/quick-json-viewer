@@ -1550,10 +1550,25 @@ impl App {
             }
             resp.on_hover_text("Multi-select mode — check rows, then right-click → Export");
         }
-        if self.settings.ai_enabled {
+        {
+            // The button is always visible; on an unconfigured install it
+            // sends the user to Settings → AI Assistant instead of opening
+            // an assistant that could not talk to a provider.
+            let configured = self.settings.ai_enabled
+                && self.ai_settings_ui.key_present(self.settings.ai_provider);
             let resp = tab_button(ui, &pal, egui::RichText::new("✨ AI").strong(), self.ai.open);
-            if resp.on_hover_text("AI assistant — query and edit with your own API key").clicked() {
-                self.ai.open = !self.ai.open;
+            let resp = resp.on_hover_text(if configured {
+                "AI assistant — query and edit with your own API key"
+            } else {
+                "AI assistant — set up your API key in Settings"
+            });
+            if resp.clicked() {
+                if configured {
+                    self.ai.open = !self.ai.open;
+                } else {
+                    self.ai_settings_ui.focus = true;
+                    self.settings_open = true;
+                }
             }
         }
         ui.add_space(8.0);
