@@ -77,6 +77,8 @@ enum RowAction {
     StartEditKey(u32),
     DeleteNode(u32),
     AddItem(u32),
+    /// Turn the search results into every node similar to this one.
+    FindSimilar(u32, search::SimilarBy),
 }
 
 /// What an export operates on.
@@ -2057,6 +2059,7 @@ impl App {
         let mut start_edit_req: Option<(u32, EditField)> = None;
         let mut delete_req: Option<u32> = None;
         let mut add_item_req: Option<u32> = None;
+        let mut find_similar_req: Option<(u32, search::SimilarBy)> = None;
         for action in actions {
             match action {
                 RowAction::Select(n)           => { tree.selected = Some(n); }
@@ -2069,6 +2072,7 @@ impl App {
                 RowAction::StartEditKey(n)      => { start_edit_req = Some((n, EditField::Key)); }
                 RowAction::DeleteNode(n)        => { delete_req = Some(n); }
                 RowAction::AddItem(n)           => { add_item_req = Some(n); }
+                RowAction::FindSimilar(n, by)   => { find_similar_req = Some((n, by)); }
             }
         }
         // `tree` borrow ends here; export/edit/delete/add need &mut self.
@@ -2083,6 +2087,9 @@ impl App {
         }
         if let Some(parent) = add_item_req {
             self.start_add_item(parent);
+        }
+        if let Some((n, by)) = find_similar_req {
+            self.kick_find_similar(n, by);
         }
     }
 }
@@ -2548,6 +2555,30 @@ fn render_row(
                 for &lang in codegen::LANGUAGES {
                     if ui.button(lang.label()).clicked() {
                         ui.ctx().copy_text(codegen::generate(raw, lang, &root_name));
+                        ui.close();
+                    }
+                }
+            });
+        }
+
+        // Find similar — real nodes only; pending adds aren't in the index and
+        // so can't be the reference for a scan over it.
+        if !is_new {
+            ui.separator();
+            ui.menu_button("Find Similar Items", |ui| {
+                let has_key = n.key_len > 0;
+                for by in [
+                    search::SimilarBy::KeyAndValue,
+                    search::SimilarBy::Key,
+                    search::SimilarBy::Value,
+                ] {
+                    // Key-based modes need a key: every array element would
+                    // otherwise match every other keyless node.
+                    if !has_key && by != search::SimilarBy::Value {
+                        continue;
+                    }
+                    if ui.button(by.label()).clicked() {
+                        actions.push(RowAction::FindSimilar(node_idx, by));
                         ui.close();
                     }
                 }
@@ -3060,6 +3091,48 @@ impl App {
             self.search_pending =
                 Some(std::thread::spawn(move || search::search(&index, &query, use_regex, &cancel)));
         }
+    }
+
+    /// Right-click → Find Similar Items: scan for every node sharing the
+    /// reference node's key and/or value, and land the hits in the search
+    /// results so highlighting, ▲/▼ and ⌘G work exactly as for a typed query.
+    fn kick_find_similar(&mut self, node_idx: u32, by: search::SimilarBy) {
+        // Abort any in-flight scan — its results would land on top of ours.
+        self.search_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.search_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.search_pending = None;
+        self.search_debounce_until = None;
+        let Some(t) = &self.tree else { return };
+        // Show the closest typed equivalent in the box so the user can see
+        // what's highlighted and tweak it. It's a display approximation: the
+        // scan matches keys and values exactly, `key:` is a substring filter,
+        // and long values are elided.
+        self.search_input = t
+            .index
+            .nodes
+            .get(node_idx as usize)
+            .map(|n| {
+                let key = t.index.key_of(n);
+                let val = elide(&String::from_utf8_lossy(t.index.value_bytes(n)), 40);
+                match by {
+                    search::SimilarBy::Key         => format!("key:{key}"),
+                    search::SimilarBy::Value       => format!("value = {val}"),
+                    search::SimilarBy::KeyAndValue => format!("\"{key}\" = {val}"),
+                }
+            })
+            .unwrap_or_default();
+        let index  = Arc::clone(&t.index);
+        let cancel = Arc::clone(&self.search_cancel);
+        self.search_pending =
+            Some(std::thread::spawn(move || search::find_similar(&index, node_idx, by, &cancel)));
+    }
+}
+
+/// Shorten `s` to at most `max` chars, marking the cut with an ellipsis.
+fn elide(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None           => s.to_owned(),
     }
 }
 

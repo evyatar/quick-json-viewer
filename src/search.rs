@@ -309,6 +309,75 @@ fn part_matches(index: &JsonIndex, node: &Node, part: &CompiledPart<'_>) -> bool
 /// How often the scan loops poll the cancellation flag.
 const CANCEL_STRIDE: usize = 8192;
 
+// ─── find similar ────────────────────────────────────────────────────────────
+
+/// Which attributes a node must share with the reference node to be "similar".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimilarBy {
+    Key,
+    Value,
+    KeyAndValue,
+}
+
+impl SimilarBy {
+    pub fn label(self) -> &'static str {
+        match self {
+            SimilarBy::Key         => "Same Key",
+            SimilarBy::Value       => "Same Value",
+            SimilarBy::KeyAndValue => "Same Key and Value",
+        }
+    }
+}
+
+/// Bytes compared by the value modes: strings without their surrounding
+/// quotes, scalars verbatim, containers as their raw source text — so two
+/// identically written objects match, while formatting or key-order
+/// differences make them differ.
+fn similar_value_bytes<'a>(index: &'a JsonIndex, n: &Node) -> &'a [u8] {
+    match n.kind {
+        NodeKind::String => {
+            let raw = index.value_bytes(n);
+            if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { raw }
+        }
+        _ => index.value_bytes(n),
+    }
+}
+
+/// Every node whose key and/or value is byte-for-byte identical to
+/// `node_idx`'s — including `node_idx` itself, so the highlighted set is what
+/// the user right-clicked plus its twins. Same cancellation contract as
+/// [`search`]: `None` means the scan was aborted and results must be dropped.
+pub fn find_similar(
+    index:    &JsonIndex,
+    node_idx: u32,
+    by:       SimilarBy,
+    cancel:   &AtomicBool,
+) -> Option<Vec<u32>> {
+    let Some(target) = index.nodes.get(node_idx as usize) else {
+        return Some(Vec::new());
+    };
+    let want_key = key_bytes(index, target);
+    let want_val = similar_value_bytes(index, target);
+
+    let mut out = Vec::new();
+    for (i, node) in index.nodes.iter().enumerate() {
+        if i % CANCEL_STRIDE == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let hit = match by {
+            SimilarBy::Key         => key_bytes(index, node) == want_key,
+            SimilarBy::Value       => similar_value_bytes(index, node) == want_val,
+            SimilarBy::KeyAndValue => {
+                key_bytes(index, node) == want_key && similar_value_bytes(index, node) == want_val
+            }
+        };
+        if hit {
+            out.push(i as u32);
+        }
+    }
+    Some(out)
+}
+
 /// Search node keys and leaf values for `query`.
 /// Regex mode matches the pattern against keys and raw values (no DSL).
 /// Otherwise the query is parsed as smart-search parts AND-ed together.
@@ -563,5 +632,73 @@ mod tests {
         let res = search(&idx, "value < -5", false);
         assert_eq!(res.len(), 1);
         assert_eq!(idx.key_of(&idx.nodes[res[0] as usize]), "t");
+    }
+
+    /// Test wrapper: find_similar with a never-raised cancel flag.
+    fn similar(index: &JsonIndex, node_idx: u32, by: SimilarBy) -> Vec<u32> {
+        super::find_similar(index, node_idx, by, &AtomicBool::new(false)).unwrap()
+    }
+
+    /// Index of the first node with the given key.
+    fn node_with_key(index: &JsonIndex, key: &str) -> u32 {
+        index
+            .nodes
+            .iter()
+            .position(|n| index.key_of(n) == key)
+            .expect("key not in document") as u32
+    }
+
+    #[test]
+    fn similar_key_and_value_is_exact() {
+        let idx = make_index(
+            r#"[{"status": "ok"}, {"status": "okay"}, {"state": "ok"}, {"status": "ok"}]"#,
+        );
+        let target = node_with_key(&idx, "status");
+        let res = similar(&idx, target, SimilarBy::KeyAndValue);
+        // The two `"status": "ok"` pairs — "okay" and "state" are near misses.
+        assert_eq!(res.len(), 2);
+        assert!(res.contains(&target));
+    }
+
+    #[test]
+    fn similar_key_ignores_value() {
+        let idx = make_index(r#"{"a": {"id": 1}, "b": {"id": 2}, "c": {"other": 1}}"#);
+        let target = node_with_key(&idx, "id");
+        assert_eq!(similar(&idx, target, SimilarBy::Key).len(), 2);
+    }
+
+    #[test]
+    fn similar_value_ignores_key() {
+        let idx = make_index(r#"{"a": "x", "b": "x", "c": "y"}"#);
+        let target = node_with_key(&idx, "a");
+        assert_eq!(similar(&idx, target, SimilarBy::Value).len(), 2);
+    }
+
+    #[test]
+    fn similar_value_matches_number_and_string_separately() {
+        let idx = make_index(r#"{"a": 1, "b": "1"}"#);
+        let num = node_with_key(&idx, "a");
+        // "1" (string, quotes stripped) and 1 (number) are both the byte "1".
+        assert_eq!(similar(&idx, num, SimilarBy::Value).len(), 2);
+    }
+
+    #[test]
+    fn similar_value_matches_identical_containers() {
+        let idx = make_index(r#"[{"a":1},{"a":1},{"a":2}]"#);
+        let res = similar(&idx, 1, SimilarBy::Value);
+        assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn similar_always_includes_the_reference_node() {
+        let idx = make_index(r#"{"only": "one"}"#);
+        let target = node_with_key(&idx, "only");
+        assert_eq!(similar(&idx, target, SimilarBy::KeyAndValue), vec![target]);
+    }
+
+    #[test]
+    fn similar_out_of_range_node_is_empty() {
+        let idx = make_index(r#"{"a": 1}"#);
+        assert!(similar(&idx, 9999, SimilarBy::Key).is_empty());
     }
 }
