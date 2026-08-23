@@ -27,6 +27,10 @@ pub enum EditAction {
     /// New key for an object property.
     RenameKey(String),
     Delete,
+    /// Append a new child to the container at `ProposedEdit::path`.
+    /// `key` is `Some` for an object property, `None` for an array element;
+    /// `value` is raw JSON text (mirrors [`crate::export::AddedItem`]).
+    AddItem { key: Option<String>, value: String },
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +80,7 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "propose_edits",
-            description: "Propose edits to the document. The edits are NOT applied — they are shown to the user as a reviewable changeset with Apply/Reject controls. Use for value changes, key renames and deletions, including bulk edits (one entry per node).",
+            description: "Propose edits to the document. The edits are NOT applied — they are shown to the user as a reviewable changeset with Apply/Reject controls. Use for value changes, key renames, deletions and adding new items to arrays/objects, including bulk edits (one entry per node).",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -85,10 +89,10 @@ pub fn definitions() -> Vec<ToolDef> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Path of the node to edit."},
-                                "action": {"type": "string", "enum": ["set_value", "rename_key", "delete"]},
-                                "value": {"type": "string", "description": "For set_value: the new value as raw JSON text (e.g. \"\\\"hello\\\"\", \"42\", \"true\")."},
-                                "key": {"type": "string", "description": "For rename_key: the new key."}
+                                "path": {"type": "string", "description": "Path of the node to edit. For add_item this is the path of the array or object to append to."},
+                                "action": {"type": "string", "enum": ["set_value", "rename_key", "delete", "add_item"]},
+                                "value": {"type": "string", "description": "For set_value and add_item: the value as raw JSON text (e.g. \"\\\"hello\\\"\", \"42\", \"true\", \"{\\\"id\\\": 1}\")."},
+                                "key": {"type": "string", "description": "For rename_key: the new key. For add_item: the property name — required when appending to an object, omitted when appending to an array."}
                             },
                             "required": ["path", "action"]
                         }
@@ -228,6 +232,37 @@ fn propose_edits(index: &Arc<JsonIndex>, args: &Value) -> ToolOutcome {
                     continue;
                 }
                 EditAction::RenameKey(k.to_owned())
+            }
+            "add_item" => {
+                let Some(v) = e["value"].as_str() else {
+                    errors.push(format!("edit {i}: add_item requires `value`"));
+                    continue;
+                };
+                if serde_json::from_str::<Value>(v).is_err() {
+                    errors.push(format!("edit {i}: `value` is not valid JSON: {v}"));
+                    continue;
+                }
+                let key = e["key"].as_str().filter(|k| !k.is_empty()).map(str::to_owned);
+                match node.kind {
+                    NodeKind::Object => {
+                        if key.is_none() {
+                            errors.push(format!(
+                                "edit {i}: add_item on the object {path} requires `key`"
+                            ));
+                            continue;
+                        }
+                    }
+                    NodeKind::Array => {}
+                    _ => {
+                        errors.push(format!(
+                            "edit {i}: {path} is neither an array nor an object — add_item needs the path of the container to append to"
+                        ));
+                        continue;
+                    }
+                }
+                // An array element has no key; drop a stray one rather than failing.
+                let key = if node.kind == NodeKind::Array { None } else { key };
+                EditAction::AddItem { key, value: v.to_owned() }
             }
             "delete" => {
                 if node.parent == u32::MAX {
@@ -552,6 +587,40 @@ mod tests {
         assert!(out.output.contains("Rejected"));
         assert!(matches!(out.proposals[0].action, EditAction::SetValue(_)));
         assert!(matches!(out.proposals[1].action, EditAction::Delete));
+    }
+
+    #[test]
+    fn propose_add_item_validates() {
+        let idx = make(r#"{"items": [1, 2], "meta": {"a": 1}, "n": 5}"#);
+        let args = json!({"edits": [
+            {"path": "$.items", "action": "add_item", "value": "3"},
+            // A stray key on an array append is dropped, not rejected.
+            {"path": "$.items", "action": "add_item", "value": "4", "key": "x"},
+            {"path": "$.meta", "action": "add_item", "value": "2", "key": "b"},
+            {"path": "$.meta", "action": "add_item", "value": "2"},
+            {"path": "$.n", "action": "add_item", "value": "1"},
+            {"path": "$.items", "action": "add_item", "value": "{oops"},
+            {"path": "$.items", "action": "add_item"},
+        ]});
+        let out = propose_edits(&idx, &args);
+        assert_eq!(out.proposals.len(), 3);
+        assert_eq!(
+            out.proposals[0].action,
+            EditAction::AddItem { key: None, value: "3".to_owned() }
+        );
+        assert_eq!(
+            out.proposals[1].action,
+            EditAction::AddItem { key: None, value: "4".to_owned() }
+        );
+        assert_eq!(
+            out.proposals[2].action,
+            EditAction::AddItem { key: Some("b".to_owned()), value: "2".to_owned() }
+        );
+        // Object without a key, a scalar target, bad JSON and a missing value.
+        assert!(out.output.contains("requires `key`"));
+        assert!(out.output.contains("neither an array nor an object"));
+        assert!(out.output.contains("not valid JSON"));
+        assert!(out.output.contains("add_item requires `value`"));
     }
 
     #[test]

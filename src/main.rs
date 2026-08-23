@@ -79,6 +79,7 @@ fn contains_rtl(s: &str) -> bool {
     })
 }
 
+use export::AddedItem;
 use loader::LoadMsg;
 use settings::{Settings, show_settings_window};
 use tree::TreeState;
@@ -173,13 +174,16 @@ struct UndoEntry {
 
 /// One entry on the undo/redo stack: either an `edit_overlay` change, the
 /// addition of a pending array item / object property (see `TreeState::add_item`),
-/// or a batch of overlay changes applied together (an AI changeset) that
+/// or a batch of changes applied together (an AI changeset) that
 /// undoes/redoes as one unit.
 #[derive(Clone)]
 enum UndoAction {
     Overlay(UndoEntry),
     Add { parent: u32, key: Option<String>, raw_value: String },
-    Batch(Vec<UndoEntry>),
+    /// An AI changeset: overlay edits plus any items it appended. `adds` are
+    /// always the most recently pushed pending items, so undoing pops them
+    /// in reverse (same LIFO invariant as `UndoAction::Add`).
+    Batch { entries: Vec<UndoEntry>, adds: Vec<AddedItem> },
 }
 
 /// Actions produced by a diff row, applied after the scroll-area borrow ends.
@@ -726,7 +730,13 @@ impl eframe::App for App {
         // ── 3c. ⌘C — copy selected node value when no text field is focused ──
         // egui-winit converts Cmd+C into Event::Copy (early-return, no Key event),
         // so we must intercept Event::Copy rather than using key_pressed(Key::C).
-        if no_text_focus {
+        // When text is selected in a label (e.g. an AI chat message), leave the
+        // event alone so egui's own label-selection handler copies that instead.
+        let label_selection = ui
+            .ctx()
+            .with_plugin::<egui::text_selection::LabelSelectionState, _>(|s| s.has_selection())
+            .unwrap_or(false);
+        if no_text_focus && !label_selection {
             let copy_event = ui.input_mut(|i| {
                 let mut found = false;
                 i.events.retain(|e| {
@@ -3125,11 +3135,16 @@ impl App {
                     tree.remove_last_added_item();
                 }
             }
-            UndoAction::Batch(entries) => {
+            UndoAction::Batch { entries, adds } => {
                 for entry in entries.iter().rev() {
                     match &entry.before {
                         Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
                         None       => { self.edit_overlay.remove(&entry.node_idx); }
+                    }
+                }
+                if let Some(tree) = &mut self.tree {
+                    for _ in adds {
+                        tree.remove_last_added_item();
                     }
                 }
             }
@@ -3153,11 +3168,16 @@ impl App {
                     tree.add_item(*parent, key.clone(), raw_value.clone());
                 }
             }
-            UndoAction::Batch(entries) => {
+            UndoAction::Batch { entries, adds } => {
                 for entry in entries {
                     match &entry.after {
                         Some(edit) => { self.edit_overlay.insert(entry.node_idx, edit.clone()); }
                         None       => { self.edit_overlay.remove(&entry.node_idx); }
+                    }
+                }
+                if let Some(tree) = &mut self.tree {
+                    for add in adds {
+                        tree.add_item(add.parent, add.key.clone(), add.raw_value.clone());
                     }
                 }
             }
@@ -3299,6 +3319,7 @@ impl App {
         let Some(tree) = &self.tree else { return };
         let index = Arc::clone(&tree.index);
         let mut entries: Vec<UndoEntry> = Vec::new();
+        let mut adds: Vec<AddedItem> = Vec::new();
         let mut failed = 0usize;
         for edit in &edits {
             let node_idx = match ai::tools::resolve_path(&index, &edit.path) {
@@ -3308,18 +3329,36 @@ impl App {
                     continue;
                 }
             };
+            // Adds are collected here and appended below — `tree` is borrowed
+            // immutably for the duration of the path resolution above.
+            if let ai::EditAction::AddItem { key, value } = &edit.action {
+                adds.push(AddedItem {
+                    parent:    node_idx,
+                    key:       key.clone(),
+                    raw_value: value.clone(),
+                });
+                continue;
+            }
             let before = self.edit_overlay.get(&node_idx).cloned();
             let entry = self.edit_overlay.entry(node_idx).or_default();
             match &edit.action {
                 ai::EditAction::SetValue(v)  => entry.value_override = Some(v.clone()),
                 ai::EditAction::RenameKey(k) => entry.key_override = Some(k.clone()),
                 ai::EditAction::Delete       => entry.deleted = true,
+                ai::EditAction::AddItem { .. } => unreachable!("handled above"),
             }
             let after = self.edit_overlay.get(&node_idx).cloned();
             entries.push(UndoEntry { node_idx, before, after });
         }
-        if !entries.is_empty() {
-            self.undo_stack.push(UndoAction::Batch(entries));
+        if !adds.is_empty() {
+            if let Some(tree) = &mut self.tree {
+                for add in &adds {
+                    tree.add_item(add.parent, add.key.clone(), add.raw_value.clone());
+                }
+            }
+        }
+        if !entries.is_empty() || !adds.is_empty() {
+            self.undo_stack.push(UndoAction::Batch { entries, adds });
             cap_undo(&mut self.undo_stack);
             self.redo_stack.clear();
         }
@@ -4713,6 +4752,73 @@ mod edit_tests {
         assert!(t.selected.is_some_and(|s| s < real_len));
         assert!(t.checked.iter().all(|&id| id < real_len));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ai_changeset_adds_items_and_undoes_as_one_unit() {
+        let mut app = app_with(r#"{"items": [1], "meta": {"a": 1}}"#);
+        let index = Arc::clone(&app.tree.as_ref().unwrap().index);
+        let name = nav(&index, &["meta", "a"]);
+
+        app.apply_ai_edits(vec![
+            ai::ProposedEdit {
+                path:   "$.items".to_owned(),
+                action: ai::EditAction::AddItem { key: None, value: "2".to_owned() },
+                old:    "[…] (1 items)".to_owned(),
+            },
+            ai::ProposedEdit {
+                path:   "$.meta".to_owned(),
+                action: ai::EditAction::AddItem {
+                    key:   Some("b".to_owned()),
+                    value: "true".to_owned(),
+                },
+                old:    "{…} (1 keys)".to_owned(),
+            },
+            ai::ProposedEdit {
+                path:   "$.meta.a".to_owned(),
+                action: ai::EditAction::SetValue("9".to_owned()),
+                old:    "1".to_owned(),
+            },
+        ]);
+
+        let t = app.tree.as_ref().unwrap();
+        assert_eq!(t.added_items.len(), 2);
+        assert_eq!(t.added_items[0].raw_value, "2");
+        assert_eq!(t.added_items[0].key, None);
+        assert_eq!(t.added_items[1].key.as_deref(), Some("b"));
+        assert_eq!(app.edit_overlay[&name].value_override.as_deref(), Some("9"));
+        assert!(app.is_dirty());
+
+        // The whole changeset — overlay edits and adds together — is one step.
+        app.undo();
+        assert!(app.tree.as_ref().unwrap().added_items.is_empty());
+        assert!(!app.edit_overlay.contains_key(&name));
+        assert!(!app.is_dirty());
+
+        app.redo();
+        let t = app.tree.as_ref().unwrap();
+        assert_eq!(t.added_items.len(), 2);
+        assert_eq!(t.added_items[1].key.as_deref(), Some("b"));
+        assert_eq!(app.edit_overlay[&name].value_override.as_deref(), Some("9"));
+
+        // The adds survive serialization.
+        let json = export::json_with_edits(&index, index.root, &app.edit_overlay,
+                                           &app.tree.as_ref().unwrap().added_items);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["items"], serde_json::json!([1, 2]));
+        assert_eq!(v["meta"], serde_json::json!({"a": 9, "b": true}));
+    }
+
+    #[test]
+    fn ai_add_into_unresolvable_path_is_reported() {
+        let mut app = app_with(r#"{"items": [1]}"#);
+        app.apply_ai_edits(vec![ai::ProposedEdit {
+            path:   "$.nope".to_owned(),
+            action: ai::EditAction::AddItem { key: None, value: "2".to_owned() },
+            old:    String::new(),
+        }]);
+        assert!(app.tree.as_ref().unwrap().added_items.is_empty());
+        assert!(!app.can_undo());
     }
 
     #[test]
