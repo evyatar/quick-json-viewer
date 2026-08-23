@@ -16,7 +16,9 @@ pub struct NodeEdit {
 /// index_in_this_vec`, which is always greater than every real `u32` node index.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddedItem {
-    pub parent:    u32,            // real Array or Object node this item is appended to
+    pub parent:    u32,            // Array/Object this item belongs to — a real
+                                   // node, or another pending item's id when it
+                                   // is a row of a pasted container
     pub key:       Option<String>, // Some for an Object property, None for an Array element
     pub raw_value: String,         // raw JSON text, as typed (validated JSON)
 }
@@ -27,8 +29,9 @@ pub fn is_added(nodes_len: usize, node_idx: u32) -> bool {
     node_idx as usize >= nodes_len
 }
 
-/// Group `added` by parent, in insertion order, keyed by the parent's real
-/// node index. Values are the synthetic ids (not indices into `added`).
+/// Group `added` by parent, in insertion order. Keys are real node indices for
+/// items appended to the document, or synthetic ids for the rows of a pasted
+/// container. Values are synthetic ids (not indices into `added`).
 pub fn build_added_map(nodes_len: usize, added: &[AddedItem]) -> HashMap<u32, Vec<u32>> {
     let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
     for (i, item) in added.iter().enumerate() {
@@ -42,9 +45,80 @@ pub fn build_added_map(nodes_len: usize, added: &[AddedItem]) -> HashMap<u32, Ve
 pub fn added_display_index(nodes: &[Node], added: &[AddedItem], node_idx: u32) -> u32 {
     let local = node_idx as usize - nodes.len();
     let parent = added[local].parent;
-    let base = nodes[parent as usize].child_count;
+    // A row nested inside a pending container has no real siblings to count
+    // past — everything under it is pending too.
+    let base = if is_added(nodes.len(), parent) { 0 } else { nodes[parent as usize].child_count };
     let offset = added[..=local].iter().filter(|it| it.parent == parent).count() as u32 - 1;
     base + offset
+}
+
+/// Kind of a pending item's value, inferred from its raw JSON text (which the
+/// Add dialog has already validated).
+pub fn added_kind(raw: &str) -> NodeKind {
+    match raw.trim_start().as_bytes().first() {
+        Some(b'{')        => NodeKind::Object,
+        Some(b'[')        => NodeKind::Array,
+        Some(b'"')        => NodeKind::String,
+        Some(b't' | b'f') => NodeKind::Bool,
+        Some(b'n')        => NodeKind::Null,
+        _                 => NodeKind::Number,
+    }
+}
+
+/// How many pending rows have `node_idx` (a synthetic id) as their parent.
+pub fn added_child_count(added: &[AddedItem], node_idx: u32) -> u32 {
+    added.iter().filter(|it| it.parent == node_idx).count() as u32
+}
+
+/// Nesting depth of a pending row: the depth of its nearest real ancestor plus
+/// one level per pending item in between.
+pub fn added_depth(nodes: &[Node], added: &[AddedItem], node_idx: u32) -> u16 {
+    let mut extra: u16 = 1;
+    let mut cur = added[node_idx as usize - nodes.len()].parent;
+    while is_added(nodes.len(), cur) {
+        extra += 1;
+        cur = added[cur as usize - nodes.len()].parent;
+    }
+    nodes[cur as usize].depth + extra
+}
+
+/// Display-only child rows for a pending container item — one per element of
+/// `raw_value`, recursively, in document order. `container_id` is the
+/// container's synthetic id; `first_id` the id the first returned row takes
+/// (callers append the result straight onto `added_items`).
+///
+/// These rows exist so a pasted object/array shows up as a tree right away
+/// instead of one long raw-text row, and they are what the serializers walk
+/// when writing the container back out — so editing, renaming, deleting or
+/// adding inside a pasted value all reach the saved file.
+pub fn expand_added_children(container_id: u32, first_id: u32, raw_value: &str) -> Vec<AddedItem> {
+    let bytes = raw_value.as_bytes();
+    let Ok((nodes, root, _)) = crate::parser::parse_bytes(bytes, &mut |_| {}) else {
+        return Vec::new();
+    };
+    let mut out: Vec<AddedItem> = Vec::new();
+    // Synthetic id per sub-node. Nodes are stored pre-order, so a parent is
+    // always assigned an id before its children are reached.
+    let mut ids = vec![u32::MAX; nodes.len()];
+    ids[root as usize] = container_id;
+    for (i, n) in nodes.iter().enumerate() {
+        if i as u32 == root {
+            continue;
+        }
+        // Not under `root` (only possible for NDJSON text) — skip the subtree.
+        let parent = ids[n.parent as usize];
+        if parent == u32::MAX {
+            continue;
+        }
+        ids[i] = first_id + out.len() as u32;
+        let key = (n.key_len > 0).then(|| {
+            let s = (n.value_start - n.key_start) as usize;
+            String::from_utf8_lossy(&bytes[s..s + n.key_len as usize]).into_owned()
+        });
+        let raw = String::from_utf8_lossy(&bytes[n.value_start as usize..n.value_end as usize]);
+        out.push(AddedItem { parent, key, raw_value: raw.into_owned() });
+    }
+    out
 }
 
 // ─── selection geometry ───────────────────────────────────────────────────────
@@ -262,13 +336,27 @@ fn write_json_edited(
     out:       &mut String,
 ) {
     if is_added(index.nodes.len(), idx) {
-        // A pending array item — no source bytes; emit its (possibly edited) text.
         let local = idx as usize - index.nodes.len();
-        let v = edits
-            .get(&idx)
-            .and_then(|e| e.value_override.as_deref())
-            .unwrap_or(added[local].raw_value.as_str());
-        out.push_str(v);
+        // A pending container is written from its child rows, so edits,
+        // renames, deletions and further adds inside a pasted object all
+        // reach the file. Without children (a scalar, or an empty `{}`/`[]`)
+        // its raw text — edited or as typed — is the value.
+        let kids = added_map.get(&idx).filter(|k| !k.is_empty());
+        let Some(kids) = kids else {
+            let v = edits
+                .get(&idx)
+                .and_then(|e| e.value_override.as_deref())
+                .unwrap_or(added[local].raw_value.as_str());
+            out.push_str(v);
+            return;
+        };
+        let is_obj = added_kind(&added[local].raw_value) == NodeKind::Object;
+        let children: Vec<u32> = kids
+            .iter()
+            .copied()
+            .filter(|c| !edits.get(c).map_or(false, |e| e.deleted))
+            .collect();
+        write_children_edited(index, is_obj, &children, edits, added, added_map, level, out);
         return;
     }
 
@@ -276,7 +364,6 @@ fn write_json_edited(
     match node.kind {
         NodeKind::Object | NodeKind::Array => {
             let is_obj = node.kind == NodeKind::Object;
-            let (open, close) = if is_obj { ('{', '}') } else { ('[', ']') };
 
             // Collect children, skipping any marked deleted.
             let mut children: Vec<u32> = Vec::new();
@@ -295,38 +382,7 @@ fn write_json_edited(
                     }
                 }
             }
-
-            if children.is_empty() {
-                out.push(open);
-                out.push(close);
-                return;
-            }
-            out.push(open);
-            out.push('\n');
-            for (i, &ch) in children.iter().enumerate() {
-                indent(out, level + 1);
-                if is_obj {
-                    // Use edited key if present, original (or the typed key,
-                    // for a pending added property) otherwise.
-                    let key = edits.get(&ch).and_then(|e| e.key_override.as_deref()).unwrap_or_else(|| {
-                        if is_added(index.nodes.len(), ch) {
-                            added[ch as usize - index.nodes.len()].key.as_deref().unwrap_or("")
-                        } else {
-                            index.key_of(&index.nodes[ch as usize])
-                        }
-                    });
-                    out.push('"');
-                    push_json_escaped(out, key);
-                    out.push_str("\": ");
-                }
-                write_json_edited(index, ch, edits, added, added_map, level + 1, out);
-                if i + 1 < children.len() {
-                    out.push(',');
-                }
-                out.push('\n');
-            }
-            indent(out, level);
-            out.push(close);
+            write_children_edited(index, is_obj, &children, edits, added, added_map, level, out);
         }
         _ => {
             // Use edited value if present, original raw bytes otherwise.
@@ -337,6 +393,52 @@ fn write_json_edited(
             }
         }
     }
+}
+
+/// Emit an object/array body for an already-filtered child list. Shared by real
+/// nodes and pending containers, which differ only in how the list is gathered.
+fn write_children_edited(
+    index:     &JsonIndex,
+    is_obj:    bool,
+    children:  &[u32],
+    edits:     &std::collections::HashMap<u32, NodeEdit>,
+    added:     &[AddedItem],
+    added_map: &HashMap<u32, Vec<u32>>,
+    level:     usize,
+    out:       &mut String,
+) {
+    let (open, close) = if is_obj { ('{', '}') } else { ('[', ']') };
+    if children.is_empty() {
+        out.push(open);
+        out.push(close);
+        return;
+    }
+    out.push(open);
+    out.push('\n');
+    for (i, &ch) in children.iter().enumerate() {
+        indent(out, level + 1);
+        if is_obj {
+            // Use edited key if present, original (or the typed key, for a
+            // pending added property) otherwise.
+            let key = edits.get(&ch).and_then(|e| e.key_override.as_deref()).unwrap_or_else(|| {
+                if is_added(index.nodes.len(), ch) {
+                    added[ch as usize - index.nodes.len()].key.as_deref().unwrap_or("")
+                } else {
+                    index.key_of(&index.nodes[ch as usize])
+                }
+            });
+            out.push('"');
+            push_json_escaped(out, key);
+            out.push_str("\": ");
+        }
+        write_json_edited(index, ch, edits, added, added_map, level + 1, out);
+        if i + 1 < children.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, level);
+    out.push(close);
 }
 
 /// Minified (no whitespace) JSON rooted at `root`, applying the `edits` overlay.
@@ -364,11 +466,18 @@ fn write_json_compact_edited(
 ) {
     if is_added(index.nodes.len(), idx) {
         let local = idx as usize - index.nodes.len();
-        let v = edits
-            .get(&idx)
-            .and_then(|e| e.value_override.as_deref())
-            .unwrap_or(added[local].raw_value.as_str());
-        out.push_str(v);
+        // See `write_json_edited`: a pending container comes from its rows.
+        let kids = added_map.get(&idx).filter(|k| !k.is_empty());
+        let Some(kids) = kids else {
+            let v = edits
+                .get(&idx)
+                .and_then(|e| e.value_override.as_deref())
+                .unwrap_or(added[local].raw_value.as_str());
+            out.push_str(v);
+            return;
+        };
+        let is_obj = added_kind(&added[local].raw_value) == NodeKind::Object;
+        write_children_compact_edited(index, is_obj, kids, edits, added, added_map, out);
         return;
     }
 
@@ -376,7 +485,6 @@ fn write_json_compact_edited(
     match node.kind {
         NodeKind::Object | NodeKind::Array => {
             let is_obj = node.kind == NodeKind::Object;
-            out.push(if is_obj { '{' } else { '[' });
             let mut children: Vec<u32> = Vec::new();
             let mut c = index.first_child(idx);
             while c != u32::MAX {
@@ -386,29 +494,7 @@ fn write_json_compact_edited(
             if let Some(extra) = added_map.get(&idx) {
                 children.extend(extra.iter().copied());
             }
-            let mut first = true;
-            for c in children {
-                if !edits.get(&c).map_or(false, |e| e.deleted) {
-                    if !first {
-                        out.push(',');
-                    }
-                    first = false;
-                    if is_obj {
-                        let key = edits.get(&c).and_then(|e| e.key_override.as_deref()).unwrap_or_else(|| {
-                            if is_added(index.nodes.len(), c) {
-                                added[c as usize - index.nodes.len()].key.as_deref().unwrap_or("")
-                            } else {
-                                index.key_of(&index.nodes[c as usize])
-                            }
-                        });
-                        out.push('"');
-                        push_json_escaped(out, key);
-                        out.push_str("\":");
-                    }
-                    write_json_compact_edited(index, c, edits, added, added_map, out);
-                }
-            }
-            out.push(if is_obj { '}' } else { ']' });
+            write_children_compact_edited(index, is_obj, &children, edits, added, added_map, out);
         }
         _ => {
             if let Some(v) = edits.get(&idx).and_then(|e| e.value_override.as_deref()) {
@@ -418,6 +504,44 @@ fn write_json_compact_edited(
             }
         }
     }
+}
+
+/// Compact counterpart of [`write_children_edited`]. Takes the unfiltered child
+/// list and skips deleted entries as it goes.
+fn write_children_compact_edited(
+    index:     &JsonIndex,
+    is_obj:    bool,
+    children:  &[u32],
+    edits:     &std::collections::HashMap<u32, NodeEdit>,
+    added:     &[AddedItem],
+    added_map: &HashMap<u32, Vec<u32>>,
+    out:       &mut String,
+) {
+    out.push(if is_obj { '{' } else { '[' });
+    let mut first = true;
+    for &c in children {
+        if edits.get(&c).map_or(false, |e| e.deleted) {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if is_obj {
+            let key = edits.get(&c).and_then(|e| e.key_override.as_deref()).unwrap_or_else(|| {
+                if is_added(index.nodes.len(), c) {
+                    added[c as usize - index.nodes.len()].key.as_deref().unwrap_or("")
+                } else {
+                    index.key_of(&index.nodes[c as usize])
+                }
+            });
+            out.push('"');
+            push_json_escaped(out, key);
+            out.push_str("\":");
+        }
+        write_json_compact_edited(index, c, edits, added, added_map, out);
+    }
+    out.push(if is_obj { '}' } else { ']' });
 }
 
 fn push_json_escaped(out: &mut String, s: &str) {

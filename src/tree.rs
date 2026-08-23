@@ -18,8 +18,9 @@ pub struct TreeState {
     pub search_result_set: NodeSet,
     pub scroll_to_row:     Option<usize>,
     pub reveal_row:        Option<usize>,
-    /// Array items added interactively but not yet saved to disk. Identified
-    /// by synthetic ids beyond the real node range (see [`export::AddedItem`]).
+    /// Items added interactively but not yet saved to disk, plus one row per
+    /// element of any pasted container value. Identified by synthetic ids
+    /// beyond the real node range (see [`export::AddedItem`]).
     pub added_items:       Vec<AddedItem>,
 }
 
@@ -63,28 +64,77 @@ impl TreeState {
         export::build_added_map(self.index.nodes.len(), &self.added_items)
     }
 
+    /// Number of derived rows a pending container expanded into (0 for a
+    /// pending scalar, or an empty `{}` / `[]`).
+    pub fn added_child_count(&self, node_idx: u32) -> u32 {
+        export::added_child_count(&self.added_items, node_idx)
+    }
+
+    /// Kind of any row, real or pending.
+    pub fn kind_of(&self, node_idx: u32) -> NodeKind {
+        if self.is_added(node_idx) {
+            export::added_kind(&self.added_item(node_idx).raw_value)
+        } else {
+            self.index.nodes[node_idx as usize].kind
+        }
+    }
+
+    /// Synthetic ids of a pending item's rows, in display order.
+    pub fn added_children(&self, node_idx: u32) -> Vec<u32> {
+        let nodes_len = self.index.nodes.len();
+        self.added_items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.parent == node_idx)
+            .map(|(i, _)| (nodes_len + i) as u32)
+            .collect()
+    }
+
     /// Append a new pending item to `parent` (an Array or Object node —
     /// `key` is `Some` for an object property, `None` for an array element),
     /// expand it so the item is visible, and return the new item's synthetic id.
+    ///
+    /// A container value is expanded into one child row per element right
+    /// after it, so a pasted object/array reads — and edits — as a tree
+    /// instead of a single raw-text row.
+    /// Returns the new item's synthetic id. Callers that need to undo the add
+    /// compare `added_items.len()` before and after: a container value pushes
+    /// more than one row.
     pub fn add_item(&mut self, parent: u32, key: Option<String>, raw_value: String) -> u32 {
+        let new_id = (self.index.nodes.len() + self.added_items.len()) as u32;
+        let children = match export::added_kind(&raw_value) {
+            NodeKind::Object | NodeKind::Array =>
+                export::expand_added_children(new_id, new_id + 1, &raw_value),
+            _ => Vec::new(),
+        };
         self.added_items.push(AddedItem { parent, key, raw_value });
-        let new_id = (self.index.nodes.len() + self.added_items.len() - 1) as u32;
         self.expanded.insert(parent);
+        if !children.is_empty() {
+            // Show the pasted container's contents without a click.
+            self.expanded.insert(new_id);
+            self.added_items.extend(children);
+        }
         self.refresh_visible();
         new_id
     }
 
-    /// Undo the most recent [`add_item`] — removes the last pending item.
-    /// Relies on strict undo/redo LIFO ordering: the add being undone is
-    /// always the most recently pushed entry (see `App::push_undo_add`).
-    pub fn remove_last_added_item(&mut self) {
-        let Some(item) = self.added_items.pop() else { return };
-        let removed_id = (self.index.nodes.len() + self.added_items.len()) as u32;
-        if self.selected == Some(removed_id) {
-            self.selected = Some(item.parent);
+    /// Undo an [`add_item`] — removes its `rows` trailing pending rows (the
+    /// item itself plus the rows a container value expanded into). Relies on
+    /// strict undo/redo LIFO ordering: the add being undone always sits at the
+    /// tail of `added_items` (see `App::push_undo_add`).
+    pub fn remove_last_added_items(&mut self, rows: usize) {
+        let nodes_len = self.index.nodes.len();
+        for _ in 0..rows {
+            let Some(item) = self.added_items.pop() else { break };
+            let removed_id = (nodes_len + self.added_items.len()) as u32;
+            if self.selected == Some(removed_id) {
+                // May itself be a removed row — the chain ends at a real node.
+                self.selected = Some(item.parent);
+            }
+            self.checked.remove(&removed_id);
+            self.search_result_set.remove(&removed_id);
+            self.expanded.remove(&removed_id);
         }
-        self.checked.remove(&removed_id);
-        self.search_result_set.remove(&removed_id);
         self.refresh_visible();
     }
 
@@ -191,7 +241,12 @@ impl TreeState {
     pub fn select_left(&mut self) {
         let Some(sel) = self.selected else { return; };
         if self.is_added(sel) {
-            self.selected = Some(self.added_parent(sel));
+            // A pending container collapses first, like a real one.
+            if self.expanded.contains(&sel) && self.added_child_count(sel) > 0 {
+                self.toggle(sel);
+            } else {
+                self.selected = Some(self.added_parent(sel));
+            }
             return;
         }
         let node = &self.index.nodes[sel as usize];
@@ -211,7 +266,10 @@ impl TreeState {
     pub fn select_right(&mut self) {
         let Some(sel) = self.selected else { return; };
         if self.is_added(sel) {
-            return; // added items are always leaves
+            if self.added_child_count(sel) > 0 && !self.expanded.contains(&sel) {
+                self.toggle(sel);
+            }
+            return;
         }
         let node = &self.index.nodes[sel as usize];
         if matches!(node.kind, NodeKind::Object | NodeKind::Array)
@@ -248,13 +306,13 @@ impl TreeState {
 
     /// Expand all ancestors of `node_idx` so it becomes visible, then rebuild.
     pub fn ensure_visible(&mut self, node_idx: u32) {
-        let mut current = if self.is_added(node_idx) {
-            let parent = self.added_parent(node_idx);
-            self.expanded.insert(parent);
-            parent
-        } else {
-            node_idx
-        };
+        // Pending rows can nest (a pasted container expands into derived rows),
+        // so walk up through them until a real node is reached.
+        let mut current = node_idx;
+        while self.is_added(current) {
+            current = self.added_parent(current);
+            self.expanded.insert(current);
+        }
         loop {
             let parent = self.index.nodes[current as usize].parent;
             if parent == u32::MAX {
@@ -284,6 +342,11 @@ impl TreeState {
     pub fn collapse_recursive(&mut self, root: u32) {
         let mut stack = vec![root];
         while let Some(idx) = stack.pop() {
+            if self.is_added(idx) {
+                self.expanded.remove(&idx);
+                stack.extend(self.added_children(idx));
+                continue;
+            }
             let node = &self.index.nodes[idx as usize];
             if matches!(node.kind, NodeKind::Object | NodeKind::Array) && node.child_count > 0 {
                 self.expanded.remove(&idx);
@@ -292,6 +355,7 @@ impl TreeState {
                     stack.push(child);
                     child = self.index.nodes[child as usize].next_sibling;
                 }
+                stack.extend(self.added_children(idx));
             }
         }
         self.refresh_visible();
@@ -300,6 +364,14 @@ impl TreeState {
     pub fn expand_recursive(&mut self, root: u32) {
         let mut stack = vec![root];
         while let Some(idx) = stack.pop() {
+            if self.is_added(idx) {
+                let kids = self.added_children(idx);
+                if !kids.is_empty() {
+                    self.expanded.insert(idx);
+                    stack.extend(kids);
+                }
+                continue;
+            }
             let node = &self.index.nodes[idx as usize];
             if matches!(node.kind, NodeKind::Object | NodeKind::Array) && node.child_count > 0 {
                 self.expanded.insert(idx);
@@ -308,6 +380,7 @@ impl TreeState {
                     stack.push(child);
                     child = self.index.nodes[child as usize].next_sibling;
                 }
+                stack.extend(self.added_children(idx));
             }
         }
         self.refresh_visible();
@@ -395,11 +468,20 @@ pub fn rebuild_visible(
 
     while let Some(node_idx) = stack.pop() {
         visible.push(node_idx);
+        let extra = added.get(&node_idx);
         if node_idx as usize >= nodes.len() {
-            continue; // synthetic added item — always a leaf
+            // Synthetic added item: its only children are the derived rows a
+            // container value was expanded into.
+            if expanded.contains(&node_idx) {
+                if let Some(extra) = extra {
+                    let mark = stack.len();
+                    stack.extend(extra.iter().copied());
+                    stack[mark..].reverse();
+                }
+            }
+            continue;
         }
         let node = &nodes[node_idx as usize];
-        let extra = added.get(&node_idx);
         let has_extra = extra.is_some_and(|v| !v.is_empty());
         if expanded.contains(&node_idx) && (node.child_count > 0 || has_extra) {
             // Push children onto the stack, then reverse that range in place
@@ -624,7 +706,7 @@ mod tests {
         let root = state.index.root;
         let new_id = state.add_item(root, None, "2".to_owned());
         state.selected = Some(new_id);
-        state.remove_last_added_item();
+        state.remove_last_added_items(1);
         assert!(state.added_items.is_empty());
         assert_eq!(state.selected, Some(root));
         assert!(!state.visible.contains(&new_id));
@@ -641,5 +723,69 @@ mod tests {
         assert_eq!(state.selected, Some(new_id));
         state.select_left(); // jumps to parent
         assert_eq!(state.selected, Some(root));
+    }
+
+    #[test]
+    fn added_container_expands_into_child_rows() {
+        let idx = make_index(r#"[1]"#);
+        let mut state = TreeState::new(idx);
+        let root = state.index.root;
+        let new_id = state.add_item(root, None, r#"{"a": 1, "b": [2]}"#.to_owned());
+        // Container rows: the pasted object, its two properties, and the
+        // element inside "b" (collapsed, so not yet visible).
+        assert_eq!(state.added_items.len(), 4);
+        assert_eq!(state.added_child_count(new_id), 2);
+        let a = new_id + 1;
+        let b = new_id + 2;
+        assert_eq!(state.added_item(a).key.as_deref(), Some("a"));
+        assert_eq!(state.added_item(b).key.as_deref(), Some("b"));
+        assert_eq!(state.added_item(b + 1).parent, b);
+        // The pasted container is expanded on add, its own children are not.
+        assert!(state.visible.contains(&a) && state.visible.contains(&b));
+        assert!(!state.visible.contains(&(b + 1)));
+        state.toggle(b);
+        assert!(state.visible.contains(&(b + 1)));
+    }
+
+    #[test]
+    fn nested_added_rows_hang_off_their_pending_parent() {
+        let idx = make_index(r#"[1]"#);
+        let mut state = TreeState::new(idx);
+        let root = state.index.root;
+        let new_id = state.add_item(root, None, r#"{"a": {"b": 1}}"#.to_owned());
+        assert_eq!(state.added_item(new_id).parent, root);
+        assert_eq!(state.added_item(new_id + 1).parent, new_id);
+        assert_eq!(state.added_item(new_id + 2).parent, new_id + 1);
+        let root_depth = state.index.nodes[root as usize].depth;
+        let depth = |id| crate::export::added_depth(&state.index.nodes, &state.added_items, id);
+        assert_eq!(depth(new_id), root_depth + 1);
+        assert_eq!(depth(new_id + 1), root_depth + 2);
+        assert_eq!(depth(new_id + 2), root_depth + 3);
+    }
+
+    #[test]
+    fn removing_an_added_container_drops_its_child_rows() {
+        let idx = make_index(r#"[1]"#);
+        let mut state = TreeState::new(idx);
+        let root = state.index.root;
+        state.add_item(root, None, "2".to_owned());
+        let new_id = state.add_item(root, None, r#"{"a": {"b": 1}}"#.to_owned());
+        assert_eq!(state.added_items.len(), 4);
+        state.selected = Some(new_id + 2); // a row deep inside the pasted value
+        state.remove_last_added_items(3);
+        // Only the earlier scalar add survives; selection falls back to a real node.
+        assert_eq!(state.added_items.len(), 1);
+        assert_eq!(state.selected, Some(root));
+        assert!(!state.visible.contains(&new_id));
+    }
+
+    #[test]
+    fn empty_added_container_has_no_child_rows() {
+        let idx = make_index(r#"[1]"#);
+        let mut state = TreeState::new(idx);
+        let root = state.index.root;
+        let new_id = state.add_item(root, None, "{}".to_owned());
+        assert_eq!(state.added_items.len(), 1);
+        assert_eq!(state.added_child_count(new_id), 0);
     }
 }
