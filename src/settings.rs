@@ -241,6 +241,7 @@ pub fn show_settings_window(
         .open(open)
         .collapsible(false)
         .resizable(false)
+        .vscroll(true)
         .min_width(360.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
@@ -391,4 +392,9 @@ pub fn show_settings_window(
 
             ui.add_space(8.0);
         });
+
+    // The AI-section highlight only lasts as long as this visit.
+    if !*open {
+        ai_ui.focus = false;
+    }
 }

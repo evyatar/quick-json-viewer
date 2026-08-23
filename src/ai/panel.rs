@@ -26,10 +26,16 @@ pub struct AiSettingsUi {
     key_status: Option<Result<&'static str, String>>,
     /// Cached "a key exists in the Keychain" check, per provider.
     key_cached: Option<(ProviderKind, bool)>,
+    /// Set when the settings window was opened *because* the user asked for
+    /// the assistant without having configured it: the AI section scrolls
+    /// into view and is highlighted until the window closes.
+    pub focus:  bool,
 }
 
 impl AiSettingsUi {
-    fn key_present(&mut self, kind: ProviderKind) -> bool {
+    /// Whether an API key for `kind` is stored. Cached, so the toolbar can
+    /// call it every frame without hitting the platform credential store.
+    pub fn key_present(&mut self, kind: ProviderKind) -> bool {
         match self.key_cached {
             Some((k, present)) if k == kind => present,
             _ => {
@@ -46,6 +52,23 @@ impl AiSettingsUi {
 }
 
 pub fn settings_section(ui: &mut egui::Ui, settings: &mut Settings, state: &mut AiSettingsUi) {
+    if !state.focus {
+        settings_body(ui, settings, state);
+        return;
+    }
+    // Highlight + scroll to the section when the user got here by clicking
+    // the AI button on an unconfigured install.
+    let stroke = egui::Stroke::new(1.0, ui.visuals().selection.stroke.color);
+    let resp = egui::Frame::new()
+        .stroke(stroke)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| settings_body(ui, settings, state))
+        .response;
+    resp.scroll_to_me(Some(egui::Align::Center));
+}
+
+fn settings_body(ui: &mut egui::Ui, settings: &mut Settings, state: &mut AiSettingsUi) {
     ui.heading("AI Assistant");
     ui.add_space(8.0);
 
