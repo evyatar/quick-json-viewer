@@ -46,7 +46,10 @@ fn system_prompt(file_name: &str) -> String {
          tools are capped in size; narrow your queries rather than fetching huge \
          subtrees.\n\
          To change the document, call propose_edits — edits are shown to the user \
-         as a reviewable changeset, never applied automatically. For bulk edits, \
+         as a reviewable changeset, never applied automatically. Its actions are \
+         set_value, rename_key, delete, and add_item (append a new element to an \
+         array or a new property to an object — `path` is the container itself, \
+         and `key` is required only for objects). For bulk edits, \
          first use search/get_value to find every affected node, then propose one \
          edit per node in a single propose_edits call.\n\
          Paths use the form $.key.nested[0] or $[\"odd key\"]. Keep answers concise; \

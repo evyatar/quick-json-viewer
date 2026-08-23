@@ -489,6 +489,18 @@ fn proposal_card(
                                 .color(theme::DELETED),
                         );
                     }
+                    EditAction::AddItem { key, value } => {
+                        let what = match key {
+                            Some(k) => format!("add {k}: {value}"),
+                            None    => format!("append {value}"),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{what}  → {}", edit.old))
+                                .monospace()
+                                .small()
+                                .color(theme::NEW),
+                        );
+                    }
                 });
             }
             ui.add_space(6.0);
