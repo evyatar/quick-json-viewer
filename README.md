@@ -41,6 +41,10 @@ Installs to `/Applications` — find it in Launchpad or open files with right-cl
 # Development build
 cargo run
 
+# Optimized build for local iteration (thin LTO, ~5x faster rebuilds
+# than --release)
+cargo run --profile fast
+
 # Production .app bundle (Apple Silicon)
 ./build-app.sh
 open quick-json-viewer.app

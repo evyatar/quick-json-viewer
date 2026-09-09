@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # No incremental artifacts on a cold runner: they only slow the build and
+  # bloat the cache.
+  CARGO_INCREMENTAL: 0
+  # Nothing debugs CI binaries; skip debug info entirely.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   ci:
@@ -21,9 +26,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check
-        run: cargo check
-
+      # No separate `cargo check`: `cargo test` and the release build below
+      # already type-check every target.
       - name: Test
         run: cargo test
 
