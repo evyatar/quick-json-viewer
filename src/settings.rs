@@ -438,7 +438,7 @@ pub fn view<'a>(
         row![
             label("Font size"),
             slider(10.0..=24.0, settings.font_size, SettingsMsg::FontSize)
-                .step(1.0)
+                .step(1.0_f32)
                 .width(160)
                 .style(theme::slider_style),
             text(format!("{} px", settings.font_size as i32)).size(DIALOG_FONT_SIZE),
