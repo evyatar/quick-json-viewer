@@ -14,6 +14,12 @@ pub enum ProviderKind {
     OpenAiCompatible,
 }
 
+impl std::fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 impl ProviderKind {
     /// Keychain account name for this provider's API key.
     pub fn key_account(self) -> &'static str {

@@ -2,7 +2,7 @@
 
 A fast, native macOS app for viewing and navigating large JSON and NDJSON files.
 
-Built with Rust + [egui](https://github.com/emilk/egui). Uses memory-mapped file I/O so even multi-GB files open instantly.
+Built with Rust + [iced](https://github.com/iced-rs/iced). Uses memory-mapped file I/O so even multi-GB files open instantly.
 
 ## Installation
 
@@ -81,7 +81,9 @@ Right-click any row to copy its JSON path, key, or value. Right-clicking a conta
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | UI layout, keyboard handling, app state |
+| `src/main.rs` | App state, `Message` enum, update loop, keyboard handling, document logic |
+| `src/view.rs` | View layer: toolbar, menus, breadcrumbs, status bar, panels, popups and dialogs |
+| `src/tree_view.rs` | Virtualized custom widget that paints the Viewer rows and the Compare diff rows |
 | `src/parser.rs` | Hand-written JSON / NDJSON parser |
 | `src/index.rs` | Flat node array over the backing data (mmap or pasted buffer) |
 | `src/tree.rs` | Tree expansion, selection, and search state |
@@ -94,6 +96,6 @@ Right-click any row to copy its JSON path, key, or value. Right-clicking a conta
 | `src/codegen.rs` | Typed code generation (TS, Python, Go, Java, C#, Kotlin, Swift, Dart) |
 | `src/ai/` | BYOK AI assistant: provider client, tool-calling agent loop, review UI, Keychain key storage |
 | `src/update.rs` | Notify-only update checker against GitHub Releases |
-| `src/theme.rs` | Design tokens for the custom dark theme |
+| `src/theme.rs` | Design tokens, the custom light/dark iced themes, and shared widget styles |
 | `src/settings.rs` | Persistent user preferences; set-as-default JSON viewer |
 | `src/macos_menu.rs` | Native macOS menu bar via Objective-C FFI |

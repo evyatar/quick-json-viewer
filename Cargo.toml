@@ -7,8 +7,7 @@ authors = ["Evyatar Shalom"]
 repository = "https://github.com/evyatar/quick-json-viewer"
 
 [dependencies]
-eframe        = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "persistence"] }
-egui          = "0.34"
+iced          = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced", "advanced-shaping", "markdown", "crisp", "fira-sans"] }
 memchr        = "2"
 memmap2       = "0.9"
 regex         = "1"
@@ -16,7 +15,6 @@ rfd           = "0.17"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 ureq          = { version = "2", features = ["tls", "json"] }
-unicode-bidi  = "0.3"
 image         = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

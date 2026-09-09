@@ -2,8 +2,10 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use iced::futures::Stream;
+use iced::futures::channel::mpsc::{UnboundedSender, unbounded};
 
 use objc2::define_class;
 use objc2::msg_send;
@@ -33,8 +35,35 @@ pub const ACT_UNDO:         u32 = 1 << 14;
 pub const ACT_REDO:         u32 = 1 << 15;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
-static CTX: OnceLock<egui::Context> = OnceLock::new();
 static PENDING_OPEN_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Wake channel into the iced runtime: every menu action / Finder open pushes
+/// a unit token so the app polls `take_actions` / `take_open_file` promptly,
+/// even when no window event would otherwise wake the event loop.
+static WAKER: Mutex<Option<UnboundedSender<()>>> = Mutex::new(None);
+
+fn wake() {
+    if let Ok(guard) = WAKER.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.unbounded_send(());
+        }
+    }
+}
+
+/// Stream of wake tokens for `Subscription::run`. Anything queued before the
+/// runtime subscribed (e.g. a Finder open at launch) is flushed immediately.
+pub fn wake_stream() -> impl Stream<Item = ()> {
+    let (tx, rx) = unbounded();
+    let has_pending = PENDING.load(Ordering::Acquire) != 0
+        || PENDING_OPEN_FILE.lock().map(|g| g.is_some()).unwrap_or(false);
+    if has_pending {
+        let _ = tx.unbounded_send(());
+    }
+    if let Ok(mut guard) = WAKER.lock() {
+        *guard = Some(tx);
+    }
+    rx
+}
 
 pub fn take_actions() -> u32 {
     PENDING.swap(0, Ordering::AcqRel)
@@ -98,9 +127,7 @@ unsafe extern "C-unwind" fn open_file_imp(
     if let Ok(mut lock) = PENDING_OPEN_FILE.lock() {
         *lock = Some(path);
     }
-    if let Some(ctx) = CTX.get() {
-        ctx.request_repaint();
-    }
+    wake();
     true
 }
 
@@ -120,7 +147,7 @@ define_class!(
     }
 );
 
-/// Call from `main()` before `eframe::run_native()`.
+/// Call from `main()` before the iced runtime starts.
 pub fn register_open_file_handler() {
     unsafe {
         let nc_cls = ffi::objc_getClass(b"NSNotificationCenter\0".as_ptr().cast());
@@ -156,82 +183,82 @@ define_class!(
         #[unsafe(method(handleOpenFile:))]
         fn handle_open_file(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_OPEN_FILE, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handlePaste:))]
         fn handle_paste(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_PASTE, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleExportJson:))]
         fn handle_export_json(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_EXPORT_JSON, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleExportCsv:))]
         fn handle_export_csv(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_EXPORT_CSV, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleSave:))]
         fn handle_save(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_SAVE, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleSaveCopy:))]
         fn handle_save_copy(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_SAVE_COPY, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleSettings:))]
         fn handle_settings(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_SETTINGS, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleFocusSearch:))]
         fn handle_focus_search(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_FOCUS_SEARCH, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleCollapseAll:))]
         fn handle_collapse_all(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_COLLAPSE_ALL, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleExpandAll:))]
         fn handle_expand_all(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_EXPAND_ALL, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleHelp:))]
         fn handle_help(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_HELP, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleSearchSyntax:))]
         fn handle_search_syntax(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_SEARCH_SYNTAX, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleAbout:))]
         fn handle_about(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_ABOUT, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleOpenUrl:))]
         fn handle_open_url(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_OPEN_URL, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleUndo:))]
         fn handle_undo(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_UNDO, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
         #[unsafe(method(handleRedo:))]
         fn handle_redo(&self, _sender: &AnyObject) {
             PENDING.fetch_or(ACT_REDO, Ordering::Relaxed);
-            if let Some(c) = CTX.get() { c.request_repaint(); }
+            wake();
         }
     }
 );
@@ -257,9 +284,7 @@ unsafe fn add_item(
 
 // ─── public entry point ──────────────────────────────────────────────────────
 
-pub fn install(ctx: &egui::Context) {
-    let _ = CTX.set(ctx.clone());
-
+pub fn install() {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
     unsafe {
@@ -283,7 +308,7 @@ pub fn install(ctx: &egui::Context) {
         add_item(&file_menu, "Open…",    "o", cmd,  objc2::sel!(handleOpenFile:),   handler_ref);
         add_item(&file_menu, "Open URL…", "l", cmd, objc2::sel!(handleOpenUrl:),   handler_ref);
         // ⇧⌘V — a plain ⌘V key equivalent here would be swallowed by the menu
-        // and never reach the search box; bare ⌘V is handled in the egui layer.
+        // and never reach the search box; bare ⌘V is handled in the app layer.
         add_item(&file_menu, "Paste JSON / JWT", "v", cmd | NSEventModifierFlags::Shift,
                  objc2::sel!(handlePaste:), handler_ref);
         file_menu.addItem(&NSMenuItem::separatorItem(mtm));

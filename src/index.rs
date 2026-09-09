@@ -19,7 +19,7 @@ pub enum NodeKind {
 /// [`first_child`] / [`JsonIndex::first_child`]. Byte offsets are u32,
 /// capping supported input at 4 GiB (checked at parse time). Kept to 36
 /// bytes — on multi-million-node files this dominates memory use.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Node {
     /// Byte range in the source data (value_start..value_end).
     pub value_start:  u32,

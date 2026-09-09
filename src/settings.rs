@@ -1,20 +1,13 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::path::PathBuf;
 
+use iced::widget::{button, checkbox, column, container, pick_list, row, rule, slider, space, text};
+use iced::{Element, Font, Length};
 use serde::{Deserialize, Serialize};
 
+use crate::theme;
+
 const STORAGE_KEY: &str = "json_viewer_settings_v1";
-
-// 0 = untried, 1 = success, 2 = failure
-static SET_DEFAULT_STATUS: AtomicU8 = AtomicU8::new(0);
-
-// Set by the "Check for Updates" button; consumed by the app loop, which owns
-// the update channel (`show_settings_window` does not).
-static REQUEST_UPDATE_CHECK: AtomicBool = AtomicBool::new(false);
-
-/// Returns and clears the "user asked to check for updates" flag.
-pub fn take_update_check_request() -> bool {
-    REQUEST_UPDATE_CHECK.swap(false, Ordering::Relaxed)
-}
+const APP_DIR: &str = "quick-json-viewer";
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreServices", kind = "framework")]
@@ -46,7 +39,7 @@ fn set_as_default_json_viewer() -> bool {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Theme {
     #[default]
     Auto,
@@ -54,11 +47,125 @@ pub enum Theme {
     Dark,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::Auto, Theme::Light, Theme::Dark];
+}
+
+impl std::fmt::Display for Theme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Theme::Auto => "Auto",
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FontFamily {
+    // Generic families — resolved by the system to whatever is installed.
     Proportional,
     #[default]
     Monospace,
+    Serif,
+    // Monospace fonts commonly found on macOS / Windows / Linux.
+    Menlo,
+    Monaco,
+    SfMono,
+    Consolas,
+    CourierNew,
+    JetBrainsMono,
+    FiraCode,
+    SourceCodePro,
+    DejaVuSansMono,
+    UbuntuMono,
+    // Proportional fonts commonly found on macOS / Windows / Linux.
+    Helvetica,
+    Arial,
+    Verdana,
+    SegoeUi,
+    Georgia,
+    TimesNewRoman,
+    DejaVuSans,
+}
+
+impl FontFamily {
+    pub const ALL: [FontFamily; 20] = [
+        FontFamily::Proportional,
+        FontFamily::Monospace,
+        FontFamily::Serif,
+        FontFamily::Menlo,
+        FontFamily::Monaco,
+        FontFamily::SfMono,
+        FontFamily::Consolas,
+        FontFamily::CourierNew,
+        FontFamily::JetBrainsMono,
+        FontFamily::FiraCode,
+        FontFamily::SourceCodePro,
+        FontFamily::DejaVuSansMono,
+        FontFamily::UbuntuMono,
+        FontFamily::Helvetica,
+        FontFamily::Arial,
+        FontFamily::Verdana,
+        FontFamily::SegoeUi,
+        FontFamily::Georgia,
+        FontFamily::TimesNewRoman,
+        FontFamily::DejaVuSans,
+    ];
+
+    /// The iced font for this family. Named fonts fall back to the system
+    /// default if they are not installed.
+    pub fn font(self) -> Font {
+        match self {
+            FontFamily::Proportional   => Font::DEFAULT,
+            FontFamily::Monospace      => Font::MONOSPACE,
+            FontFamily::Serif          => Font { family: iced::font::Family::Serif, ..Font::DEFAULT },
+            FontFamily::Menlo          => Font::with_name("Menlo"),
+            FontFamily::Monaco         => Font::with_name("Monaco"),
+            FontFamily::SfMono         => Font::with_name("SF Mono"),
+            FontFamily::Consolas       => Font::with_name("Consolas"),
+            FontFamily::CourierNew     => Font::with_name("Courier New"),
+            FontFamily::JetBrainsMono  => Font::with_name("JetBrains Mono"),
+            FontFamily::FiraCode       => Font::with_name("Fira Code"),
+            FontFamily::SourceCodePro  => Font::with_name("Source Code Pro"),
+            FontFamily::DejaVuSansMono => Font::with_name("DejaVu Sans Mono"),
+            FontFamily::UbuntuMono     => Font::with_name("Ubuntu Mono"),
+            FontFamily::Helvetica      => Font::with_name("Helvetica"),
+            FontFamily::Arial          => Font::with_name("Arial"),
+            FontFamily::Verdana        => Font::with_name("Verdana"),
+            FontFamily::SegoeUi        => Font::with_name("Segoe UI"),
+            FontFamily::Georgia        => Font::with_name("Georgia"),
+            FontFamily::TimesNewRoman  => Font::with_name("Times New Roman"),
+            FontFamily::DejaVuSans     => Font::with_name("DejaVu Sans"),
+        }
+    }
+}
+
+impl std::fmt::Display for FontFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FontFamily::Proportional   => "Proportional (system)",
+            FontFamily::Monospace      => "Monospace (system)",
+            FontFamily::Serif          => "Serif (system)",
+            FontFamily::Menlo          => "Menlo",
+            FontFamily::Monaco         => "Monaco",
+            FontFamily::SfMono         => "SF Mono",
+            FontFamily::Consolas       => "Consolas",
+            FontFamily::CourierNew     => "Courier New",
+            FontFamily::JetBrainsMono  => "JetBrains Mono",
+            FontFamily::FiraCode       => "Fira Code",
+            FontFamily::SourceCodePro  => "Source Code Pro",
+            FontFamily::DejaVuSansMono => "DejaVu Sans Mono",
+            FontFamily::UbuntuMono     => "Ubuntu Mono",
+            FontFamily::Helvetica      => "Helvetica",
+            FontFamily::Arial          => "Arial",
+            FontFamily::Verdana        => "Verdana",
+            FontFamily::SegoeUi        => "Segoe UI",
+            FontFamily::Georgia        => "Georgia",
+            FontFamily::TimesNewRoman  => "Times New Roman",
+            FontFamily::DejaVuSans     => "DejaVu Sans",
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -114,40 +221,109 @@ impl Default for Settings {
     }
 }
 
+// ─── persistence ─────────────────────────────────────────────────────────────
+
+/// `~/Library/Application Support/quick-json-viewer` on macOS; the XDG-ish
+/// `~/.config/quick-json-viewer` elsewhere.
+fn config_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library").join("Application Support").join(APP_DIR))
+    } else {
+        Some(home.join(".config").join(APP_DIR))
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("settings.json"))
+}
+
+/// Location of the settings blob written by earlier (eframe-based) releases:
+/// a RON map of key → JSON string.
+fn legacy_eframe_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library").join("Application Support").join("Quick JSON Viewer").join("app.ron"))
+    } else {
+        Some(home.join(".local").join("share").join("quick json viewer").join("app.ron"))
+    }
+}
+
+/// Pull our JSON string out of eframe's RON store without a RON parser: find
+/// the key, then decode the following string literal (Rust-style escapes).
+fn extract_legacy_json(ron: &str) -> Option<String> {
+    let key_pos = ron.find(&format!("\"{STORAGE_KEY}\""))?;
+    let rest = &ron[key_pos + STORAGE_KEY.len() + 2..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '0' => out.push('\0'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                'u' => {
+                    // \u{XXXX}
+                    if chars.next()? != '{' { return None; }
+                    let mut hex = String::new();
+                    for h in chars.by_ref() {
+                        if h == '}' { break; }
+                        hex.push(h);
+                    }
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
 impl Settings {
-    pub fn load(storage: &dyn eframe::Storage) -> Self {
-        eframe::get_value(storage, STORAGE_KEY).unwrap_or_default()
+    /// Load persisted settings, falling back to the previous eframe store and
+    /// finally to defaults.
+    pub fn load() -> Self {
+        if let Some(path) = settings_path() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(s) = serde_json::from_str::<Settings>(&text) {
+                    return s;
+                }
+            }
+        }
+        if let Some(path) = legacy_eframe_path() {
+            if let Ok(ron) = std::fs::read_to_string(&path) {
+                if let Some(json) = extract_legacy_json(&ron) {
+                    if let Ok(s) = serde_json::from_str::<Settings>(&json) {
+                        return s;
+                    }
+                }
+            }
+        }
+        Settings::default()
     }
 
-    pub fn save(&self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, STORAGE_KEY, self);
+    /// Persist to disk. Best-effort — a failure here should never take the
+    /// app down.
+    pub fn save(&self) {
+        let Some(path) = settings_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
     }
 
-    pub fn apply_fonts(&self, ctx: &egui::Context) {
-        let mut style = (*ctx.global_style()).clone();
-        let family = match self.font_family {
-            FontFamily::Proportional => egui::FontFamily::Proportional,
-            FontFamily::Monospace => egui::FontFamily::Monospace,
-        };
-        style.text_styles.insert(
-            egui::TextStyle::Monospace,
-            egui::FontId::new(self.font_size, egui::FontFamily::Monospace),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Body,
-            egui::FontId::new(self.font_size, family.clone()),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            egui::FontId::new(self.font_size, family),
-        );
-        // egui's default (4, 1) plus 2 px on every side.
-        style.spacing.button_padding = egui::vec2(6.0, 3.0);
-        ctx.set_global_style(style);
-    }
-
-    /// Resolve the effective light/dark choice (mirrors `apply_theme`), so the
-    /// chrome palette and the egui visuals always agree within a frame.
+    /// Resolve the effective light/dark choice.
     pub fn is_dark(&self, prefer_dark: bool) -> bool {
         match self.theme {
             Theme::Dark  => true,
@@ -156,45 +332,14 @@ impl Settings {
         }
     }
 
-    pub fn apply_theme(&self, ctx: &egui::Context, prefer_dark: bool) {
-        let mut visuals = match self.theme {
-            Theme::Dark => crate::theme::visuals(),
-            Theme::Light => egui::Visuals::light(),
-            Theme::Auto => {
-                if prefer_dark {
-                    crate::theme::visuals()
-                } else {
-                    egui::Visuals::light()
-                }
-            }
-        };
-
-        // Show the pointing-hand ("hand") cursor when hovering any button.
-        visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
-
-        // egui derives a button's inner margin from `button_padding -
-        // bg_stroke.width`. The default `inactive` stroke is 0px wide but
-        // `hovered`/`active` are 1px, so buttons shrink by 1px per side on
-        // hover — a visible layout shift. Normalise the widths so the margin
-        // (and therefore the button size) stays constant across states.
-        let w = visuals.widgets.inactive.bg_stroke.width;
-        visuals.widgets.hovered.bg_stroke.width = w;
-        visuals.widgets.active.bg_stroke.width = w;
-        visuals.widgets.open.bg_stroke.width = w;
-
-        ctx.set_visuals(visuals);
+    /// Font for keys, paths, and anything that must stay monospace.
+    pub fn key_font(&self) -> Font {
+        Font::MONOSPACE
     }
 
-    pub fn key_font(&self) -> egui::FontId {
-        egui::FontId::new(self.font_size, egui::FontFamily::Monospace)
-    }
-
-    pub fn val_font(&self) -> egui::FontId {
-        let family = match self.font_family {
-            FontFamily::Monospace => egui::FontFamily::Monospace,
-            FontFamily::Proportional => egui::FontFamily::Proportional,
-        };
-        egui::FontId::new(self.font_size, family)
+    /// Font for values and the general UI, following the family setting.
+    pub fn val_font(&self) -> Font {
+        self.font_family.font()
     }
 
     pub fn row_height(&self) -> f32 {
@@ -202,156 +347,187 @@ impl Settings {
     }
 }
 
-pub fn show_settings_window(
-    settings: &mut Settings,
-    ctx: &egui::Context,
-    open: &mut bool,
-    ai_ui: &mut crate::ai::panel::AiSettingsUi,
-) {
-    egui::Window::new("⚙  Settings")
-        .open(open)
-        .collapsible(false)
-        .resizable(false)
-        .vscroll(true)
-        .min_width(360.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            // Pin this window's fonts to a fixed size: its widgets edit the
-            // global font settings, and letting those changes resize the
-            // window mid-drag shifts the slider under the cursor.
-            let style = ui.style_mut();
-            for text_style in [egui::TextStyle::Body, egui::TextStyle::Button, egui::TextStyle::Monospace] {
-                style.text_styles.insert(
-                    text_style,
-                    egui::FontId::new(14.0, egui::FontFamily::Monospace),
-                );
-            }
+// ─── settings dialog ─────────────────────────────────────────────────────────
 
-            ui.add_space(8.0);
+/// Result of the last "Set as Default JSON Viewer" attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DefaultStatus {
+    #[default]
+    Untried,
+    Ok,
+    Failed,
+}
 
-            // ── Appearance ───────────────────────────────────────────────────
-            ui.heading("Appearance");
-            ui.add_space(8.0);
+#[derive(Clone, Debug)]
+pub enum SettingsMsg {
+    Theme(Theme),
+    FontFamily(FontFamily),
+    FontSize(f32),
+    ShowMenuBar(bool),
+    ShowBreadcrumbs(bool),
+    CopyCompact(bool),
+    SetAsDefault,
+    CheckForUpdates,
+    Ai(crate::ai::panel::AiSettingsMsg),
+    Close,
+}
 
-            egui::Grid::new("appearance_grid")
-                .num_columns(2)
-                .spacing([24.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Theme");
-                    egui::ComboBox::from_id_salt("theme_combo")
-                        .width(160.0)
-                        .selected_text(match settings.theme {
-                            Theme::Auto  => "Auto",
-                            Theme::Light => "Light",
-                            Theme::Dark  => "Dark",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut settings.theme, Theme::Auto,  "Auto");
-                            ui.selectable_value(&mut settings.theme, Theme::Light, "Light");
-                            ui.selectable_value(&mut settings.theme, Theme::Dark,  "Dark");
-                        });
-                    ui.end_row();
-
-                    ui.label("Font style");
-                    egui::ComboBox::from_id_salt("font_combo")
-                        .width(160.0)
-                        .selected_text(match settings.font_family {
-                            FontFamily::Proportional => "Proportional",
-                            FontFamily::Monospace    => "Monospace",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut settings.font_family, FontFamily::Proportional, "Proportional");
-                            ui.selectable_value(&mut settings.font_family, FontFamily::Monospace,    "Monospace");
-                        });
-                    ui.end_row();
-
-                    ui.label("Font size");
-                    ui.add(
-                        egui::Slider::new(&mut settings.font_size, 10.0..=24.0)
-                            .step_by(1.0)
-                            .suffix(" px")
-                            .fixed_decimals(0),
-                    );
-                    ui.end_row();
-                });
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(12.0);
-
-            // ── Layout ───────────────────────────────────────────────────────
-            ui.heading("Layout");
-            ui.add_space(8.0);
-
-            egui::Grid::new("layout_grid")
-                .num_columns(2)
-                .spacing([24.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Show menu bar");
-                    ui.checkbox(&mut settings.show_menu_bar, "");
-                    ui.end_row();
-
-                    ui.label("Show breadcrumbs");
-                    ui.checkbox(&mut settings.show_breadcrumbs, "");
-                    ui.end_row();
-                });
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(12.0);
-
-            // ── Clipboard ────────────────────────────────────────────────────
-            ui.heading("Clipboard");
-            ui.add_space(8.0);
-
-            egui::Grid::new("clipboard_grid")
-                .num_columns(2)
-                .spacing([24.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Copy compressed JSON");
-                    ui.checkbox(&mut settings.copy_compact_json, "")
-                        .on_hover_text("\"Copy Value\" copies minified JSON instead of its original formatting");
-                    ui.end_row();
-                });
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(12.0);
-
-            // ── AI assistant (BYOK) ──────────────────────────────────────────
-            crate::ai::panel::settings_section(ui, settings, ai_ui);
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(12.0);
-
-            // ── System ───────────────────────────────────────────────────────
-            ui.heading("System");
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                if ui.button("Set as Default JSON Viewer").clicked() {
-                    let ok = set_as_default_json_viewer();
-                    SET_DEFAULT_STATUS.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
-                }
-                match SET_DEFAULT_STATUS.load(Ordering::Relaxed) {
-                    1 => { ui.colored_label(egui::Color32::from_rgb(52, 199, 89), "Set as default"); }
-                    2 => { ui.colored_label(egui::Color32::from_rgb(255, 69, 58), "Failed — run from .app bundle"); }
-                    _ => {}
-                }
-            });
-
-            ui.add_space(8.0);
-
-            if ui.button("Check for Updates").clicked() {
-                REQUEST_UPDATE_CHECK.store(true, Ordering::Relaxed);
-            }
-
-            ui.add_space(8.0);
-        });
-
-    // The AI-section highlight only lasts as long as this visit.
-    if !*open {
-        ai_ui.focus = false;
+/// Apply a dialog message to the settings. Returns `true` when the caller
+/// should request an update check.
+pub fn apply(settings: &mut Settings, default_status: &mut DefaultStatus, msg: &SettingsMsg) -> bool {
+    match msg {
+        SettingsMsg::Theme(t)           => settings.theme = *t,
+        SettingsMsg::FontFamily(f)      => settings.font_family = *f,
+        SettingsMsg::FontSize(s)        => settings.font_size = s.round().clamp(10.0, 24.0),
+        SettingsMsg::ShowMenuBar(b)     => settings.show_menu_bar = *b,
+        SettingsMsg::ShowBreadcrumbs(b) => settings.show_breadcrumbs = *b,
+        SettingsMsg::CopyCompact(b)     => settings.copy_compact_json = *b,
+        SettingsMsg::SetAsDefault => {
+            *default_status = if set_as_default_json_viewer() { DefaultStatus::Ok } else { DefaultStatus::Failed };
+        }
+        SettingsMsg::CheckForUpdates => return true,
+        SettingsMsg::Ai(_) | SettingsMsg::Close => {}
     }
+    false
+}
+
+const DIALOG_FONT_SIZE: f32 = 14.0;
+
+fn heading<'a>(s: &'a str) -> Element<'a, SettingsMsg> {
+    text(s).size(18).into()
+}
+
+fn label<'a>(s: &'a str) -> Element<'a, SettingsMsg> {
+    text(s).size(DIALOG_FONT_SIZE).width(Length::Fixed(170.0)).into()
+}
+
+fn section_gap<'a>() -> Element<'a, SettingsMsg> {
+    column![
+        space().height(12),
+        rule::horizontal(1).style(theme::divider_style),
+        space().height(12),
+    ]
+    .into()
+}
+
+/// The body of the Settings dialog. Fonts are pinned to a fixed size so that
+/// dragging the font-size slider doesn't move the slider under the cursor.
+pub fn view<'a>(
+    settings: &'a Settings,
+    default_status: DefaultStatus,
+    ai_ui: &'a crate::ai::panel::AiSettingsUi,
+    pal: &theme::Palette,
+) -> Element<'a, SettingsMsg> {
+    let appearance = column![
+        row![
+            label("Theme"),
+            pick_list(&Theme::ALL[..], Some(settings.theme), SettingsMsg::Theme)
+                .width(160)
+                .text_size(DIALOG_FONT_SIZE)
+                .style(theme::pick_list_style),
+        ]
+        .align_y(iced::Center),
+        row![
+            label("Font style"),
+            pick_list(&FontFamily::ALL[..], Some(settings.font_family), SettingsMsg::FontFamily)
+                .width(200)
+                .text_size(DIALOG_FONT_SIZE)
+                .style(theme::pick_list_style),
+        ]
+        .align_y(iced::Center),
+        row![
+            label("Font size"),
+            slider(10.0..=24.0, settings.font_size, SettingsMsg::FontSize)
+                .step(1.0)
+                .width(160)
+                .style(theme::slider_style),
+            text(format!("{} px", settings.font_size as i32)).size(DIALOG_FONT_SIZE),
+        ]
+        .spacing(10)
+        .align_y(iced::Center),
+    ]
+    .spacing(10);
+
+    let layout = column![
+        row![
+            label("Show menu bar"),
+            checkbox(settings.show_menu_bar).on_toggle(SettingsMsg::ShowMenuBar),
+        ]
+        .align_y(iced::Center),
+        row![
+            label("Show breadcrumbs"),
+            checkbox(settings.show_breadcrumbs).on_toggle(SettingsMsg::ShowBreadcrumbs),
+        ]
+        .align_y(iced::Center),
+    ]
+    .spacing(10);
+
+    let clipboard = column![
+        row![
+            label("Copy compressed JSON"),
+            checkbox(settings.copy_compact_json).on_toggle(SettingsMsg::CopyCompact),
+        ]
+        .align_y(iced::Center),
+        text("\"Copy Value\" copies minified JSON instead of its original formatting")
+            .size(12)
+            .color(pal.text_muted),
+    ]
+    .spacing(6);
+
+    let ai_section: Element<'a, SettingsMsg> =
+        crate::ai::panel::settings_section(settings, ai_ui, pal).map(SettingsMsg::Ai);
+
+    let default_note: Element<'a, SettingsMsg> = match default_status {
+        DefaultStatus::Ok => text("Set as default").size(DIALOG_FONT_SIZE).color(theme::OK_GREEN).into(),
+        DefaultStatus::Failed => text("Failed — run from .app bundle").size(DIALOG_FONT_SIZE).color(theme::ERR_RED).into(),
+        DefaultStatus::Untried => space().width(0).into(),
+    };
+
+    let system = column![
+        row![
+            button(text("Set as Default JSON Viewer").size(DIALOG_FONT_SIZE))
+                .style(theme::button_style)
+                .on_press(SettingsMsg::SetAsDefault),
+            default_note,
+        ]
+        .spacing(10)
+        .align_y(iced::Center),
+        button(text("Check for Updates").size(DIALOG_FONT_SIZE))
+            .style(theme::button_style)
+            .on_press(SettingsMsg::CheckForUpdates),
+    ]
+    .spacing(8);
+
+    let body = column![
+        row![
+            row![text("⚙").size(24), text("Settings").size(20)].spacing(8).align_y(iced::Center),
+            space().width(Length::Fill),
+            button(text("✕").size(17))
+                .style(theme::flat_button_style)
+                .on_press(SettingsMsg::Close),
+        ]
+        .align_y(iced::Center),
+        space().height(8),
+        heading("Appearance"),
+        space().height(8),
+        appearance,
+        section_gap(),
+        heading("Layout"),
+        space().height(8),
+        layout,
+        section_gap(),
+        heading("Clipboard"),
+        space().height(8),
+        clipboard,
+        section_gap(),
+        ai_section,
+        section_gap(),
+        heading("System"),
+        space().height(8),
+        system,
+        space().height(4),
+    ]
+    .width(Length::Fixed(420.0));
+
+    container(body).into()
 }
