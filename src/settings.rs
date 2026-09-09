@@ -19,18 +19,26 @@ extern "C" {
     ) -> i32;
 }
 
+/// Content types we claim as the default handler for. `public.jsonl` is
+/// exported by our own bundle (see `build-app.sh`) since macOS has no
+/// built-in UTI for `.jsonl` / `.ndjson`.
+#[cfg(target_os = "macos")]
+const HANDLED_CONTENT_TYPES: &[&str] = &["public.json", "public.jsonl"];
+
 fn set_as_default_json_viewer() -> bool {
     #[cfg(target_os = "macos")]
     {
         use objc2_foundation::NSString;
         unsafe {
-            let uti = NSString::from_str("public.json");
             let bundle = NSString::from_str("com.evyatar.quick-json-viewer");
-            LSSetDefaultRoleHandlerForContentType(
-                &*uti as *const NSString as *const std::ffi::c_void,
-                0xFFFF_FFFF, // kLSRolesAll
-                &*bundle as *const NSString as *const std::ffi::c_void,
-            ) == 0
+            HANDLED_CONTENT_TYPES.iter().all(|ct| {
+                let uti = NSString::from_str(ct);
+                LSSetDefaultRoleHandlerForContentType(
+                    &*uti as *const NSString as *const std::ffi::c_void,
+                    0xFFFF_FFFF, // kLSRolesAll
+                    &*bundle as *const NSString as *const std::ffi::c_void,
+                ) == 0
+            })
         }
     }
     #[cfg(not(target_os = "macos"))]

@@ -52,14 +52,35 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
   <array>
     <dict>
       <key>CFBundleTypeExtensions</key>
-      <array>
-        <string>json</string><string>jsonl</string><string>ndjson</string>
-      </array>
+      <array><string>json</string></array>
       <key>CFBundleTypeName</key><string>JSON File</string>
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Owner</string>
       <key>LSItemContentTypes</key>
       <array><string>public.json</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeExtensions</key>
+      <array><string>jsonl</string><string>ndjson</string></array>
+      <key>CFBundleTypeName</key><string>JSON Lines File</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array><string>public.jsonl</string></array>
+    </dict>
+  </array>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>public.jsonl</string>
+      <key>UTTypeDescription</key><string>JSON Lines File</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.text</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>jsonl</string><string>ndjson</string></array>
+      </dict>
     </dict>
   </array>
 </dict>
