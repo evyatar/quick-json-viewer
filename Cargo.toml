@@ -1,6 +1,6 @@
 [package]
 name = "quick-json-viewer"
-version = "1.1.3"
+version = "1.2.0"
 edition = "2021"
 description = "A fast, native JSON viewer for macOS"
 authors = ["Evyatar Shalom"]
@@ -22,8 +22,28 @@ objc2             = "0.6.4"
 objc2-app-kit     = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard"] }
 objc2-foundation  = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSEnumerator"] }
 
+# Shipping profile: max optimization, smallest binary. Slow to build (~1m+ for a
+# one-line change) -- use the `fast` profile while iterating.
 [profile.release]
 opt-level     = 3
 codegen-units = 1
 lto           = true
 strip         = true
+
+# Optimized build for local iteration: same opt-level, thin LTO + parallel
+# codegen. ~5x faster rebuilds than `release`, slightly larger binary.
+[profile.fast]
+inherits      = "release"
+codegen-units = 16
+lto           = "thin"
+incremental   = true
+
+[profile.dev]
+# Line tables are enough for backtraces and link far faster than full DWARF.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies are built once and never stepped through: no debug info, and
+# light optimization so debug runs stay usable.
+debug     = false
+opt-level = 1
