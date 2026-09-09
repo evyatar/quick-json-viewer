@@ -115,7 +115,34 @@ struct EditingState {
 struct AddingState {
     parent: u32,
     key:    String,
-    text:   String,
+    /// Multi-line so a whole object / array can be pasted or typed in.
+    value:  text_editor::Content,
+}
+
+impl AddingState {
+    fn new(parent: u32) -> Self {
+        Self { parent, key: String::new(), value: text_editor::Content::new() }
+    }
+
+    fn text(&self) -> String {
+        self.value.text()
+    }
+
+    #[cfg(test)]
+    fn set_value(&mut self, text: &str) {
+        self.value = text_editor::Content::with_text(text);
+    }
+
+    /// Re-indent the typed value when it already parses as JSON; a no-op
+    /// otherwise so the user's in-progress text is never mangled.
+    fn format(&mut self) {
+        let text = self.text();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&v) {
+                self.value = text_editor::Content::with_text(&pretty);
+            }
+        }
+    }
 }
 
 /// One undoable change to `edit_overlay`: the entry's state for `node_idx`
@@ -375,7 +402,8 @@ pub enum Message {
     EditCommit,
     EditCancel,
     AddKey(String),
-    AddValue(String),
+    AddValue(text_editor::Action),
+    AddFormat,
     AddCommit,
     AddCancel,
 
@@ -850,8 +878,12 @@ impl App {
                 if let Some(a) = &mut self.adding_item { a.key = s; }
                 Task::none()
             }
-            Message::AddValue(s) => {
-                if let Some(a) = &mut self.adding_item { a.text = s; }
+            Message::AddValue(action) => {
+                if let Some(a) = &mut self.adding_item { a.value.perform(action); }
+                Task::none()
+            }
+            Message::AddFormat => {
+                if let Some(a) = &mut self.adding_item { a.format(); }
                 Task::none()
             }
             Message::AddCommit => {
@@ -1465,7 +1497,7 @@ impl App {
         let Some(state) = &self.adding_item else { return false };
         let Some(tree) = &self.tree else { return false };
         let is_object = tree.kind_of(state.parent) == index::NodeKind::Object;
-        let value_valid = serde_json::from_str::<serde_json::Value>(&state.text).is_ok();
+        let value_valid = serde_json::from_str::<serde_json::Value>(&state.text()).is_ok();
         let key_valid = !is_object || !state.key.trim().is_empty();
         value_valid && key_valid
     }
@@ -2363,7 +2395,7 @@ impl App {
     /// Open the "Add Item" / "Add Property" dialog for appending a new child
     /// to `parent` (an Array or Object node).
     fn start_add_item(&mut self, parent: u32) {
-        self.adding_item = Some(AddingState { parent, key: String::new(), text: String::new() });
+        self.adding_item = Some(AddingState::new(parent));
     }
 
     /// Append the typed value (and, for an Object parent, key) to
@@ -2373,12 +2405,13 @@ impl App {
         let Some(tree) = &mut self.tree else { return };
         let is_object = tree.kind_of(state.parent) == index::NodeKind::Object;
         let key = if is_object { Some(state.key.clone()) } else { None };
+        let raw_value = state.text();
         let rows_before = tree.added_items.len();
-        let new_id = tree.add_item(state.parent, key.clone(), state.text.clone());
+        let new_id = tree.add_item(state.parent, key.clone(), raw_value.clone());
         let rows = tree.added_items.len() - rows_before;
         tree.selected = Some(new_id);
         tree.ensure_visible(new_id);
-        self.push_undo_add(state.parent, key, state.text, rows);
+        self.push_undo_add(state.parent, key, raw_value, rows);
     }
 }
 
@@ -3101,7 +3134,7 @@ mod edit_tests {
         let root = app.tree.as_ref().unwrap().index.root;
 
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = "3".to_owned();
+        app.adding_item.as_mut().unwrap().set_value("3");
         app.commit_add_item();
 
         assert!(app.adding_item.is_none());
@@ -3117,7 +3150,7 @@ mod edit_tests {
         let mut app = app_with(r#"[1]"#);
         let root = app.tree.as_ref().unwrap().index.root;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = "2".to_owned();
+        app.adding_item.as_mut().unwrap().set_value("2");
         app.commit_add_item();
         assert!(app.is_dirty());
 
@@ -3136,7 +3169,7 @@ mod edit_tests {
         let (mut app, path) = app_with_file(r#"[1, 2]"#);
         let root = app.tree.as_ref().unwrap().index.root;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = "3".to_owned();
+        app.adding_item.as_mut().unwrap().set_value("3");
         app.commit_add_item();
 
         app.save_overwrite();
@@ -3159,8 +3192,7 @@ mod edit_tests {
         let root = app.tree.as_ref().unwrap().index.root;
         let base = app.tree.as_ref().unwrap().index.nodes.len() as u32;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text =
-            r#"{"a": 1, "b": "x", "c": [3]}"#.to_owned();
+        app.adding_item.as_mut().unwrap().set_value(r#"{"a": 1, "b": "x", "c": [3]}"#);
         app.commit_add_item();
         // Rows: base = the object, then "a", "b", "c", and c's element.
         assert_eq!(app.tree.as_ref().unwrap().added_items.len(), 5);
@@ -3184,7 +3216,7 @@ mod edit_tests {
         {
             let st = app.adding_item.as_mut().unwrap();
             st.key = "d".to_owned();
-            st.text = "true".to_owned();
+            st.set_value("true");
         }
         app.commit_add_item();
 
@@ -3206,7 +3238,7 @@ mod edit_tests {
         let root = app.tree.as_ref().unwrap().index.root;
         let base = app.tree.as_ref().unwrap().index.nodes.len() as u32;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = r#"{"a": 1}"#.to_owned();
+        app.adding_item.as_mut().unwrap().set_value(r#"{"a": 1}"#);
         app.commit_add_item();
         app.toggle_delete(base);
 
@@ -3225,14 +3257,14 @@ mod edit_tests {
         let root = app.tree.as_ref().unwrap().index.root;
         let base = app.tree.as_ref().unwrap().index.nodes.len() as u32;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = r#"{"a": 1}"#.to_owned();
+        app.adding_item.as_mut().unwrap().set_value(r#"{"a": 1}"#);
         app.commit_add_item();
 
         app.start_add_item(base);
         {
             let st = app.adding_item.as_mut().unwrap();
             st.key = "b".to_owned();
-            st.text = "2".to_owned();
+            st.set_value("2");
         }
         app.commit_add_item();
         assert_eq!(app.tree.as_ref().unwrap().added_items.len(), 3);
@@ -3249,7 +3281,7 @@ mod edit_tests {
         let (mut app, path) = app_with_file(r#"[1]"#);
         let root = app.tree.as_ref().unwrap().index.root;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = r#"{"a": [1, 2]}"#.to_owned();
+        app.adding_item.as_mut().unwrap().set_value(r#"{"a": [1, 2]}"#);
         app.commit_add_item();
         // The pasted object shows as a subtree, but only the item itself is
         // serialized — its derived rows are display-only.
@@ -3265,11 +3297,75 @@ mod edit_tests {
     }
 
     #[test]
+    fn multiline_object_added_to_array_expands_and_serializes() {
+        let mut app = app_with(r#"[1]"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        let base = app.tree.as_ref().unwrap().index.nodes.len() as u32;
+        app.start_add_item(root);
+        // Typed / pasted the way a pretty-printed object arrives: newlines
+        // and indentation, which the single-line input used to drop.
+        app.adding_item
+            .as_mut()
+            .unwrap()
+            .set_value("{\n  \"id\": 1,\n  \"tags\": [\n    \"a\"\n  ]\n}");
+        assert!(app.add_item_valid());
+        app.commit_add_item();
+
+        let t = app.tree.as_ref().unwrap();
+        // The object, "id", "tags", and tags' one element.
+        assert_eq!(t.added_items.len(), 4);
+        assert_eq!(t.kind_of(base), index::NodeKind::Object);
+        assert_eq!(t.selected, Some(base));
+
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &t.added_items);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!([1, {"id": 1, "tags": ["a"]}]));
+    }
+
+    #[test]
+    fn multiline_array_added_as_object_property() {
+        let mut app = app_with(r#"{"a": 1}"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        app.start_add_item(root);
+        {
+            let st = app.adding_item.as_mut().unwrap();
+            st.key = "b".to_owned();
+            st.set_value("[\n  1,\n  {\"c\": 2}\n]");
+        }
+        assert!(app.add_item_valid());
+        app.commit_add_item();
+
+        let t = app.tree.as_ref().unwrap();
+        // The array, its two elements, and "c" inside the second one.
+        assert_eq!(t.added_items.len(), 4);
+        let out = export::json_with_edits(&t.index, t.index.root, &app.edit_overlay, &t.added_items);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"a": 1, "b": [1, {"c": 2}]}));
+    }
+
+    #[test]
+    fn format_prettifies_valid_json_and_leaves_invalid_text_alone() {
+        let mut app = app_with(r#"[1]"#);
+        let root = app.tree.as_ref().unwrap().index.root;
+        app.start_add_item(root);
+
+        let st = app.adding_item.as_mut().unwrap();
+        st.set_value(r#"{"a":[1,2]}"#);
+        st.format();
+        assert_eq!(st.text(), "{\n  \"a\": [\n    1,\n    2\n  ]\n}");
+
+        st.set_value(r#"{"a":"#);
+        st.format();
+        assert_eq!(st.text(), r#"{"a":"#);
+        assert!(!app.add_item_valid());
+    }
+
+    #[test]
     fn undo_add_container_removes_its_rows() {
         let mut app = app_with(r#"[1]"#);
         let root = app.tree.as_ref().unwrap().index.root;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = r#"{"a": 1}"#.to_owned();
+        app.adding_item.as_mut().unwrap().set_value(r#"{"a": 1}"#);
         app.commit_add_item();
         assert_eq!(app.tree.as_ref().unwrap().added_items.len(), 2);
 
@@ -3293,7 +3389,7 @@ mod edit_tests {
         {
             let state = app.adding_item.as_mut().unwrap();
             state.key = "b".to_owned();
-            state.text = "2".to_owned();
+            state.set_value("2");
         }
         app.commit_add_item();
 
@@ -3316,7 +3412,7 @@ mod edit_tests {
         {
             let state = app.adding_item.as_mut().unwrap();
             state.key = "b".to_owned();
-            state.text = "2".to_owned();
+            state.set_value("2");
         }
         app.commit_add_item();
 
@@ -3334,7 +3430,7 @@ mod edit_tests {
         let mut app = app_with(r#"[1]"#);
         let root = app.tree.as_ref().unwrap().index.root;
         app.start_add_item(root);
-        app.adding_item.as_mut().unwrap().text = "2".to_owned();
+        app.adding_item.as_mut().unwrap().set_value("2");
         app.commit_add_item();
         let new_id = app.tree.as_ref().unwrap().selected.unwrap();
 

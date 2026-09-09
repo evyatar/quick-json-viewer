@@ -1434,7 +1434,7 @@ fn url_dialog<'a>(app: &'a App, ui: &Ui) -> Element<'a, Message> {
             .font(Font::MONOSPACE)
             .size(13)
             .height(100)
-            .style(url_editor_style),
+            .style(dialog_editor_style),
         space().height(6),
     ]
     .width(520);
@@ -1463,7 +1463,7 @@ fn url_dialog<'a>(app: &'a App, ui: &Ui) -> Element<'a, Message> {
     col.into()
 }
 
-fn url_editor_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+fn dialog_editor_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
     let pal = Palette::of(theme);
     let border_color = match status {
         text_editor::Status::Focused { .. } => pal.accent,
@@ -1526,9 +1526,12 @@ fn add_dialog<'a>(app: &'a App, ui: &Ui, state: &'a crate::AddingState) -> Eleme
     } else {
         build_path(&tree.index.nodes, &tree.index, state.parent)
     };
-    let value_valid = serde_json::from_str::<serde_json::Value>(&state.text).is_ok();
+    let value_text = state.value.text();
+    let parsed = serde_json::from_str::<serde_json::Value>(&value_text);
+    let value_valid = parsed.is_ok();
     let key_valid = !is_object || !state.key.trim().is_empty();
     let valid = value_valid && key_valid;
+    let single_line = !value_text.contains('\n');
     let title = if is_object { "Add Property" } else { "Add Item" };
     let hint = if is_object { format!("{path}.…") } else { format!("{path}[…]") };
 
@@ -1539,7 +1542,7 @@ fn add_dialog<'a>(app: &'a App, ui: &Ui, state: &'a crate::AddingState) -> Eleme
         space().height(4),
     ]
     .spacing(4)
-    .width(400);
+    .width(480);
 
     if is_object {
         col = col.push(text("Key").size(12).color(ui.pal.text_muted));
@@ -1554,30 +1557,83 @@ fn add_dialog<'a>(app: &'a App, ui: &Ui, state: &'a crate::AddingState) -> Eleme
                 .style(theme::input_style),
         );
         col = col.push(space().height(6));
-        col = col.push(text("Value").size(12).color(ui.pal.text_muted));
     }
     col = col.push(
-        text_input(r#"e.g. "text", 42, true, null"#, &state.text)
+        row![
+            text("Value (any JSON)").size(12).color(ui.pal.text_muted),
+            space().width(Length::Fill),
+            ui.small_btn("Format", value_valid.then_some(Message::AddFormat)),
+        ]
+        .align_y(iced::Center),
+    );
+    col = col.push(
+        text_editor(&state.value)
             .id(ADD_VALUE_ID)
-            .on_input(Message::AddValue)
-            .on_submit(Message::AddCommit)
+            .placeholder("42, \"text\", true, null — or an object / array:\n{\n  \"id\": 1,\n  \"tags\": [\"a\", \"b\"]\n}")
+            .on_action(Message::AddValue)
+            .key_binding(move |kp| {
+                use iced::keyboard::key::Named;
+                use iced::keyboard::Key;
+                // ⌘↵ always commits, and so does a bare ↵ on a single-line
+                // value (the old scalar flow). Once the value spans lines —
+                // a pasted or typed object — ↵ inserts a newline instead, and
+                // ⇧↵ always does.
+                let enter = matches!(kp.key.as_ref(), Key::Named(Named::Enter));
+                let commit = enter
+                    && !kp.modifiers.shift()
+                    && (kp.modifiers.command() || single_line);
+                if commit {
+                    Some(text_editor::Binding::Custom(Message::AddCommit))
+                } else {
+                    text_editor::Binding::from_key_press(kp)
+                }
+            })
             .font(Font::MONOSPACE)
             .size(ui.fs)
-            .width(Length::Fill)
-            .style(theme::input_style),
+            .height(140)
+            .style(dialog_editor_style),
     );
-    if !state.text.is_empty() && !value_valid {
-        col = col.push(text("Not valid JSON").size(12).color(theme::DELETED));
-    }
+    col = col.push(if value_text.trim().is_empty() {
+        text("").size(12)
+    } else {
+        match &parsed {
+            Ok(v)  => text(describe_json_value(v)).size(12).color(ui.pal.text_muted),
+            Err(e) => text(format!("Not valid JSON — {e}")).size(12).color(theme::DELETED),
+        }
+    });
     col = col.push(space().height(8));
     col = col.push(
         row![
             ui.btn("Add", valid.then_some(Message::AddCommit)),
             ui.btn("Cancel", Some(Message::AddCancel)),
+            space().width(Length::Fill),
+            text(if single_line { "↵ to add" } else { "⌘↵ to add · ⇧↵ for a newline" })
+                .size(12)
+                .color(ui.pal.text_faint),
         ]
-        .spacing(6),
+        .spacing(6)
+        .align_y(iced::Center),
     );
     col.into()
+}
+
+/// One-line summary of a parsed value, shown under the Add dialog's editor so
+/// it's clear an object / array was recognised as a tree, not raw text.
+fn describe_json_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(m) => match m.len() {
+            1 => "Object with 1 key".to_owned(),
+            n => format!("Object with {n} keys"),
+        },
+        serde_json::Value::Array(a) => match a.len() {
+            1 => "Array with 1 item".to_owned(),
+            n => format!("Array with {n} items"),
+        },
+        serde_json::Value::String(_) => "String".to_owned(),
+        serde_json::Value::Number(_) => "Number".to_owned(),
+        serde_json::Value::Bool(_)   => "Boolean".to_owned(),
+        serde_json::Value::Null      => "Null".to_owned(),
+    }
 }
 
 /// Renders the bytes surrounding a parse error in a code-block-style
