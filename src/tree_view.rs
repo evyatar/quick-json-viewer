@@ -163,7 +163,10 @@ fn paragraph(content: &str, font: Font, size: f32, row_h: f32) -> Paragraph {
         size: size.into(),
         line_height: text::LineHeight::default(),
         font,
-        align_x: text::Alignment::Left,
+        // Not `Left`: iced 0.14 skips the RTL relayout for single-line
+        // paragraphs with an explicit alignment, so RTL text (e.g. Hebrew)
+        // stays right-aligned to the 100k-wide bounds and is drawn off-screen.
+        align_x: text::Alignment::Default,
         align_y: Vertical::Top,
         shaping: text::Shaping::Advanced,
         wrapping: text::Wrapping::None,
