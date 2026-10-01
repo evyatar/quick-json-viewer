@@ -2751,6 +2751,11 @@ impl App {
 
     /// Pick the drop target pane from the pointer's last horizontal position.
     fn drop_side(&self) -> Side {
+        // Cursor events stop during an OS drag, so `cursor_x` is stale there.
+        #[cfg(target_os = "macos")]
+        if let Some(f) = macos_menu::cursor_x_fraction() {
+            return if f < 0.5 { Side::Left } else { Side::Right };
+        }
         let center = self.window_size.width / 2.0;
         let x = self.cursor_x.unwrap_or(center);
         if x < center { Side::Left } else { Side::Right }

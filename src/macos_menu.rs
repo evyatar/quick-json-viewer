@@ -82,6 +82,22 @@ pub fn clipboard_file_path() -> Option<PathBuf> {
     Some(PathBuf::from(path.to_string()))
 }
 
+/// Pointer x relative to the app window under it, as a fraction of that
+/// window's width (0.0 = left edge, 1.0 = right edge). winit 0.30 delivers no
+/// cursor events during an OS file drag, so a drop has to ask AppKit directly.
+pub fn cursor_x_fraction() -> Option<f32> {
+    use objc2_app_kit::NSEvent;
+    let mtm = MainThreadMarker::new()?;
+    let p = NSEvent::mouseLocation();
+    NSApplication::sharedApplication(mtm).windows().iter().find_map(|w| {
+        let f = w.frame();
+        let inside = w.isVisible()
+            && p.x >= f.origin.x && p.x <= f.origin.x + f.size.width
+            && p.y >= f.origin.y && p.y <= f.origin.y + f.size.height;
+        (inside && f.size.width > 0.0).then(|| ((p.x - f.origin.x) / f.size.width) as f32)
+    })
+}
+
 pub fn take_open_file() -> Option<PathBuf> {
     PENDING_OPEN_FILE.lock().ok()?.take()
 }
