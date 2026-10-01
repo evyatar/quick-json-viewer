@@ -119,14 +119,17 @@ fn fetch_latest() -> Result<GhRelease, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     // GitHub rejects requests without a User-Agent. A ~10s timeout keeps a
     // stalled connection from leaking the thread indefinitely.
-    let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .set("User-Agent", "quick-json-viewer")
-        .set("Accept", "application/vnd.github+json")
+    let mut resp = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .header("User-Agent", "quick-json-viewer")
+        .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| format!("request: {e}"))?;
     let body = resp
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| format!("read: {e}"))?;
     let rel: GhRelease = serde_json::from_str(&body)
         .map_err(|e| format!("parse: {e}"))?;

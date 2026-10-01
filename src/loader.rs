@@ -72,33 +72,42 @@ pub fn spawn_fetch_url(
     body: Option<String>,
 ) -> mpsc::Receiver<LoadMsg> {
     spawn_build(move || {
-        use std::io::Read;
-
-        let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
-        let mut req = match method.as_str() {
-            "POST"   => ureq::post(&url),
-            "PUT"    => ureq::put(&url),
-            "DELETE" => ureq::delete(&url),
-            "PATCH"  => ureq::patch(&url),
-            _        => ureq::get(&url),
-        }
-        .timeout(std::time::Duration::from_secs(30))
-        .set("User-Agent", "quick-json-viewer")
-        .set("Accept", "application/json, text/plain, */*");
+        let method = match method.as_deref().unwrap_or("GET").to_ascii_uppercase().as_str() {
+            "POST"   => ureq::http::Method::POST,
+            "PUT"    => ureq::http::Method::PUT,
+            "DELETE" => ureq::http::Method::DELETE,
+            "PATCH"  => ureq::http::Method::PATCH,
+            _        => ureq::http::Method::GET,
+        };
+        let mut req = ureq::http::Request::builder()
+            .method(method)
+            .uri(&url)
+            .header("User-Agent", "quick-json-viewer")
+            .header("Accept", "application/json, text/plain, */*");
         for (k, v) in &headers {
-            req = req.set(k.as_str(), v.as_str());
+            req = req.header(k.as_str(), v.as_str());
         }
 
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .into();
+        // `Agent::run` sends a body with any method (curl allows e.g. DELETE -d).
         let resp = if let Some(body) = body {
-            req.send_string(&body).map_err(|e| format!("HTTP error: {e}"))?
+            req.body(body).map_err(|e| format!("bad request: {e}")).and_then(|r| {
+                agent.run(r).map_err(|e| format!("HTTP error: {e}"))
+            })?
         } else {
-            req.call().map_err(|e| format!("HTTP error: {e}"))?
+            req.body(()).map_err(|e| format!("bad request: {e}")).and_then(|r| {
+                agent.run(r).map_err(|e| format!("HTTP error: {e}"))
+            })?
         };
 
-        let mut data = Vec::new();
-        resp.into_reader()
-            .take(50 * 1024 * 1024) // 50 MB limit
-            .read_to_end(&mut data)
+        let data = resp
+            .into_body()
+            .with_config()
+            .limit(50 * 1024 * 1024) // 50 MB limit
+            .read_to_vec()
             .map_err(|e| format!("reading response: {e}"))?;
 
         Ok(JsonData::Memory(data))

@@ -92,29 +92,35 @@ pub struct ToolDef {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(180))
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(180)))
+        // Non-2xx responses come back as `Ok` so `read_json` can surface the
+        // provider's error body (ureq's own status error discards it).
+        .http_status_as_error(false)
         .build()
+        .into()
 }
 
-/// Extract a readable error message from an HTTP failure.
-fn http_error(err: ureq::Error) -> String {
-    match err {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            // Try to pull the provider's error message out of the JSON body.
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| body.chars().take(300).collect());
-            format!("HTTP {code}: {detail}")
-        }
-        other => other.to_string(),
+/// Parse a JSON response, turning an HTTP failure into a readable message.
+fn read_json(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<Value, String> {
+    let mut resp = result.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status.is_success() {
+        return resp.body_mut().read_json().map_err(|e| e.to_string());
     }
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    // Try to pull the provider's error message out of the JSON body.
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.chars().take(300).collect());
+    Err(format!("HTTP {}: {detail}", status.as_u16()))
 }
 
 /// Build the initial user message in the provider's native shape.
@@ -198,15 +204,14 @@ fn chat_anthropic(
     });
 
     let url = format!("{}/v1/messages", cfg.base());
-    let resp: Value = agent()
-        .post(&url)
-        .set("content-type", "application/json")
-        .set("x-api-key", &cfg.api_key)
-        .set("anthropic-version", "2023-06-01")
-        .send_json(body)
-        .map_err(http_error)?
-        .into_json()
-        .map_err(|e| e.to_string())?;
+    let resp = read_json(
+        agent()
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-api-key", &cfg.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send(body.to_string()), // compact; ureq 3 `send_json` pretty-prints
+    )?;
 
     let stop_reason = resp["stop_reason"].as_str().unwrap_or("");
     if stop_reason == "refusal" {
@@ -272,14 +277,13 @@ fn chat_openai(
     });
 
     let url = format!("{}/chat/completions", cfg.base());
-    let resp: Value = agent()
-        .post(&url)
-        .set("content-type", "application/json")
-        .set("authorization", &format!("Bearer {}", cfg.api_key))
-        .send_json(body)
-        .map_err(http_error)?
-        .into_json()
-        .map_err(|e| e.to_string())?;
+    let resp = read_json(
+        agent()
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("authorization", &format!("Bearer {}", cfg.api_key))
+            .send(body.to_string()), // compact; ureq 3 `send_json` pretty-prints
+    )?;
 
     let message = resp
         .pointer("/choices/0/message")
