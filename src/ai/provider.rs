@@ -25,21 +25,21 @@ impl ProviderKind {
     pub fn key_account(self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "anthropic",
-            ProviderKind::OpenAiCompatible => "openai_compatible",
+            ProviderKind::OpenAiCompatible => "openai",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "Anthropic",
-            ProviderKind::OpenAiCompatible => "OpenAI-compatible",
+            ProviderKind::OpenAiCompatible => "OpenAI",
         }
     }
 
     pub fn default_model(self) -> &'static str {
         match self {
-            ProviderKind::Anthropic => "claude-sonnet-5",
-            ProviderKind::OpenAiCompatible => "gpt-5.4",
+            ProviderKind::Anthropic => "claude-sonnet-5-5",
+            ProviderKind::OpenAiCompatible => "gpt-6-luna",
         }
     }
 }
