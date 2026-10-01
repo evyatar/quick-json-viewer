@@ -270,20 +270,32 @@ fn chat_openai(
     let mut messages = vec![json!({"role": "system", "content": system})];
     messages.extend_from_slice(history);
 
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model,
         "messages": messages,
         "tools": tools_json,
     });
 
     let url = format!("{}/chat/completions", cfg.base());
-    let resp = read_json(
-        agent()
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("authorization", &format!("Bearer {}", cfg.api_key))
-            .send(body.to_string()), // compact; ureq 3 `send_json` pretty-prints
-    )?;
+    let send = |body: &Value| {
+        read_json(
+            agent()
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("authorization", &format!("Bearer {}", cfg.api_key))
+                .send(body.to_string()), // compact; ureq 3 `send_json` pretty-prints
+        )
+    };
+    let resp = match send(&body) {
+        // Some reasoning models (e.g. gpt-6-luna) refuse function tools on
+        // chat/completions unless reasoning is disabled. Only retry with the
+        // field on demand — other compatible endpoints may reject it outright.
+        Err(e) if e.starts_with("HTTP 400") && e.contains("reasoning_effort") => {
+            body["reasoning_effort"] = json!("none");
+            send(&body)?
+        }
+        other => other?,
+    };
 
     let message = resp
         .pointer("/choices/0/message")
