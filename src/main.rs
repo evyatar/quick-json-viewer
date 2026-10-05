@@ -6,6 +6,7 @@ mod index;
 mod loader;
 #[cfg(target_os = "macos")]
 mod macos_menu;
+mod merge;
 mod parser;
 mod paste;
 mod search;
@@ -84,6 +85,12 @@ enum BgWriteDone {
         structural: bool,
         /// Overlay as it was at save time — becomes the saved baseline.
         snapshot:   std::collections::HashMap<u32, export::NodeEdit>,
+    },
+    /// A Compare pane was written to `path`; `index` is what was written.
+    PaneSaved {
+        side:  Side,
+        index: Arc<index::JsonIndex>,
+        path:  PathBuf,
     },
 }
 
@@ -207,6 +214,22 @@ struct ComparePane {
     load_error:     Option<String>,
     load_error_ctx: Option<loader::ErrorContext>,
     file_info:      Option<FileInfo>,
+    /// The index as last loaded or saved; the pane is dirty when `index` is a
+    /// different one (a copy from the other side, not yet saved).
+    clean:          Option<Arc<index::JsonIndex>>,
+    /// Set while a copied-across edit reparses (`load_rx`): the index it
+    /// replaces, pushed onto the undo stack once the new one arrives.
+    pending_copy:   Option<Arc<index::JsonIndex>>,
+}
+
+impl ComparePane {
+    fn is_dirty(&self) -> bool {
+        match (&self.index, &self.clean) {
+            (Some(i), Some(c)) => !Arc::ptr_eq(i, c),
+            (Some(_), None)    => true,
+            (None, _)          => false,
+        }
+    }
 }
 
 /// State for the Compare view: the two panes, the diff options + their raw UI
@@ -231,6 +254,12 @@ struct CompareState {
     filter:             diff::StatusFilter,
     /// Bumped per computed diff so the row widget resets its cached widths.
     generation:         u64,
+    /// Copy-across history: the pane and the index it had before the change.
+    undo:               Vec<(Side, Arc<index::JsonIndex>)>,
+    redo:               Vec<(Side, Arc<index::JsonIndex>)>,
+    /// View (expanded paths, selected path) to re-apply to the next diff, so
+    /// a copy or undo doesn't collapse the tree and jump to the first diff.
+    restore:            Option<(std::collections::HashSet<String>, Option<String>)>,
 }
 
 impl Side {
@@ -245,6 +274,17 @@ impl CompareState {
     }
     fn pane_mut(&mut self, side: Side) -> &mut ComparePane {
         match side { Side::Left => &mut self.left, Side::Right => &mut self.right }
+    }
+    /// Drop the copy-across history of a pane whose document was replaced.
+    fn forget_history(&mut self, side: Side) {
+        self.undo.retain(|(s, _)| *s != side);
+        self.redo.retain(|(s, _)| *s != side);
+    }
+    /// True while a load, reparse or diff is in flight — merged node ids may
+    /// not match the documents then, so copy / undo wait.
+    fn busy(&self) -> bool {
+        self.left.load_rx.is_some() || self.right.load_rx.is_some()
+            || self.diff_rx.is_some() || self.needs_rediff
     }
 }
 
@@ -361,6 +401,11 @@ pub enum Message {
     PaneOpen(Side),
     PanePaste(Side),
     PaneErrorCtx(Side),
+    PaneSave(Side, SaveAction),
+    /// Copy a pane's whole document — including copied-across changes.
+    CopyPaneDocument(Side),
+    /// Make the `Side` document match the other one at this merged node.
+    CompareCopy(u32, Side),
     CursorMoved(Point),
 
     // ── trees ──
@@ -791,6 +836,9 @@ impl App {
                 self.dialog = Some(Dialog::ErrorContext(Some(side)));
                 Task::none()
             }
+            Message::PaneSave(side, action) => { self.save_pane(side, action); Task::none() }
+            Message::CopyPaneDocument(side) => copy(self.pane_document_text(side)),
+            Message::CompareCopy(node, to) => { self.compare_copy(node, to); Task::none() }
             Message::CursorMoved(p) => { self.cursor_x = Some(p.x); Task::none() }
 
             // ── trees ──
@@ -1171,8 +1219,12 @@ impl App {
                 Some('v') if !shift && !alt => return self.handle(Message::RequestPaste),
                 // ⌘C — copy the selected node's value.
                 Some('c') if !shift && !alt => return self.handle(Message::CopySelected),
-                Some('z') if !shift && self.mode == AppMode::Viewer => return self.handle(Message::Undo),
-                Some('z') if shift && self.mode == AppMode::Viewer => return self.handle(Message::Redo),
+                Some('z') if !shift => return self.handle(Message::Undo),
+                Some('z') if shift => return self.handle(Message::Redo),
+                Some('s') if self.mode == AppMode::Compare => {
+                    let action = if shift { SaveAction::Copy } else { SaveAction::Overwrite };
+                    return self.handle(Message::PaneSave(self.compare.active_pane, action));
+                }
                 Some('s') if !shift && self.mode == AppMode::Viewer => {
                     if self.is_dirty() {
                         return if self.can_overwrite() {
@@ -1411,6 +1463,8 @@ impl App {
                             return self.start_edit_task(node, field);
                         }
                     }
+                    // Compare-only regions; viewer rows never report them.
+                    Region::CopyToRight | Region::CopyToLeft => {}
                 }
                 Task::none()
             }
@@ -1426,10 +1480,15 @@ impl App {
         match ev {
             RowEvent::Click { node, region } => {
                 tree.selected = Some(node);
-                if region == Region::Caret {
-                    tree.toggle(node, result);
+                match region {
+                    Region::Caret => tree.toggle(node, result),
+                    Region::CopyToRight => self.compare_copy(node, Side::Right),
+                    Region::CopyToLeft => self.compare_copy(node, Side::Left),
+                    _ => {}
                 }
             }
+            // The first click already copied; don't toggle or copy again.
+            RowEvent::DoubleClick { region: Region::CopyToRight | Region::CopyToLeft, .. } => {}
             RowEvent::DoubleClick { node, region } => {
                 tree.selected = Some(node);
                 let dn = &result.nodes[node as usize];
@@ -1605,15 +1664,20 @@ impl App {
         })
     }
 
+    /// A pane's current document text: verbatim, or minified when compact
+    /// copying is on (NDJSON stays verbatim — minifying would merge its lines).
+    fn pane_document_text(&self, side: Side) -> Option<String> {
+        let index = self.compare.pane(side).index.as_ref()?;
+        Some(if self.settings.copy_compact_json && !index.is_ndjson {
+            export::json_compact(index, index.root)
+        } else {
+            String::from_utf8_lossy(index.data.bytes()).into_owned()
+        })
+    }
+
     fn diff_path_of(&self, node_idx: u32) -> Option<String> {
         let result = self.compare.result.as_ref()?;
-        let dn = &result.nodes[node_idx as usize];
-        let (idx, n) = match (dn.left_idx(), dn.right_idx()) {
-            (Some(li), _) => (&*result.left, li),
-            (_, Some(ri)) => (&*result.right, ri),
-            _             => (&*result.left, 0),
-        };
-        Some(build_path(&idx.nodes, idx, n))
+        Some(diff::node_path(result, node_idx))
     }
 
     fn handle_pasted(&mut self, text: Option<String>) {
@@ -1820,6 +1884,7 @@ impl App {
     /// Unload one Compare pane and drop the diff computed against it.
     fn clear_pane(&mut self, side: Side) {
         *self.compare.pane_mut(side) = ComparePane::default();
+        self.compare.forget_history(side);
         self.compare.result       = None;
         self.compare.tree         = None;
         self.compare.diff_rx      = None;
@@ -1880,17 +1945,11 @@ impl App {
 
     fn open_url_request_into_pane(&mut self, side: Side, req: url_parse::HttpRequest) {
         let name = url_parse::url_display_name(&req.url);
-        let pane = self.compare.pane_mut(side);
-        pane.file_info      = Some(FileInfo { name, size_bytes: 0, path: None });
-        pane.index          = None;
-        pane.load_error     = None;
-        pane.load_error_ctx = None;
-        pane.load_progress  = 0.0;
-        pane.load_rx = Some(match req.curl_args {
+        let rx = match req.curl_args {
             Some(args) => loader::spawn_exec_curl(args),
             None       => loader::spawn_fetch_url(req.url, req.method, req.headers, req.body),
-        });
-        self.compare.active_pane = side.other();
+        };
+        self.begin_pane_load(side, FileInfo { name, size_bytes: 0, path: None }, rx);
     }
 
     fn kick_search(&mut self) {
@@ -2027,15 +2086,24 @@ impl App {
     }
 
     fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
+        match self.mode {
+            AppMode::Viewer  => !self.undo_stack.is_empty(),
+            AppMode::Compare => !self.compare.undo.is_empty(),
+        }
     }
 
     fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
+        match self.mode {
+            AppMode::Viewer  => !self.redo_stack.is_empty(),
+            AppMode::Compare => !self.compare.redo.is_empty(),
+        }
     }
 
     /// Revert the most recent action and move it to the redo stack.
     fn undo(&mut self) {
+        if self.mode == AppMode::Compare {
+            return self.compare_step_history(true);
+        }
         let Some(action) = self.undo_stack.pop() else { return };
         match &action {
             UndoAction::Overlay(entry) => {
@@ -2067,6 +2135,9 @@ impl App {
 
     /// Re-apply the most recently undone action.
     fn redo(&mut self) {
+        if self.mode == AppMode::Compare {
+            return self.compare_step_history(false);
+        }
         let Some(action) = self.redo_stack.pop() else { return };
         match &action {
             UndoAction::Overlay(entry) => {
@@ -2294,6 +2365,9 @@ impl App {
     /// Serialization + write happen on a background thread.
     /// Does not change which file is open or clear the dirty state.
     fn save_copy(&mut self) {
+        if self.mode == AppMode::Compare {
+            return self.save_pane(self.compare.active_pane, SaveAction::Copy);
+        }
         let Some(tree) = &self.tree else { return };
         let stem = self
             .file_info
@@ -2335,6 +2409,9 @@ impl App {
     /// on a background thread; the post-save transition happens when
     /// `bg_write_rx` reports completion.
     fn save_overwrite(&mut self) {
+        if self.mode == AppMode::Compare {
+            return self.save_pane(self.compare.active_pane, SaveAction::Overwrite);
+        }
         let Some(path) = self.file_info.as_ref().and_then(|f| f.path.clone()) else { return };
         let Some(tree) = &self.tree else { return };
         // Deletions and pending adds both change the node structure, which
@@ -2378,7 +2455,21 @@ impl App {
                     }
                 }
             }
-            Err(e) => self.load_error = Some(e),
+            Ok(BgWriteDone::PaneSaved { side, index, path }) => {
+                // Skip if the pane has since been given another document.
+                let c = &self.compare;
+                let ours = c.pane(side).index.as_ref().is_some_and(|i| Arc::ptr_eq(i, &index))
+                    || c.undo.iter().chain(&c.redo).any(|(s, i)| *s == side && Arc::ptr_eq(i, &index));
+                if !ours { return; }
+                let pane = self.compare.pane_mut(side);
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                pane.file_info = Some(FileInfo { name, size_bytes: index.data.bytes().len() as u64, path: Some(path) });
+                pane.clean = Some(index);
+            }
+            Err(e) => match self.mode {
+                AppMode::Viewer  => self.load_error = Some(e),
+                AppMode::Compare => self.compare.pane_mut(self.compare.active_pane).load_error = Some(e),
+            },
         }
     }
 
@@ -2511,6 +2602,7 @@ impl App {
         if mode == AppMode::Compare && self.compare.left.index.is_none() {
             if let Some(t) = &self.tree {
                 self.compare.left.index     = Some(Arc::clone(&t.index));
+                self.compare.left.clean     = Some(Arc::clone(&t.index));
                 self.compare.left.file_info = self.file_info.clone();
                 self.compare.needs_rediff   = true;
                 self.recompute_diff_if_needed();
@@ -2540,13 +2632,18 @@ impl App {
     fn open_file_into_pane(&mut self, side: Side, path: PathBuf) {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let pane = self.compare.pane_mut(side);
-        pane.file_info      = Some(FileInfo { name, size_bytes: size, path: None });
-        pane.index          = None;
-        pane.load_error     = None;
-        pane.load_error_ctx = None;
-        pane.load_progress  = 0.0;
-        pane.load_rx        = Some(loader::spawn_load(path));
+        let info = FileInfo { name, size_bytes: size, path: Some(path.clone()) };
+        self.begin_pane_load(side, info, loader::spawn_load(path));
+    }
+
+    /// Start loading a new document into a pane, dropping what it held.
+    fn begin_pane_load(&mut self, side: Side, info: FileInfo, rx: std::sync::mpsc::Receiver<LoadMsg>) {
+        *self.compare.pane_mut(side) = ComparePane {
+            file_info: Some(info),
+            load_rx:   Some(rx),
+            ..ComparePane::default()
+        };
+        self.compare.forget_history(side);
         self.compare.active_pane = side.other();
     }
 
@@ -2567,14 +2664,8 @@ impl App {
             Some(d) => (d, "Pasted JWT"),
             None    => (text.as_bytes().to_vec(), "Pasted JSON"),
         };
-        let pane = self.compare.pane_mut(side);
-        pane.file_info      = Some(FileInfo { name: name.to_owned(), size_bytes: data.len() as u64, path: None });
-        pane.index          = None;
-        pane.load_error     = None;
-        pane.load_error_ctx = None;
-        pane.load_progress  = 0.0;
-        pane.load_rx        = Some(loader::spawn_parse(data));
-        self.compare.active_pane = side.other();
+        let info = FileInfo { name: name.to_owned(), size_bytes: data.len() as u64, path: None };
+        self.begin_pane_load(side, info, loader::spawn_parse(data));
     }
 
     fn poll_pane_loader(&mut self, side: Side) {
@@ -2583,20 +2674,34 @@ impl App {
             None     => None,
         };
         let Some(msg) = msg else { return };
-        let mut did_load = false;
-        {
-            let pane = self.compare.pane_mut(side);
-            match msg {
-                LoadMsg::Progress(p) => { pane.load_progress = p; }
-                LoadMsg::Done(idx)   => { pane.index = Some(idx); pane.load_rx = None; did_load = true; }
-                LoadMsg::Error(e, ctx) => {
-                    pane.load_error     = Some(e);
-                    pane.load_error_ctx = ctx;
-                    pane.load_rx        = None;
+        let pane = self.compare.pane_mut(side);
+        match msg {
+            LoadMsg::Progress(p) => { pane.load_progress = p; }
+            LoadMsg::Done(idx) => {
+                pane.load_rx = None;
+                match pane.pending_copy.take() {
+                    Some(before) => {
+                        if let Some(f) = &mut pane.file_info {
+                            f.size_bytes = idx.data.bytes().len() as u64;
+                        }
+                        self.compare.undo.push((side, before));
+                        self.compare.redo.clear();
+                    }
+                    None => pane.clean = Some(Arc::clone(&idx)),
+                }
+                self.compare.pane_mut(side).index = Some(idx);
+                self.compare.needs_rediff = true;
+            }
+            LoadMsg::Error(e, ctx) => {
+                pane.load_error     = Some(e);
+                pane.load_error_ctx = ctx;
+                pane.load_rx        = None;
+                // A failed copy leaves the pane as it was.
+                if pane.pending_copy.take().is_some() {
+                    self.compare.restore = None;
                 }
             }
         }
-        if did_load { self.compare.needs_rediff = true; }
     }
 
     /// Kick off a diff on a background thread when a pane changed or an option
@@ -2623,6 +2728,90 @@ impl App {
         self.compare.diff_rx = Some(rx);
     }
 
+    /// Make the `to` document match the other side at merged node `node`
+    /// (copy the value across, insert it, or delete the target's member). The
+    /// spliced bytes reparse in the background; the old view stays up until
+    /// the new diff lands, then `restore` puts the expansion/selection back.
+    fn compare_copy(&mut self, node: u32, to: Side) {
+        if self.compare.busy() { return; }
+        let Some(result) = &self.compare.result else { return };
+        let Some(bytes) = merge::apply(result, node, to) else { return };
+        self.compare.restore = self.compare.tree.as_ref().map(|t| {
+            (t.expanded_paths(result), t.selected.map(|n| diff::node_path(result, n)))
+        });
+        let pane = self.compare.pane_mut(to);
+        pane.pending_copy  = pane.index.clone();
+        pane.load_error    = None;
+        pane.load_progress = 0.0;
+        pane.load_rx       = Some(loader::spawn_parse(bytes));
+        self.compare.active_pane = to;
+    }
+
+    /// Undo (`undo = true`) or redo the most recent copy-across: swap the
+    /// pane's index with the one saved in the history.
+    fn compare_step_history(&mut self, undo: bool) {
+        if self.compare.busy() { return; }
+        let c = &mut self.compare;
+        let Some((side, index)) = (if undo { c.undo.pop() } else { c.redo.pop() }) else { return };
+        let size = index.data.bytes().len() as u64;
+        let pane = c.pane_mut(side);
+        let Some(current) = pane.index.replace(index) else { return };
+        if let Some(f) = &mut pane.file_info {
+            f.size_bytes = size;
+        }
+        if undo { c.redo.push((side, current)) } else { c.undo.push((side, current)) }
+        c.restore = match (&c.result, &c.tree) {
+            (Some(r), Some(t)) => Some((t.expanded_paths(r), t.selected.map(|n| diff::node_path(r, n)))),
+            _ => None,
+        };
+        c.active_pane = side;
+        c.needs_rediff = true;
+        self.recompute_diff_if_needed();
+    }
+
+    /// Write a Compare pane's document to disk: in place (`Overwrite`, when it
+    /// came from a file) or to a newly chosen file (`Copy` — the pane then
+    /// refers to that file). The write runs on a background thread.
+    fn save_pane(&mut self, side: Side, action: SaveAction) {
+        let pane = self.compare.pane(side);
+        let Some(index) = pane.index.clone() else { return };
+        let path = match (action, pane.file_info.as_ref().and_then(|f| f.path.clone())) {
+            (SaveAction::Overwrite, Some(path)) => {
+                if !pane.is_dirty() { return; }
+                path
+            }
+            _ => {
+                let stem = pane
+                    .file_info
+                    .as_ref()
+                    .map(|f| {
+                        std::path::Path::new(&f.name)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| f.name.clone())
+                    })
+                    .unwrap_or_else(|| "document".to_owned());
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .set_file_name(format!("{stem}.json"))
+                    .save_file()
+                else {
+                    return;
+                };
+                path
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bg_write_rx = Some(rx);
+        std::thread::spawn(move || {
+            // Atomic write: the pane (or the other one) may mmap this file.
+            let res = write_atomic(&path, index.data.bytes())
+                .map(|_| BgWriteDone::PaneSaved { side, index, path })
+                .map_err(|e| format!("Save failed: {e}"));
+            let _ = tx.send(res);
+        });
+    }
+
     /// Collect a finished background diff and build its view tree.
     fn poll_diff(&mut self) {
         let result = match &self.compare.diff_rx {
@@ -2639,7 +2828,10 @@ impl App {
         let mut tree = diff::DiffTreeState::new(&result);
         tree.only_diffs = self.compare.show_only_diffs;
         tree.filter = self.compare.filter;
-        tree.refresh_visible(&result);
+        match self.compare.restore.take() {
+            Some((expanded, selected)) => tree.restore(&result, &expanded, selected.as_deref()),
+            None => tree.refresh_visible(&result),
+        }
         self.compare.result  = Some(result);
         self.compare.tree    = Some(tree);
         self.compare.diff_rx = None;
@@ -3457,5 +3649,161 @@ mod edit_tests {
         assert_eq!(scroll_target(None, Some(30), 20.0, 0.0, 400.0, 1000), Some(31.0 * 20.0 - 400.0));
         // Reveal above → scroll so the row's top is at the viewport top.
         assert_eq!(scroll_target(None, Some(2), 20.0, 100.0, 400.0, 1000), Some(40.0));
+    }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+    use crate::index::{JsonData, JsonIndex};
+
+    fn index(json: &str) -> Arc<JsonIndex> {
+        let data = json.as_bytes().to_vec();
+        let (nodes, root, is_ndjson) = crate::parser::parse_bytes(&data, &mut |_| {}).unwrap();
+        Arc::new(JsonIndex { data: JsonData::Memory(data), nodes, root, is_ndjson })
+    }
+
+    /// Drive pane reparses and the background diff until nothing is in flight.
+    fn settle(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.compare.busy() {
+            assert!(Instant::now() < deadline, "compare never settled");
+            app.poll_pane_loader(Side::Left);
+            app.poll_pane_loader(Side::Right);
+            app.recompute_diff_if_needed();
+            app.poll_diff();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn compare_app(l: &str, r: &str) -> App {
+        let mut app = App { mode: AppMode::Compare, ..App::default() };
+        for (side, json) in [(Side::Left, l), (Side::Right, r)] {
+            let pane = app.compare.pane_mut(side);
+            pane.index = Some(index(json));
+            pane.clean = pane.index.clone();
+            pane.file_info = Some(FileInfo { name: format!("{side:?}.json"), size_bytes: json.len() as u64, path: None });
+        }
+        app.compare.needs_rediff = true;
+        settle(&mut app);
+        app
+    }
+
+    fn node_at(app: &App, path: &str) -> u32 {
+        let res = app.compare.result.as_ref().unwrap();
+        (0..res.nodes.len() as u32).find(|&i| diff::node_path(res, i) == path).unwrap()
+    }
+
+    fn text(app: &App, side: Side) -> String {
+        String::from_utf8(app.compare.pane(side).index.as_ref().unwrap().data.bytes().to_vec()).unwrap()
+    }
+
+    fn root_status(app: &App) -> diff::DiffStatus {
+        let res = app.compare.result.as_ref().unwrap();
+        res.nodes[res.root as usize].status
+    }
+
+    #[test]
+    fn copy_marks_target_dirty_and_resolves_the_difference() {
+        let mut app = compare_app(r#"{"a": 1, "b": 2}"#, r#"{"a": 1, "b": 3}"#);
+        assert_eq!(root_status(&app), diff::DiffStatus::Changed);
+        let b = node_at(&app, "$.b");
+        app.compare.tree.as_mut().unwrap().selected = Some(b);
+
+        let _ = app.handle(Message::CompareCopy(b, Side::Left));
+        settle(&mut app);
+
+        assert_eq!(text(&app, Side::Left), r#"{"a": 1, "b": 3}"#);
+        assert!(app.compare.left.is_dirty());
+        assert!(!app.compare.right.is_dirty());
+        assert_eq!(root_status(&app), diff::DiffStatus::Unchanged);
+        assert_eq!(app.compare.active_pane, Side::Left);
+        // The selection stays on the copied row instead of jumping away.
+        let sel = app.compare.tree.as_ref().unwrap().selected.unwrap();
+        assert_eq!(diff::node_path(app.compare.result.as_ref().unwrap(), sel), "$.b");
+    }
+
+    #[test]
+    fn undo_and_redo_swap_the_pane_document() {
+        let mut app = compare_app(r#"{"a": 1}"#, r#"{"a": 1, "z": true}"#);
+        let z = node_at(&app, "$.z");
+        let _ = app.handle(Message::CompareCopy(z, Side::Left));
+        settle(&mut app);
+        assert_eq!(text(&app, Side::Left), r#"{"a": 1, "z": true}"#);
+        assert!(app.can_undo() && !app.can_redo());
+
+        let _ = app.handle(Message::Undo);
+        settle(&mut app);
+        assert_eq!(text(&app, Side::Left), r#"{"a": 1}"#);
+        assert!(!app.compare.left.is_dirty());
+        assert_eq!(root_status(&app), diff::DiffStatus::Changed);
+        assert!(app.can_redo());
+
+        let _ = app.handle(Message::Redo);
+        settle(&mut app);
+        assert_eq!(text(&app, Side::Left), r#"{"a": 1, "z": true}"#);
+        assert!(app.compare.left.is_dirty());
+        assert_eq!(root_status(&app), diff::DiffStatus::Unchanged);
+    }
+
+    #[test]
+    fn delete_from_target_when_source_lacks_the_value() {
+        let mut app = compare_app(r#"{"a": 1}"#, r#"{"a": 1, "z": true}"#);
+        let z = node_at(&app, "$.z");
+        let _ = app.handle(Message::CompareCopy(z, Side::Right));
+        settle(&mut app);
+        assert_eq!(text(&app, Side::Right), r#"{"a": 1}"#);
+        assert!(app.compare.right.is_dirty());
+    }
+
+    #[test]
+    fn save_overwrites_the_pane_file_and_clears_dirty() {
+        let mut app = compare_app(r#"{"v": "old"}"#, r#"{"v": "new"}"#);
+        let path = std::env::temp_dir().join(format!(
+            "jsonviewer-compare-{}.json",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, r#"{"v": "old"}"#).unwrap();
+        app.compare.left.file_info.as_mut().unwrap().path = Some(path.clone());
+
+        let v = node_at(&app, "$.v");
+        let _ = app.handle(Message::CompareCopy(v, Side::Left));
+        settle(&mut app);
+        assert!(app.compare.left.is_dirty());
+
+        let _ = app.handle(Message::Save(SaveAction::Overwrite)); // active pane = Left
+        app.wait_bg_write();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"v": "new"}"#);
+        assert!(!app.compare.left.is_dirty());
+
+        // Undoing past the save leaves the pane differing from the file.
+        let _ = app.handle(Message::Undo);
+        settle(&mut app);
+        assert!(app.compare.left.is_dirty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pane_document_text_includes_copied_changes() {
+        let mut app = compare_app(r#"{"a": 1, "b": 2}"#, r#"{"a": 1, "b": 3}"#);
+        let b = node_at(&app, "$.b");
+        let _ = app.handle(Message::CompareCopy(b, Side::Left));
+        settle(&mut app);
+        assert_eq!(app.pane_document_text(Side::Left).unwrap(), r#"{"a": 1, "b": 3}"#);
+        app.settings.copy_compact_json = true;
+        assert_eq!(app.pane_document_text(Side::Left).unwrap(), r#"{"a":1,"b":3}"#);
+    }
+
+    #[test]
+    fn loading_a_new_document_drops_that_panes_history() {
+        let mut app = compare_app(r#"{"a": 1}"#, r#"{"a": 2}"#);
+        let a = node_at(&app, "$.a");
+        let _ = app.handle(Message::CompareCopy(a, Side::Left));
+        settle(&mut app);
+        assert!(app.can_undo());
+        app.open_pasted_into_pane(Side::Left, r#"{"b": 1}"#);
+        assert!(!app.can_undo());
+        settle(&mut app);
+        assert!(!app.compare.left.is_dirty());
     }
 }

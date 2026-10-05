@@ -2,8 +2,8 @@
 //! status bar), the Viewer / Compare panels, popup menus and modal dialogs.
 
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, progress_bar, rich_text, row, rule,
-    scrollable, space, span, stack, text, text_editor, text_input, tooltip, Button, Text,
+    button, center, column, container, mouse_area, opaque, progress_bar, responsive, rich_text, row,
+    rule, scrollable, space, span, stack, text, text_editor, text_input, tooltip, Button, Text,
 };
 use iced::{Color, Element, Font, Length, Padding};
 
@@ -11,10 +11,11 @@ use crate::ai;
 use crate::codegen;
 use crate::export;
 use crate::index::{self, NodeKind};
+use crate::merge;
 use crate::search;
 use crate::settings;
 use crate::theme::{self, Palette};
-use crate::tree_view::{DiffRows, Rows, TreeView, ViewerRows};
+use crate::tree_view::{text_width, DiffRows, Rows, TreeView, ViewerRows};
 use crate::url_parse;
 use crate::update;
 use crate::{
@@ -773,18 +774,78 @@ fn tree_panel<'a>(app: &'a App, ui: &Ui) -> Element<'a, Message> {
 
 // ─── compare panel ───────────────────────────────────────────────────────────
 
+/// `s` shortened to fit `max_w` by replacing its middle with "…" — keeping
+/// both ends, so similar file names (shared prefix, differing date or
+/// extension) stay distinguishable. Returns whether it was shortened.
+fn ellipsize_middle(s: &str, font: Font, size: f32, max_w: f32) -> (String, bool) {
+    if text_width(s, font, size) <= max_w {
+        return (s.to_owned(), false);
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let cut = |keep: usize| -> String {
+        let head = keep.div_ceil(2);
+        let tail = keep - head;
+        let mut out: String = chars[..head].iter().collect();
+        out.push('…');
+        out.extend(&chars[chars.len() - tail..]);
+        out
+    };
+    // Largest number of kept characters that still fits.
+    let (mut lo, mut hi) = (0usize, chars.len().saturating_sub(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if text_width(&cut(mid), font, size) <= max_w { lo = mid } else { hi = mid - 1 }
+    }
+    (cut(lo), true)
+}
+
 fn pane_header<'a>(app: &'a App, ui: &Ui, side: Side) -> Element<'a, Message> {
     let pane = app.compare.pane(side);
     let active = app.compare.active_pane == side;
     let loading = pane.load_rx.is_some();
     let loaded = pane.file_info.is_some();
-    let title = pane.file_info.as_ref().map(|f| f.name.clone()).unwrap_or_else(|| "— no document —".to_string());
+    let dirty = pane.is_dirty();
+    let name = pane.file_info.as_ref().map(|f| f.name.clone()).unwrap_or_else(|| "— no document —".to_string());
 
-    let mut r = row![ui.sym("📄"), ui.primary(title)].spacing(8).align_y(iced::Center).width(Length::Fill);
+    // The title takes whatever width the buttons leave and is cut down with
+    // "…" to fit; the full name is then shown as a tooltip.
+    let suffix = if dirty { " ●" } else { "" };
+    let (font, fs, small, pal) = (ui.font, ui.fs, ui.small, ui.pal);
+    let title = responsive(move |size| {
+        let avail = (size.width - text_width(suffix, font, fs)).max(0.0);
+        let (shown, cut) = ellipsize_middle(&name, font, fs, avail);
+        let t = text(format!("{shown}{suffix}"))
+            .size(fs)
+            .font(font)
+            .color(pal.text_primary)
+            .wrapping(text::Wrapping::None);
+        if !cut {
+            return t.into();
+        }
+        tooltip(
+            t,
+            container(text(name.clone()).size(small).color(pal.text_primary)).padding(6).style(theme::card_style),
+            tooltip::Position::Bottom,
+        )
+        .gap(4)
+        .into()
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed((fs * 1.3).ceil() + 1.0));
+
+    let mut r = row![ui.sym("📄"), title].spacing(8).align_y(iced::Center).width(Length::Fill);
     if loading {
         r = r.push(ui.muted("Loading…"));
     }
-    r = r.push(space().width(Length::Fill));
+    if pane.index.is_some() && !loading {
+        r = r.push(tip(ui.small_btn("Copy", Some(Message::CopyPaneDocument(side))), "Copy this document, with changes, to the clipboard", ui));
+    }
+    if dirty && !loading {
+        if pane.file_info.as_ref().is_some_and(|f| f.path.is_some()) {
+            r = r.push(tip(ui.small_btn("Save", Some(Message::PaneSave(side, SaveAction::Overwrite))), "Overwrite the file", ui));
+        }
+        r = r.push(tip(ui.small_btn("Save As…", Some(Message::PaneSave(side, SaveAction::Copy))), "Save to a new file", ui));
+    }
     if loaded || loading {
         r = r.push(tip(ui.small_btn("Clear", Some(Message::PaneClear(side))), "Unload this pane", ui));
     } else {
@@ -1143,13 +1204,41 @@ fn diff_menu_items(app: &App, node_idx: u32) -> Vec<Item> {
         items.push(action("Copy Right Value", Message::CopyDiffValue(Side::Right, node_idx)));
     }
     items.push(action("Copy Path", Message::CopyDiffPath(node_idx)));
+    items.push(Item::Separator);
+    items.push(action("Copy Left Document", Message::CopyPaneDocument(Side::Left)));
+    items.push(action("Copy Right Document", Message::CopyPaneDocument(Side::Right)));
+    // Copying a value that's absent on the source side deletes it.
+    let to_right = merge::can_copy(result, node_idx, Side::Right);
+    let to_left = merge::can_copy(result, node_idx, Side::Left);
+    if to_right || to_left {
+        items.push(Item::Separator);
+    }
+    if to_right {
+        items.push(action(
+            if dn.left_idx().is_some() { "Copy to Right →" } else { "Delete from Right" },
+            Message::CompareCopy(node_idx, Side::Right),
+        ));
+    }
+    if to_left {
+        items.push(action(
+            if dn.right_idx().is_some() { "← Copy to Left" } else { "Delete from Left" },
+            Message::CompareCopy(node_idx, Side::Left),
+        ));
+    }
     items
 }
 
 fn menubar_items(app: &App, id: MenuBarId) -> Vec<Item> {
     let has_tree = app.tree.is_some();
-    let dirty = app.is_dirty();
-    let can_over = app.can_overwrite();
+    // In Compare, Save / Save As act on the active pane.
+    let (dirty, can_over) = match app.mode {
+        AppMode::Viewer => (app.is_dirty(), app.can_overwrite()),
+        AppMode::Compare => {
+            let pane = app.compare.pane(app.compare.active_pane);
+            (pane.is_dirty(), pane.file_info.as_ref().is_some_and(|f| f.path.is_some()))
+        }
+    };
+    let compare = app.mode == AppMode::Compare;
     match id {
         MenuBarId::File => vec![
             action_if(true, "Open…", "⌘O", Message::OpenFile),
@@ -1170,8 +1259,8 @@ fn menubar_items(app: &App, id: MenuBarId) -> Vec<Item> {
             },
             Item::Separator,
             action_if(dirty && can_over, "Save", "⌘S", Message::Save(SaveAction::Overwrite)),
-            action_if(dirty, "Save a Copy", "⇧⌘S", Message::Save(SaveAction::Copy)),
-            action_if(dirty, "Discard Changes", "", Message::DiscardChanges),
+            action_if(dirty, if compare { "Save As…" } else { "Save a Copy" }, "⇧⌘S", Message::Save(SaveAction::Copy)),
+            action_if(dirty && !compare, "Discard Changes", "", Message::DiscardChanges),
             Item::Separator,
             action_if(true, "Settings", "⌘,", Message::OpenDialog(Dialog::Settings)),
         ],

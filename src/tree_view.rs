@@ -18,6 +18,8 @@ use iced::{mouse, Border, Color, Element, Event, Font, Length, Point, Rectangle,
 
 use crate::diff::{DiffNode, DiffResult, DiffStatus};
 use crate::export::{self, AddedItem, NodeEdit};
+use crate::merge;
+use crate::Side;
 use crate::index::{JsonIndex, Node, NodeKind, NodeSet};
 use crate::theme;
 
@@ -27,6 +29,9 @@ pub enum Region {
     Checkbox,
     Caret,
     Key,
+    /// The → / ← copy-across buttons on a differing Compare row.
+    CopyToRight,
+    CopyToLeft,
     Other,
 }
 
@@ -155,6 +160,21 @@ const CARET_W: f32 = 18.0;
 const INDENT_STEP: f32 = 16.0;
 const CHECKBOX_W: f32 = 20.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
+/// Width of each copy-across button beside the Compare centre divider.
+const COPY_BTN_W: f32 = 20.0;
+
+/// Space kept free on both sides of the Compare centre divider for the copy
+/// buttons. Text is clipped short of it on the left and starts after it on
+/// the right: iced paints text above quads, so a button drawn over a long
+/// value would otherwise have the value showing on top of it.
+const COPY_GUTTER: f32 = COPY_BTN_W + 6.0;
+
+/// Horizontal spans (row-relative) of the copy-to-right and copy-to-left
+/// buttons, hugging either side of the centre divider.
+fn copy_button_spans(row_width: f32) -> ((f32, f32), (f32, f32)) {
+    let mid = row_width / 2.0;
+    ((mid - 2.0 - COPY_BTN_W, mid - 2.0), (mid + 3.0, mid + 3.0 + COPY_BTN_W))
+}
 
 fn paragraph(content: &str, font: Font, size: f32, row_h: f32) -> Paragraph {
     Paragraph::with_text(text::Text {
@@ -208,6 +228,12 @@ fn draw_text(
 
 fn measure(content: &str, font: Font, size: f32, row_h: f32) -> f32 {
     if content.is_empty() { 0.0 } else { paragraph(content, font, size, row_h).min_width() }
+}
+
+/// Rendered width of a single line of `content`, for fitting text outside
+/// this widget (e.g. truncating a pane title).
+pub fn text_width(content: &str, font: Font, size: f32) -> f32 {
+    measure(content, font, size, size * 2.0)
 }
 
 // ─── shared text/colour helpers ──────────────────────────────────────────────
@@ -489,7 +515,18 @@ impl<'a, Message> Widget<Message, iced::Theme, Renderer> for TreeView<'a, Messag
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(layout.bounds()) { mouse::Interaction::Idle } else { mouse::Interaction::None }
+        let bounds = layout.bounds();
+        let Some(pos) = cursor.position_over(bounds) else { return mouse::Interaction::None };
+        if let Rows::Diff(_) = &self.rows {
+            let row = ((pos.y - bounds.y) / self.row_h).floor() as usize;
+            if row < self.rows.len() {
+                let node = self.rows.node_at(row);
+                if matches!(self.region_at(node, pos.x - bounds.x, bounds.width), Region::CopyToRight | Region::CopyToLeft) {
+                    return mouse::Interaction::Pointer;
+                }
+            }
+        }
+        mouse::Interaction::Idle
     }
 
     fn draw(
@@ -559,13 +596,20 @@ impl<'a, Message> TreeView<'a, Message> {
                 Region::Other
             }
             Rows::Diff(d) => {
+                let ((r0, r1), (l0, l1)) = copy_button_spans(row_width);
+                if x >= r0 && x < r1 && merge::can_copy(d.result, node_idx, Side::Right) {
+                    return Region::CopyToRight;
+                }
+                if x >= l0 && x < l1 && merge::can_copy(d.result, node_idx, Side::Left) {
+                    return Region::CopyToLeft;
+                }
                 let dn = &d.result.nodes[node_idx as usize];
                 let can_toggle = dn.child_count > 0 && node_idx != d.result.root;
                 if !can_toggle { return Region::Other; }
                 let indent = 4.0 + dn.depth as f32 * INDENT_STEP;
                 let mid = row_width / 2.0;
                 let in_left = x >= indent && x < indent + 16.0;
-                let in_right = x >= mid + indent && x < mid + indent + 16.0;
+                let in_right = x >= mid + COPY_GUTTER + indent && x < mid + COPY_GUTTER + indent + 16.0;
                 if in_left || in_right { Region::Caret } else { Region::Other }
             }
         }
@@ -709,20 +753,50 @@ impl<'a, Message> TreeView<'a, Message> {
         // Centre divider
         fill_rect(renderer, Rectangle { x: mid_x, y: rect.y, width: 1.0, height: rect.height }, pal.border);
 
+        // Text areas stop short of / start after the copy-button gutter.
+        let half = rect.width / 2.0;
+        let left_text = Rectangle { width: (half - COPY_GUTTER).max(0.0), ..left_cell };
+        let right_text = Rectangle { x: mid_x + COPY_GUTTER, width: (half - COPY_GUTTER).max(0.0), ..right_cell };
         let text_col = pal.text_primary;
         let left = &*d.result.left;
         let right = &*d.result.right;
         let mut w = 0.0f32;
         if let Some(li) = dn.left_idx() {
-            if let Some(cell_clip) = left_cell.intersection(&clip) {
-                w = w.max(self.draw_diff_cell(renderer, keep, left_cell, left, &left.nodes[li as usize], dn.depth, can_toggle, is_expanded, text_col, cell_clip));
+            if let Some(cell_clip) = left_text.intersection(&clip) {
+                w = w.max(self.draw_diff_cell(renderer, keep, left_text, left, &left.nodes[li as usize], dn.depth, can_toggle, is_expanded, text_col, cell_clip));
             }
         }
         if let Some(ri) = dn.right_idx() {
-            if let Some(cell_clip) = right_cell.intersection(&clip) {
-                w = w.max(self.draw_diff_cell(renderer, keep, right_cell, right, &right.nodes[ri as usize], dn.depth, can_toggle, is_expanded, text_col, cell_clip));
+            if let Some(cell_clip) = right_text.intersection(&clip) {
+                w = w.max(self.draw_diff_cell(renderer, keep, right_text, right, &right.nodes[ri as usize], dn.depth, can_toggle, is_expanded, text_col, cell_clip));
             }
         }
+        // Copy-across buttons: always on tinted (differing) rows, dimmed until
+        // the row is hovered or selected; an expanded changed container (drawn
+        // untinted) only shows them on hover / selection.
+        let active = hovered || is_selected;
+        if active || tint_status != DiffStatus::Unchanged {
+            let color = if active { theme::ACCENT } else { pal.text_faint };
+            let ((r0, _), (l0, _)) = copy_button_spans(rect.width);
+            for (x0, glyph, to) in [(r0, "→", Side::Right), (l0, "←", Side::Left)] {
+                if !merge::can_copy(d.result, node_idx, to) { continue; }
+                let btn = Rectangle { x: rect.x + x0, y: rect.y + 2.0, width: COPY_BTN_W, height: (rect.height - 4.0).max(1.0) };
+                renderer.fill_quad(
+                    Quad {
+                        bounds: btn,
+                        border: Border { color, width: 1.0, radius: 3.0.into() },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    pal.bg_panel,
+                );
+                let size = (self.font_size - 1.0).max(9.0);
+                let gw = measure(glyph, self.val_font, size, rect.height);
+                draw_text(renderer, keep, glyph, self.val_font, size, rect.height, color,
+                          btn.x + (COPY_BTN_W - gw) / 2.0, rect.y + rect.height / 2.0, clip);
+            }
+        }
+
         // The diff view never scrolls horizontally; report the container width.
         let _ = w;
         0.0

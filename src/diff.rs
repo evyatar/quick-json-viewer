@@ -769,6 +769,17 @@ pub fn rebuild_visible_diff(
     visible
 }
 
+/// JSONPath of merged node `idx`, read from whichever side has it (the left
+/// when both do).
+pub fn node_path(result: &DiffResult, idx: u32) -> String {
+    let dn = &result.nodes[idx as usize];
+    match (dn.left_idx(), dn.right_idx()) {
+        (Some(li), _) => crate::build_path(&result.left.nodes, &result.left, li),
+        (_, Some(ri)) => crate::build_path(&result.right.nodes, &result.right, ri),
+        _             => "$".to_owned(),
+    }
+}
+
 /// Expansion / selection / navigation over a [`DiffResult`]. Mirrors
 /// `tree::TreeState` but methods take the `DiffResult` as an argument so the
 /// state isn't self-referential (it can live next to the result in app state).
@@ -809,6 +820,63 @@ impl DiffTreeState {
             s.selected = Some(first);
         }
         s
+    }
+
+    /// Paths of the expanded rows, for carrying the view across a re-diff
+    /// (see [`DiffTreeState::restore`]).
+    pub fn expanded_paths(&self, result: &DiffResult) -> std::collections::HashSet<String> {
+        (0..result.nodes.len() as u32)
+            .filter(|i| self.expanded.contains(i))
+            .map(|i| node_path(result, i))
+            .collect()
+    }
+
+    /// Re-apply a view captured from an earlier diff of (nearly) the same
+    /// documents: expand the rows at `expanded` paths and select the row at
+    /// `selected` — or its deepest surviving ancestor, or failing that the
+    /// nearest visible one — instead of jumping back to the first difference.
+    pub fn restore(&mut self, result: &DiffResult, expanded: &std::collections::HashSet<String>, selected: Option<&str>) {
+        self.expanded.clear();
+        let mut best: Option<(u32, usize)> = None;
+        let mut stack = vec![result.root];
+        while let Some(i) = stack.pop() {
+            let path = node_path(result, i);
+            if let Some(sel) = selected {
+                let is_prefix = sel.starts_with(path.as_str())
+                    && matches!(sel.as_bytes().get(path.len()), None | Some(b'.') | Some(b'['));
+                if is_prefix && best.is_none_or(|(_, len)| path.len() > len) {
+                    best = Some((i, path.len()));
+                }
+            }
+            if i == result.root || expanded.contains(&path) {
+                self.expanded.insert(i);
+                let mut c = result.nodes[i as usize].first_child;
+                while c != u32::MAX {
+                    stack.push(c);
+                    c = result.nodes[c as usize].next_sibling;
+                }
+            }
+        }
+        self.refresh_visible(result);
+
+        // A row hidden by the filters (e.g. now unchanged under "only diffs")
+        // hands the selection to its closest visible ancestor.
+        let mut sel = best.map_or(result.root, |(i, _)| i);
+        while !self.visible.contains(&sel) && result.nodes[sel as usize].parent != u32::MAX {
+            sel = result.nodes[sel as usize].parent;
+        }
+        self.selected = Some(sel);
+        self.reveal_row = self.visible.iter().position(|&n| n == sel);
+        // Point the next/prev cursor at the selection so ⌘G continues from here.
+        let len = result.diff_positions.len();
+        let at = result.diff_positions.partition_point(|&p| p < sel);
+        self.diff_cursor = if result.diff_positions.get(at) == Some(&sel) || len == 0 {
+            at.min(len.saturating_sub(1))
+        } else if at == 0 {
+            len - 1
+        } else {
+            at - 1
+        };
     }
 
     pub fn refresh_visible(&mut self, result: &DiffResult) {
@@ -1134,6 +1202,41 @@ mod tests {
             let mut e = crate::index::NodeSet::new(); e.insert(res.root); e
         }, false, StatusFilter { changed: false, ..StatusFilter::default() });
         assert_eq!(no_changed.len(), 3);
+    }
+
+    #[test]
+    fn restore_keeps_expansion_and_selection_across_rediff() {
+        let l = r#"{"a": {"x": 1, "y": 2}, "b": {"z": 1}}"#;
+        let r = r#"{"a": {"x": 1, "y": 3}, "b": {"z": 1}}"#;
+        let res = run(l, r, DiffOptions::default());
+        let mut t = DiffTreeState::new(&res);
+        let find = |res: &DiffResult, p: &str| (0..res.nodes.len() as u32).find(|&i| node_path(res, i) == p).unwrap();
+        // User expands the clean `b` and selects `a.y`.
+        t.toggle(find(&res, "$.b"), &res);
+        t.selected = Some(find(&res, "$.a.y"));
+        let paths = t.expanded_paths(&res);
+        let sel = node_path(&res, t.selected.unwrap());
+
+        // After the change is resolved nothing differs, so a fresh state would
+        // collapse everything.
+        let res2 = run(r, r, DiffOptions::default());
+        let mut t2 = DiffTreeState::new(&res2);
+        t2.restore(&res2, &paths, Some(&sel));
+        assert!(t2.expanded.contains(&find(&res2, "$.a")));
+        assert!(t2.expanded.contains(&find(&res2, "$.b")));
+        assert_eq!(t2.selected, Some(find(&res2, "$.a.y")));
+
+        // Under "only diffs" the now-unchanged row is hidden: fall back to the
+        // nearest visible ancestor.
+        let mut t3 = DiffTreeState::new(&res2);
+        t3.only_diffs = true;
+        t3.restore(&res2, &paths, Some(&sel));
+        assert_eq!(t3.selected, Some(res2.root));
+
+        // A path that no longer exists selects its deepest surviving ancestor.
+        let mut t4 = DiffTreeState::new(&res2);
+        t4.restore(&res2, &paths, Some("$.a.gone"));
+        assert_eq!(t4.selected, Some(find(&res2, "$.a")));
     }
 
     #[test]
