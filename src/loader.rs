@@ -22,8 +22,9 @@ pub enum LoadMsg {
 /// Returns a Receiver the UI polls each frame.
 pub fn spawn_load(path: PathBuf) -> mpsc::Receiver<LoadMsg> {
     spawn_build(move || {
-        let file = std::fs::File::open(&path)
+        let mut file = std::fs::File::open(&path)
             .map_err(|e| format!("open: {e}"))?;
+        materialize(&mut file)?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| format!("mmap: {e}"))?;
         // The parser reads the file front-to-back once; tell the kernel to
@@ -32,6 +33,30 @@ pub fn spawn_load(path: PathBuf) -> mpsc::Receiver<LoadMsg> {
         Ok(JsonData::Mapped { _file: file, mmap })
     })
 }
+
+/// Cloud-backed placeholders (iCloud "Optimize Mac Storage", File Provider)
+/// have no local data until first read. A page fault in the mmap can't report
+/// a failed download — it just stalls — so pull the file in with a regular
+/// read first, which fails fast with a real errno.
+#[cfg(target_os = "macos")]
+fn materialize(file: &mut std::fs::File) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+
+    let meta = file.metadata().map_err(|e| format!("stat: {e}"))?;
+    if meta.st_flags() & SF_DATALESS == 0 {
+        return Ok(());
+    }
+    file.read(&mut [0u8; 1]).map_err(|e| {
+        format!("file is stored in iCloud and couldn't be downloaded ({e}). \
+                 Check that you're signed in to iCloud, or download it in Finder first.")
+    })?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn materialize(_file: &mut std::fs::File) -> Result<(), String> { Ok(()) }
 
 /// Spawns a background thread that parses an in-memory buffer (pasted text).
 pub fn spawn_parse(data: Vec<u8>) -> mpsc::Receiver<LoadMsg> {
